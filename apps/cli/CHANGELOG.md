@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.5.3...opaline-cli@0.6.0) (2026-09-13)
+
+
+### Features
+
+* make opaline the primary CLI install ([#476](https://github.com/opalinehq/cli/issues/476)) ([dcc93df](https://github.com/opalinehq/cli/commit/dcc93df086f8c10486479fff78a132f27b1a471a))
+
 ## 0.5.3
 
 ### Bug fixes
