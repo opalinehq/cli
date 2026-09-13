@@ -73,6 +73,28 @@ jobs:
             *) echo "Unexpected release PR branch: ${RELEASE_PR_BRANCH}"; exit 1 ;;
           esac
           bun install --lockfile-only --ignore-scripts
+          # Bun 1.3.9 can retain old workspace versions (oven-sh/bun#18906).
+          node <<'NODE'
+          const fs = require("node:fs");
+          let lockfile = fs.readFileSync("bun.lock", "utf8");
+          for (const workspace of ["apps/cli", "packages/opaline", "packages/rudel-alias"]) {
+            const manifest = JSON.parse(fs.readFileSync(`${workspace}/package.json`, "utf8"));
+            const start = lockfile.indexOf(`    "${workspace}": {\n`);
+            const end = lockfile.indexOf("\n    },", start) + "\n    },".length;
+            if (start < 0 || end <= start) throw new Error(`Missing lockfile workspace: ${workspace}`);
+            const original = lockfile.slice(start, end);
+            let updated = original;
+            const fields = { version: manifest.version };
+            if (workspace !== "apps/cli") fields["@opalinehq/cli"] = manifest.dependencies["@opalinehq/cli"];
+            for (const [field, version] of Object.entries(fields)) {
+              const pattern = new RegExp(`("${field}": ")[^"]+("(?=,?\\n))`, "g");
+              if ([...updated.matchAll(pattern)].length !== 1) throw new Error(`Unexpected ${field} in ${workspace}`);
+              updated = updated.replace(pattern, (_, prefix, suffix) => `${prefix}${version}${suffix}`);
+            }
+            lockfile = lockfile.slice(0, start) + updated + lockfile.slice(end);
+          }
+          fs.writeFileSync("bun.lock", lockfile);
+          NODE
           if ! git diff --quiet -- bun.lock; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
