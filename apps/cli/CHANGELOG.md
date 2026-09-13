@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.6.0...opaline-cli@0.7.0) (2026-09-13)
+
+
+### Features
+
+* launch guided CLI onboarding with live browser progress ([#479](https://github.com/opalinehq/cli/issues/479)) ([24d76fe](https://github.com/opalinehq/cli/commit/24d76fe6aba45b6b67ce3a1f8d3d7d0cd9713142))
+
 ## [0.6.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.5.3...opaline-cli@0.6.0) (2026-09-13)
 
 
