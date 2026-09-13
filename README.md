@@ -186,4 +186,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow.
 
 ## License
 
-[MIT](LICENSE)
+Copyright (c) 2025 Opaline Labs, Inc. Licensed under [MIT](LICENSE).

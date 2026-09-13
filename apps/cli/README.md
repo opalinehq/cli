@@ -31,3 +31,7 @@ Important: session transcripts are uploaded. Known-pattern secret filtering is
 best-effort and cannot guarantee that every sensitive value is removed.
 Capable servers use direct multipart object-storage uploads after filtering;
 older servers continue to use the legacy ingest endpoint.
+
+## License
+
+Copyright (c) 2025 Opaline Labs, Inc. Licensed under [MIT](LICENSE).
