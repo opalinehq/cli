@@ -4,11 +4,10 @@ Capture Claude Code and OpenAI Codex sessions and upload them to Opaline for
 team analytics. Requires Node.js 20 or newer.
 
 ```bash
-npm install --global opaline
-opaline login
-opaline upload
-opaline doctor
+npx opaline@latest
 ```
+
+Run from any directory, choose repositories, and review the upload before browser login. Opaline uploads the selected Claude Code and Codex sessions and sets up automatic uploads for those repositories.
 
 `opaline` is the recommended install name. It runs the same CLI implementation
 as `@opalinehq/cli`, pinned to the matching release. Both `@opalinehq/cli` and
