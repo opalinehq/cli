@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ORPCError } from "@orpc/client";
 import { PostHog } from "posthog-node";
+import { z } from "zod";
 import pkg from "../../package.json" with { type: "json" };
 import type {
 	ProductAnalyticsEventName,
@@ -14,8 +15,12 @@ import {
 	PRODUCT_ANALYTICS_EVENTS,
 	parseProductAnalyticsEvent,
 } from "../contracts/index.js";
-import { getApiBaseOverride } from "./api-target.js";
+import { debugLog } from "./debug.js";
 import { getConfigDir } from "./local-state.js";
+import {
+	getProductAnalyticsConfig,
+	getProductAnalyticsEnvironment,
+} from "./product-analytics-config.js";
 
 type CliSurface = "cli" | "hook";
 type CliAutoProps = "event_version" | "surface" | "environment";
@@ -27,44 +32,44 @@ type CliCapturePayload<Name extends ProductAnalyticsEventName> = Omit<
 const ANALYTICS_STATE_FILE = "product-analytics.json";
 
 let client: PostHog | null | undefined;
-
-type AnalyticsState = {
-	cli_installation_id?: string;
-	cli_first_run_tracked?: boolean;
-	cli_login_attempt_count?: number;
-};
-
-function isAnalyticsEnabled() {
-	return process.env.POSTHOG_ENABLED === "true";
-}
-
-function getEnvironment(): "production" | "staging" | "development" | "local" {
-	const apiBase = getApiBaseOverride() ?? "";
-	if (apiBase.includes("localhost") || apiBase.includes("127.0.0.1")) {
-		return "local";
-	}
-	if (apiBase.includes("staging")) {
-		return "staging";
-	}
-	if (process.env.NODE_ENV === "production") {
-		return "production";
-	}
-	return "development";
-}
+const ephemeralInstallationId = randomUUID();
+const AnalyticsStateSchema = z.object({
+	cli_installation_id: z.string().min(1).optional(),
+	cli_anonymous_id: z.string().min(1).optional(),
+	cli_identified_user_id: z.string().min(1).optional(),
+	cli_first_run_event_id: z.string().uuid().optional(),
+	cli_first_run_delivered: z.boolean().optional(),
+	cli_login_attempt_count: z.number().int().nonnegative().optional(),
+});
+type AnalyticsState = z.infer<typeof AnalyticsStateSchema>;
+const FlushedEventsSchema = z.array(z.object({ uuid: z.string().optional() }));
 
 function getClient() {
 	if (client !== undefined) {
 		return client;
 	}
 
-	const key = (process.env.POSTHOG_KEY ?? "").trim();
-	const host = (process.env.POSTHOG_HOST ?? "").trim();
-	if (!isAnalyticsEnabled() || key.length === 0 || host.length === 0) {
+	const config = getProductAnalyticsConfig();
+	if (!config) {
 		client = null;
 		return client;
 	}
-
-	client = new PostHog(key, { host });
+	try {
+		client = new PostHog(config.key, {
+			host: config.host,
+			flushAt: 1,
+			flushInterval: 0,
+			requestTimeout: 1_500,
+			fetchRetryCount: 1,
+			fetchRetryDelay: 100,
+			disableGeoip: true,
+		});
+		client.on("flush", recordDeliveredFirstRun);
+		client.on("error", () => debugLog("analytics delivery failed"));
+	} catch {
+		debugLog("analytics initialization failed");
+		client = null;
+	}
 	return client;
 }
 
@@ -73,22 +78,39 @@ function getAnalyticsStatePath() {
 }
 
 function readAnalyticsState(): AnalyticsState {
-	const statePath = getAnalyticsStatePath();
-	if (!existsSync(statePath)) {
-		return {};
-	}
-
 	try {
-		return JSON.parse(readFileSync(statePath, "utf8")) as AnalyticsState;
+		const statePath = getAnalyticsStatePath();
+		if (!existsSync(statePath)) return {};
+		const parsed = AnalyticsStateSchema.safeParse(
+			JSON.parse(readFileSync(statePath, "utf8")),
+		);
+		return parsed.success ? parsed.data : {};
 	} catch {
 		return {};
 	}
 }
 
 function writeAnalyticsState(state: AnalyticsState) {
-	const statePath = getAnalyticsStatePath();
-	mkdirSync(getConfigDir(), { recursive: true, mode: 0o700 });
-	writeFileSync(statePath, JSON.stringify(state, null, 2), { mode: 0o600 });
+	try {
+		const statePath = getAnalyticsStatePath();
+		mkdirSync(getConfigDir(), { recursive: true, mode: 0o700 });
+		writeFileSync(statePath, JSON.stringify(state, null, 2), { mode: 0o600 });
+	} catch {
+		debugLog("analytics state could not be saved");
+	}
+}
+
+function recordDeliveredFirstRun(messages: unknown) {
+	const parsed = FlushedEventsSchema.safeParse(messages);
+	if (!parsed.success) return;
+	debugLog("analytics delivered", { eventCount: parsed.data.length });
+	const state = readAnalyticsState();
+	if (
+		state.cli_first_run_event_id &&
+		parsed.data.some(({ uuid }) => uuid === state.cli_first_run_event_id)
+	) {
+		writeAnalyticsState({ ...state, cli_first_run_delivered: true });
+	}
 }
 
 function buildPayload<Name extends ProductAnalyticsEventName>(
@@ -100,7 +122,7 @@ function buildPayload<Name extends ProductAnalyticsEventName>(
 		...payload,
 		event_version: PRODUCT_ANALYTICS_EVENT_VERSION,
 		surface,
-		environment: getEnvironment(),
+		environment: getProductAnalyticsEnvironment(),
 	});
 }
 
@@ -120,11 +142,12 @@ export function getPlatformOs(): ProductAnalyticsPlatformOs {
 }
 
 export function getOrCreateCliInstallationId() {
+	if (!getProductAnalyticsConfig()) return ephemeralInstallationId;
 	const state = readAnalyticsState();
 	if (typeof state.cli_installation_id === "string") {
 		return state.cli_installation_id;
 	}
-	const cliInstallationId = randomUUID();
+	const cliInstallationId = ephemeralInstallationId;
 	writeAnalyticsState({
 		...state,
 		cli_installation_id: cliInstallationId,
@@ -132,29 +155,40 @@ export function getOrCreateCliInstallationId() {
 	return cliInstallationId;
 }
 
-export function consumeCliFirstRun(
-	cliInstallationId = getOrCreateCliInstallationId(),
-) {
+export function trackCliFirstRun(options: {
+	commandName: ProductAnalyticsEventPayload<"CLI First Run">["command_name"];
+	isAuthenticated: boolean;
+	userId?: string;
+}) {
+	if (!getClient()) return;
+	const cliInstallationId = getOrCreateCliInstallationId();
 	const state = readAnalyticsState();
-	if (state.cli_first_run_tracked) {
-		return {
-			cliInstallationId,
-			shouldTrack: false,
-		} as const;
-	}
-
+	if (state.cli_first_run_delivered) return;
+	// Older releases marked this event before checking whether capture was enabled.
+	// Only the delivery marker is authoritative; retain the UUID when retrying.
+	const eventId = state.cli_first_run_event_id ?? randomUUID();
 	writeAnalyticsState({
 		...state,
 		cli_installation_id: cliInstallationId,
-		cli_first_run_tracked: true,
+		cli_first_run_event_id: eventId,
 	});
-	return {
-		cliInstallationId,
-		shouldTrack: true,
-	} as const;
+	captureCliProductAnalyticsEvent({
+		distinctId: getCliDistinctId(options.userId),
+		event: PRODUCT_ANALYTICS_EVENTS.CLI_FIRST_RUN,
+		surface: "cli",
+		disablePersonProfile: shouldDisableCliPersonProfile(options.userId),
+		eventId,
+		payload: {
+			cli_installation_id: cliInstallationId,
+			command_name: options.commandName,
+			is_authenticated: options.isAuthenticated,
+			...getBaseCliEventPayload(),
+		},
+	});
 }
 
 export function getNextCliLoginAttemptNumber() {
+	if (!getClient()) return 1;
 	const state = readAnalyticsState();
 	const nextAttemptNumber = (state.cli_login_attempt_count ?? 0) + 1;
 	writeAnalyticsState({
@@ -174,6 +208,7 @@ export function captureCliProductAnalyticsEvent<
 	payload: CliCapturePayload<Name>;
 	surface: CliSurface;
 	disablePersonProfile?: boolean;
+	eventId?: string;
 }) {
 	const instance = getClient();
 	if (!instance) {
@@ -189,25 +224,66 @@ export function captureCliProductAnalyticsEvent<
 		instance.capture({
 			distinctId: options.distinctId,
 			event: options.event,
+			uuid: options.eventId,
 			properties: options.disablePersonProfile
 				? { ...payload, $process_person_profile: false }
 				: payload,
 		});
 	} catch {
-		// Analytics must never break CLI execution.
+		debugLog("analytics event rejected", { event: options.event });
 	}
 }
 
-export async function shutdownCliProductAnalytics(timeoutMs = 5_000) {
+export function identifyCliProductAnalyticsUser(userId: string) {
 	const instance = getClient();
+	if (!instance) return;
+	try {
+		let state = readAnalyticsState();
+		if (
+			state.cli_identified_user_id &&
+			state.cli_identified_user_id !== userId
+		) {
+			resetCliProductAnalyticsIdentity();
+			state = readAnalyticsState();
+		}
+		const anonymousId =
+			state.cli_anonymous_id ?? getOrCreateCliInstallationId();
+		instance.identify({
+			distinctId: userId,
+			properties: { $anon_distinct_id: anonymousId },
+		});
+		writeAnalyticsState({
+			...readAnalyticsState(),
+			cli_anonymous_id: anonymousId,
+			cli_identified_user_id: userId,
+		});
+	} catch {
+		debugLog("analytics identity could not be linked");
+	}
+}
+
+export function resetCliProductAnalyticsIdentity() {
+	if (!getProductAnalyticsConfig()) return;
+	writeAnalyticsState({
+		...readAnalyticsState(),
+		cli_anonymous_id: randomUUID(),
+		cli_identified_user_id: undefined,
+	});
+}
+
+export async function shutdownCliProductAnalytics(timeoutMs = 3_500) {
+	const instance = client;
 	if (!instance) {
+		client = undefined;
 		return;
 	}
 
 	try {
 		await instance.shutdown(timeoutMs);
 	} catch {
-		// Ignore shutdown failures.
+		debugLog("analytics shutdown failed");
+	} finally {
+		client = undefined;
 	}
 }
 
@@ -250,16 +326,16 @@ export function normalizeFailureReason(error: unknown) {
 	if (message.includes("forbidden") || message.includes("unauthorized")) {
 		return "auth_error";
 	}
-	return (
-		message
-			.replace(/[^a-z0-9]+/g, "_")
-			.replace(/^_+|_+$/g, "")
-			.slice(0, 64) || "unknown"
-	);
+	// Arbitrary errors can contain paths, repository names, URLs, or credentials.
+	return "unknown";
 }
 
 export function getCliDistinctId(userId?: string | null) {
-	return userId ?? getOrCreateCliInstallationId();
+	if (userId) return userId;
+	if (!getProductAnalyticsConfig()) return ephemeralInstallationId;
+	return (
+		readAnalyticsState().cli_anonymous_id ?? getOrCreateCliInstallationId()
+	);
 }
 
 export function shouldDisableCliPersonProfile(userId?: string | null) {

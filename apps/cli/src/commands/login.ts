@@ -26,12 +26,13 @@ import {
 	getBaseCliEventPayload,
 	getCliDistinctId,
 	getNextCliLoginAttemptNumber,
+	identifyCliProductAnalyticsUser,
 	normalizeFailureReason,
 	shouldDisableCliPersonProfile,
 } from "../lib/product-analytics.js";
 
 const DEVICE_CLIENT_ID = "rudel-cli";
-const POLL_SAFETY_TIMEOUT_MS = 120_000;
+const POLL_SAFETY_TIMEOUT_MS = 10 * 60_000;
 
 /**
  * Human-readable failure drawn from an untrusted error payload.
@@ -190,13 +191,20 @@ async function createIngestApiKey(
 	return parsed.data;
 }
 
-async function runLogin(flags: {
-	apiBase: string;
-	allowInsecureApiBase: boolean;
-	noBrowser: boolean;
-}): Promise<undefined | Error> {
-	const openedBrowser = !flags.noBrowser;
-	const attemptNumber = getNextCliLoginAttemptNumber();
+export async function runLogin(
+	flags: {
+		apiBase: string;
+		allowInsecureApiBase: boolean;
+		noBrowser: boolean;
+	},
+	connection?: {
+		readonly id: string;
+		readonly browserOrigin: string;
+		readonly registerDevice: (deviceCode: string) => Promise<unknown>;
+	},
+): Promise<undefined | Error> {
+	let openedBrowser = false;
+	let attemptNumber = 1;
 	const captureLoginFailure = (
 		failureStage: ProductAnalyticsLoginFailureStage,
 		error: unknown,
@@ -220,11 +228,24 @@ async function runLogin(flags: {
 	p.intro("opaline login");
 
 	const existing = loadCredentials();
-	if (existing) {
+	if (existing && !connection) {
 		p.log.warn("Already logged in.");
 		p.outro("Run `opaline logout` first to switch accounts.");
 		return;
 	}
+	attemptNumber = getNextCliLoginAttemptNumber();
+	captureCliProductAnalyticsEvent({
+		distinctId: getCliDistinctId(),
+		event: CliProductAnalyticsEvents.CLI_LOGIN_STARTED,
+		surface: "cli",
+		disablePersonProfile: true,
+		payload: {
+			auth_flow: "device_authorization",
+			opened_browser: false,
+			attempt_number: attemptNumber,
+			...getBaseCliEventPayload(),
+		},
+	});
 
 	// Resolved once and threaded through both URL checks below, so a plaintext
 	// self-hosted deployment cannot pass one gate and fail the other.
@@ -252,7 +273,12 @@ async function runLogin(flags: {
 	// The verification URL is server-controlled. Validate it before it reaches the
 	// terminal or a platform opener, and use the reserialized form so control
 	// characters stay percent-encoded (RUD-203).
-	const rawVerifyUrl = buildVerificationUrl(deviceCode);
+	const rawVerifyUrl = connection
+		? new URL(
+				`/welcome?user_code=${encodeURIComponent(deviceCode.user_code)}`,
+				connection.browserOrigin,
+			).toString()
+		: buildVerificationUrl(deviceCode);
 	const verifyUrlResult = parseSafeBrowserUrl(rawVerifyUrl, { allowPlaintext });
 	if (!verifyUrlResult.ok) {
 		const error = new Error(
@@ -261,20 +287,13 @@ async function runLogin(flags: {
 		captureLoginFailure("verification_url_rejected", error);
 		return error;
 	}
-	const verifyUrl = verifyUrlResult.url;
-
-	captureCliProductAnalyticsEvent({
-		distinctId: getCliDistinctId(),
-		event: CliProductAnalyticsEvents.CLI_LOGIN_STARTED,
-		surface: "cli",
-		disablePersonProfile: shouldDisableCliPersonProfile(),
-		payload: {
-			auth_flow: "device_authorization",
-			opened_browser: openedBrowser,
-			attempt_number: attemptNumber,
-			...getBaseCliEventPayload(),
-		},
-	});
+	let verifyUrl = verifyUrlResult.url;
+	if (connection) {
+		await connection.registerDevice(deviceCode.device_code);
+		const connectedUrl = new URL(verifyUrl);
+		connectedUrl.searchParams.set("connect", connection.id);
+		verifyUrl = connectedUrl.toString();
+	}
 
 	p.log.info(`If the browser doesn't open, visit:\n${verifyUrl}`);
 	// `user_code` is server-controlled and printed raw to the terminal, so it is
@@ -283,6 +302,7 @@ async function runLogin(flags: {
 
 	if (!flags.noBrowser) {
 		openUrl(verifyUrl);
+		openedBrowser = true;
 	}
 
 	const spin = p.spinner();
@@ -353,6 +373,7 @@ async function runLogin(flags: {
 		return new Error("Login failed: unable to persist credentials");
 	}
 
+	identifyCliProductAnalyticsUser(user.id);
 	captureCliProductAnalyticsEvent({
 		distinctId: user.id,
 		event: CliProductAnalyticsEvents.CLI_LOGIN_APPROVED,

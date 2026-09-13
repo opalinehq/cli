@@ -9,10 +9,21 @@ team analytics. The production API is at
 Requires Node.js 20 or newer.
 
 ```bash
-npm install --global opaline
-opaline login
-opaline upload
+npx @opalinehq/cli@latest
 ```
+
+Run this from any directory. The CLI scans local Claude Code and Codex sessions,
+shows repository and session counts, and lets you choose which repos to upload
+and keep syncing. Login opens only after selection. `pnpx @opalinehq/cli@latest`
+works too. A global install remains optional.
+
+Copying the command from the Opaline demo adds a hidden `--code` value. That
+one-time code pairs the terminal with your browser for live selection and upload
+status. It expires after ten minutes if unused. Approve login in the same browser
+where you copied the command; finishing setup opens your own Sessions page.
+
+Automatic uploads retain the bundled CLI under `~/.rudel/runtime` and use your
+Node executable, so hooks keep working after the temporary runner cache is gone.
 
 `opaline login` opens a browser-based device flow. `opaline upload` groups local
 worktrees by repository, lets you choose which repositories stay synchronized,
@@ -22,39 +33,6 @@ installs the required Claude Code and/or Codex hooks, and uploads new sessions.
 Existing `rudel` users do not need to log in again. Opaline intentionally reads
 the existing `~/.rudel` credential and state directory, and the `rudel` package
 continues as a compatibility alias.
-
-### Install names and upgrades
-
-| Install | Command | Purpose |
-| --- | --- | --- |
-| `npm install --global opaline` | `opaline` | Recommended installation. |
-| `npm install --global @opalinehq/cli` | `opaline` | Supported scoped installation. |
-| `npm install --global rudel` | `rudel` | Compatibility for existing commands and scripts. |
-
-All three packages use the same CLI implementation and are released together.
-The `opaline` and `rudel` launchers depend on the exact matching
-`@opalinehq/cli` version, so upgrades cannot silently mix releases.
-
-Choose either `opaline` or `@opalinehq/cli` for a global installation; both
-provide the `opaline` executable. To switch from the scoped installation:
-
-```bash
-npm uninstall --global @opalinehq/cli
-npm install --global opaline
-```
-
-Your login, configuration, and upload history remain in `~/.rudel`.
-The `rudel` package can remain installed alongside
-`opaline`; update it with `npm install --global rudel@latest` to receive
-the current implementation.
-
-Hook setup uses the command you invoked: `opaline upload` installs `opaline`
-hooks and `rudel upload` installs `rudel` hooks. A `rudel`-only installation
-therefore continues to work. Both commands recognize existing hooks under
-either name; running setup with a different command updates those hooks.
-
-One-off invocations also work: `npx opaline@latest --help`,
-`npx @opalinehq/cli@latest --help`, and `npx rudel@latest --help`.
 
 Run `opaline upload` from any directory, including your home folder. The picker
 finds saved sessions across repositories and uploads the repositories you select.
@@ -101,6 +79,8 @@ opaline disable
 
 | Command | Description |
 | --- | --- |
+| `opaline` / `opaline connect` | Scan, select repositories, then log in and upload. |
+| `opaline --code <code>` | Connect to the demo that supplied the copied command. |
 | `opaline login` | Authenticate through the browser device flow. |
 | `opaline logout` | Revoke the current credential and log out locally. |
 | `opaline whoami` | Show the authenticated user and local upload failures. |
@@ -124,6 +104,7 @@ The CLI defaults to the current production API at `https://opaline.so`.
 | `OPALINE_CONFIG_DIR` | Override local state; legacy `RUDEL_CONFIG_DIR` is also accepted. |
 | `OPALINE_ALLOW_INSECURE_API_BASE=1` | Permit plaintext non-loopback login/auth traffic. |
 | `OPALINE_ALLOW_INSECURE_ENDPOINT=1` | Permit plaintext non-loopback transcript uploads. |
+| `DO_NOT_TRACK=1` or `POSTHOG_ENABLED=false` | Disable CLI product analytics. |
 
 The insecure overrides transmit credentials or transcripts without transport
 encryption. Use them only for a trusted self-hosted network.
@@ -174,6 +155,14 @@ Keep secrets out of agent sessions, review your organization's data policies,
 and treat filtering as defense in depth. Report security issues through the
 private process in [SECURITY.md](SECURITY.md).
 
+Official CLI releases include PostHog capture configuration for a small set of
+usage events: first run, login attempts and results, and automatic-upload setup
+results. Events include CLI version and operating system; first run also includes
+the command name. Anonymous activity is linked to your account after login.
+These events exclude command arguments, connection codes, repository names,
+local paths, and session contents. Set `DO_NOT_TRACK=1` or
+`POSTHOG_ENABLED=false` to opt out. Source builds are unconfigured by default.
+
 ## Development
 
 ```bash
@@ -186,4 +175,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow.
 
 ## License
 
-Copyright (c) 2026 Opaline Labs, Inc. Licensed under [MIT](LICENSE).
+[MIT](LICENSE)

@@ -1,6 +1,5 @@
 import { getLogger } from "@logtape/logtape";
 import { buildCommand } from "@stricli/core";
-import { resolveRepoIdentity } from "../../../contracts/index.js";
 import {
 	codexAdapter,
 	findActiveRolloutFile,
@@ -13,6 +12,10 @@ import { removeFailedUpload } from "../../../lib/failed-uploads.js";
 import { getGitInfo } from "../../../lib/git-info.js";
 import { reportHookUploadFailure } from "../../../lib/hook-upload-failure.js";
 import { getProjectOrgId } from "../../../lib/project-config.js";
+import {
+	getLegacyRepositoryKey,
+	resolveUploadRepositoryIdentity,
+} from "../../../lib/repository-discovery.js";
 import { allowsInsecureEndpointFromEnv } from "../../../lib/upload-endpoint.js";
 import {
 	formatRedactionSummary,
@@ -54,13 +57,11 @@ async function runTurnComplete(
 		const input = parseNotification(notification);
 		if (!input) return;
 		const gitInfo = await getGitInfo(input.cwd);
-		const repository = resolveRepoIdentity({
-			gitRemote: gitInfo.gitRemote ?? null,
-			packageName: gitInfo.packageName ?? null,
-			projectPath: input.cwd,
-		});
+		const repository = resolveUploadRepositoryIdentity(input.cwd, gitInfo);
 		if (
-			!isRepositoryAutoUploadAllowed(repository.repoKey, codexAdapter.source)
+			!isRepositoryAutoUploadAllowed(repository.repoKey, codexAdapter.source, [
+				getLegacyRepositoryKey(input.cwd, gitInfo),
+			])
 		) {
 			logger.info(
 				"Skipping session {sessionId}: automatic upload is disabled for {repository}",

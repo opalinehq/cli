@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	clearAutoUploadRepositories,
+	enableAutoUploadRepository,
 	getRequiredAutoUploadSources,
 	isRepositoryAutoUploadAllowed,
 	loadAutoUploadConfig,
@@ -102,3 +103,43 @@ function loadRequiredConfig() {
 	if (!config) throw new Error("Expected auto-upload configuration");
 	return config;
 }
+
+test("migrates old worktree selections and keeps deselected repositories disabled", () => {
+	const legacy = {
+		key: "path:demo",
+		label: "demo",
+		sources: ["claude_code"] as const,
+	};
+	enableAutoUploadRepository(legacy);
+	const repository = {
+		key: "remote:github.com/acme/demo",
+		label: "demo",
+		sources: ["claude_code", "codex"] as const,
+		legacyKeys: [legacy.key],
+	};
+	expect(
+		isRepositoryAutoUploadAllowed(
+			repository.key,
+			"claude_code",
+			repository.legacyKeys,
+		),
+	).toBe(true);
+	saveVisibleAutoUploadSelections([repository], new Set([repository.key]));
+	expect(loadRequiredConfig().repositories[legacy.key]).toBeUndefined();
+	expect(
+		isRepositoryAutoUploadAllowed(
+			repository.key,
+			"codex",
+			repository.legacyKeys,
+		),
+	).toBe(true);
+	saveVisibleAutoUploadSelections([repository], new Set());
+	expect(
+		isRepositoryAutoUploadAllowed(
+			repository.key,
+			"claude_code",
+			repository.legacyKeys,
+		),
+	).toBe(false);
+	expect(isRepositoryAutoUploadAllowed(legacy.key, "claude_code")).toBe(false);
+});

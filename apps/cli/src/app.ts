@@ -1,5 +1,6 @@
 import { buildApplication, buildRouteMap } from "@stricli/core";
 import pkg from "../package.json" with { type: "json" };
+import { connectCommand } from "./commands/connect.js";
 import { devRouteMap } from "./commands/dev/index.js";
 import { disableCommand } from "./commands/disable.js";
 import { doctorCommand } from "./commands/doctor.js";
@@ -13,6 +14,7 @@ import { whoamiCommand } from "./commands/whoami.js";
 
 const routes = buildRouteMap({
 	routes: {
+		connect: connectCommand,
 		login: loginCommand,
 		logout: logoutCommand,
 		whoami: whoamiCommand,

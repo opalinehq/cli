@@ -3,6 +3,7 @@ import { buildCommand } from "@stricli/core";
 import { describeLogoutApiBaseRisk } from "../lib/api-base.js";
 import { createApiClient } from "../lib/api-client.js";
 import { clearCredentials, loadCredentials } from "../lib/credentials.js";
+import { resetCliProductAnalyticsIdentity } from "../lib/product-analytics.js";
 
 async function runLogout(flags: {
 	localOnly: boolean;
@@ -32,6 +33,7 @@ async function runLogout(flags: {
 	}
 
 	clearCredentials();
+	resetCliProductAnalyticsIdentity();
 	p.log.success(
 		flags.localOnly
 			? "Logged out locally. Server token was not revoked."

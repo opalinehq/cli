@@ -2,7 +2,10 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { parse as parseTOML, stringify as stringifyTOML } from "smol-toml";
-import { getCliCommand } from "../../cli-command.js";
+import {
+	getPersistentHookCommand,
+	isPersistentHookCommand,
+} from "../../persistent-hook-command.js";
 
 export const CONFIG_PATH = join(homedir(), ".codex", "config.toml");
 const HOOK_COMMAND = ["opaline", "hooks", "codex", "turn-complete"] as const;
@@ -43,14 +46,13 @@ function commandsMatch(
 function isOpalineHookCommand(command: readonly string[]): boolean {
 	return (
 		commandsMatch(command, HOOK_COMMAND) ||
-		commandsMatch(command, LEGACY_HOOK_COMMAND)
+		commandsMatch(command, LEGACY_HOOK_COMMAND) ||
+		isPersistentHookCommand(command, ["hooks", "codex", "turn-complete"])
 	);
 }
 
 export function installHook(configPath: string = CONFIG_PATH): void {
 	const config = readConfig(configPath);
-	const hookCommand =
-		getCliCommand() === "rudel" ? LEGACY_HOOK_COMMAND : HOOK_COMMAND;
 	const notify = config.notify;
 	if (notify !== undefined && !Array.isArray(notify)) {
 		throw new Error(
@@ -58,9 +60,10 @@ export function installHook(configPath: string = CONFIG_PATH): void {
 		);
 	}
 	const current = notify ?? [];
-	if (commandsMatch(current, hookCommand)) return;
+	const command = getPersistentHookCommand(["hooks", "codex", "turn-complete"]);
+	if (commandsMatch(current, command)) return;
 	if (isOpalineHookCommand(current)) {
-		config.notify = [...hookCommand];
+		config.notify = command;
 		writeConfig(configPath, config);
 		return;
 	}
@@ -72,7 +75,7 @@ export function installHook(configPath: string = CONFIG_PATH): void {
 			: current;
 
 	if (withoutLegacy.length === 0) {
-		config.notify = [...hookCommand];
+		config.notify = command;
 		writeConfig(configPath, config);
 		return;
 	}

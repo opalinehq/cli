@@ -23,6 +23,7 @@ export const ProductAnalyticsPlatformOsSchema = z.enum([
 ]);
 export const ProductAnalyticsAuthFlowSchema = z.literal("device_authorization");
 export const ProductAnalyticsCliCommandNameSchema = z.enum([
+	"connect",
 	"login",
 	"logout",
 	"whoami",
@@ -71,6 +72,18 @@ const RequiredCommonSchema = z.object({
 });
 const idSchema = z.string().min(1);
 const nonEmptyStringSchema = z.string().min(1);
+const repositoryCountsSchema = z.object({
+	repository_count: z.number().int().nonnegative(),
+	session_count: z.number().int().nonnegative(),
+	repository_session_counts: z.array(z.number().int().nonnegative()),
+});
+export type ProductAnalyticsRepositoryCounts = z.infer<
+	typeof repositoryCountsSchema
+>;
+const autoUploadSetupProperties = {
+	...repositoryCountsSchema.partial().shape,
+	setup_command: z.enum(["enable", "upload"]).optional(),
+};
 
 export const PRODUCT_ANALYTICS_EVENTS = {
 	CLI_FIRST_RUN: "CLI First Run",
@@ -123,9 +136,10 @@ const CliLoginFailedEventSchema = RequiredCommonSchema.extend({
 }).strict();
 
 const AutoUploadEnabledEventSchema = RequiredCommonSchema.extend({
+	...autoUploadSetupProperties,
 	surface: z.literal("cli"),
-	organization_id: idSchema,
-	user_id: idSchema,
+	organization_id: idSchema.optional(),
+	user_id: idSchema.optional(),
 	agent_source: SourceSchema,
 	cli_version: nonEmptyStringSchema,
 	platform_os: ProductAnalyticsPlatformOsSchema,
@@ -133,6 +147,7 @@ const AutoUploadEnabledEventSchema = RequiredCommonSchema.extend({
 }).strict();
 
 const AutoUploadEnableFailedEventSchema = RequiredCommonSchema.extend({
+	...autoUploadSetupProperties,
 	surface: z.literal("cli"),
 	agent_source: z.union([SourceSchema, z.literal("unknown")]),
 	failure_stage: ProductAnalyticsEnableFailureStageSchema,

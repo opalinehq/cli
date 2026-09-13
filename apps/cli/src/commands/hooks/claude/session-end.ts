@@ -1,6 +1,5 @@
 import { getLogger } from "@logtape/logtape";
 import { buildCommand } from "@stricli/core";
-import { resolveRepoIdentity } from "../../../contracts/index.js";
 import {
 	claudeCodeAdapter,
 	type SessionFile,
@@ -12,6 +11,10 @@ import { removeFailedUpload } from "../../../lib/failed-uploads.js";
 import { getGitInfo } from "../../../lib/git-info.js";
 import { reportHookUploadFailure } from "../../../lib/hook-upload-failure.js";
 import { getProjectOrgId } from "../../../lib/project-config.js";
+import {
+	getLegacyRepositoryKey,
+	resolveUploadRepositoryIdentity,
+} from "../../../lib/repository-discovery.js";
 import { allowsInsecureEndpointFromEnv } from "../../../lib/upload-endpoint.js";
 import {
 	formatRedactionSummary,
@@ -44,15 +47,12 @@ async function runSessionEnd(): Promise<undefined | Error> {
 		const input = JSON.parse(raw) as HookInput;
 		if (!input.session_id || !input.transcript_path) return;
 		const gitInfo = await getGitInfo(input.cwd);
-		const repository = resolveRepoIdentity({
-			gitRemote: gitInfo.gitRemote ?? null,
-			packageName: gitInfo.packageName ?? null,
-			projectPath: input.cwd,
-		});
+		const repository = resolveUploadRepositoryIdentity(input.cwd, gitInfo);
 		if (
 			!isRepositoryAutoUploadAllowed(
 				repository.repoKey,
 				claudeCodeAdapter.source,
+				[getLegacyRepositoryKey(input.cwd, gitInfo)],
 			)
 		) {
 			logger.info(

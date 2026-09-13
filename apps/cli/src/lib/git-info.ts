@@ -1,8 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { stat } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import { exec } from "./exec.js";
 
 export interface GitInfo {
+	repositoryRoot?: string;
 	gitRemote?: string;
 	packageName?: string;
 	packageType?: string;
@@ -25,22 +27,47 @@ export function normalizeRemoteUrl(url: string): string {
  * Extract git metadata for a given project directory.
  */
 export async function getGitInfo(cwd: string): Promise<GitInfo> {
+	const repositoryRoot = await getRepositoryRoot(cwd);
 	const [remoteUrl, branch, sha, packageInfo] = await Promise.all([
-		getGitRemoteUrl(cwd),
+		getGitRemoteUrl(repositoryRoot ?? cwd),
 		getGitBranch(cwd),
 		getGitSha(cwd),
-		getPackageInfo(cwd),
+		getPackageInfo(repositoryRoot ?? cwd),
 	]);
 
 	const gitRemote = remoteUrl ? normalizeRemoteUrl(remoteUrl) : undefined;
 
 	return {
+		repositoryRoot,
 		gitRemote,
 		packageName: packageInfo?.name,
 		packageType: packageInfo?.type,
 		branch: branch ?? undefined,
 		sha: sha ?? undefined,
 	};
+}
+
+async function getRepositoryRoot(cwd: string): Promise<string | undefined> {
+	let directory = resolve(cwd);
+	while (!(await stat(directory).catch(() => null))?.isDirectory()) {
+		const parent = dirname(directory);
+		if (parent === directory) return undefined;
+		directory = parent;
+	}
+	const result = await exec("git", [
+		"-C",
+		directory,
+		"rev-parse",
+		"--path-format=absolute",
+		"--git-common-dir",
+		"--show-toplevel",
+	]);
+	if (result.exitCode !== 0) return undefined;
+	const [commonDirectory, worktreeRoot] = result.stdout.trim().split("\n");
+	if (!commonDirectory || !worktreeRoot) return undefined;
+	return basename(commonDirectory) === ".git"
+		? dirname(commonDirectory)
+		: worktreeRoot;
 }
 
 interface PackageInfo {
