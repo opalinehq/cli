@@ -1,14 +1,19 @@
 # `@opalinehq/cli`
 
-The canonical Opaline CLI package for Claude Code and OpenAI Codex session
-analytics.
+The shared Opaline CLI implementation for Claude Code and OpenAI Codex session
+analytics. The recommended install name is `opaline`:
 
 ```bash
-npm install --global @opalinehq/cli
+npm install --global opaline
 opaline login
 opaline upload
 opaline doctor
 ```
+
+`npm install --global @opalinehq/cli` remains supported and provides the same
+`opaline` command. Choose one of these global installations. When switching
+to `opaline`, uninstall `@opalinehq/cli` first. Credentials and existing hooks
+continue to work.
 
 `opaline upload` groups discovered worktrees by repository, saves the selected
 repositories for automatic upload, and sends only sessions the server does not
@@ -26,3 +31,7 @@ Important: session transcripts are uploaded. Known-pattern secret filtering is
 best-effort and cannot guarantee that every sensitive value is removed.
 Capable servers use direct multipart object-storage uploads after filtering;
 older servers continue to use the legacy ingest endpoint.
+
+## License
+
+Copyright (c) 2026 Opaline Labs, Inc. Licensed under [MIT](LICENSE).

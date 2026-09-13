@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { getCliCommand } from "../../cli-command.js";
 
 const HOOK_COMMAND = "opaline hooks claude session-end";
 const LEGACY_HOOK_COMMAND = "rudel hooks claude session-end";
@@ -52,6 +53,8 @@ export function isHookEnabled(): boolean {
 
 export function addHook(): void {
 	const settings = readClaudeSettings();
+	const command =
+		getCliCommand() === "rudel" ? LEGACY_HOOK_COMMAND : HOOK_COMMAND;
 	if (!settings.hooks) {
 		settings.hooks = {};
 	}
@@ -61,9 +64,9 @@ export function addHook(): void {
 
 	for (const entry of settings.hooks.SessionEnd) {
 		for (const hook of entry.hooks ?? []) {
-			if (hook.command === HOOK_COMMAND) return;
-			if (hook.command === LEGACY_HOOK_COMMAND) {
-				hook.command = HOOK_COMMAND;
+			if (hook.command === command) return;
+			if (isOpalineHookCommand(hook.command)) {
+				hook.command = command;
 				writeClaudeSettings(settings);
 				return;
 			}
@@ -72,7 +75,7 @@ export function addHook(): void {
 
 	settings.hooks.SessionEnd.push({
 		matcher: "",
-		hooks: [{ type: "command", command: HOOK_COMMAND, async: true }],
+		hooks: [{ type: "command", command, async: true }],
 	});
 
 	writeClaudeSettings(settings);

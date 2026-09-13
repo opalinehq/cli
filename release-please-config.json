@@ -14,7 +14,29 @@
 		"apps/cli": {
 			"release-type": "node",
 			"component": "opaline-cli",
-			"changelog-path": "CHANGELOG.md"
+			"changelog-path": "CHANGELOG.md",
+			"extra-files": [
+				{
+					"type": "json",
+					"path": "/packages/opaline/package.json",
+					"jsonpath": "$.version"
+				},
+				{
+					"type": "json",
+					"path": "/packages/opaline/package.json",
+					"jsonpath": "$.dependencies['@opalinehq/cli']"
+				},
+				{
+					"type": "json",
+					"path": "/packages/rudel-alias/package.json",
+					"jsonpath": "$.version"
+				},
+				{
+					"type": "json",
+					"path": "/packages/rudel-alias/package.json",
+					"jsonpath": "$.dependencies['@opalinehq/cli']"
+				}
+			]
 		}
 	}
 }

@@ -34,9 +34,19 @@
         "typescript": "5.9.2",
       },
     },
+    "packages/opaline": {
+      "name": "opaline",
+      "version": "0.5.3",
+      "bin": {
+        "opaline": "./bin/opaline.js",
+      },
+      "dependencies": {
+        "@opalinehq/cli": "0.5.3",
+      },
+    },
     "packages/rudel-alias": {
       "name": "rudel",
-      "version": "0.5.1",
+      "version": "0.5.3",
       "bin": {
         "rudel": "./bin/rudel.js",
       },
@@ -123,6 +133,8 @@
     "posthog-node": ["posthog-node@5.46.1", "", { "dependencies": { "@posthog/core": "^1.45.1" }, "peerDependencies": { "rxjs": "^7.0.0" }, "optionalPeers": ["rxjs"] }, "sha512-WjCqExq44pBdyg9MSsH6UAE0tNZ88p4aIuVFicgqhjf2Fbws6IhS4ioYUa4aBrbUPS9EDRXtBTtF5DpP1ml8Pw=="],
 
     "radash": ["radash@12.1.1", "", {}, "sha512-h36JMxKRqrAxVD8201FrCpyeNuUY9Y5zZwujr20fFO77tpUtGa6EZzfKw/3WaiBX95fq7+MpsuMLNdSnORAwSA=="],
+
+    "opaline": ["opaline@workspace:packages/opaline"],
 
     "rudel": ["rudel@workspace:packages/rudel-alias"],
 

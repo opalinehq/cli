@@ -206,7 +206,7 @@ export function formatUploadError(error: unknown): string {
 		error instanceof ORPCError &&
 		error.code === SESSION_UPLOAD_SHRINK_REJECTED_CODE
 	) {
-		return "Opaline refused this upload because it is smaller than the stored session. Check that the transcript is complete, then run `opaline upload <session> --force-replace` only if the replacement is intentional. If this CLI does not recognize the flag, upgrade @opalinehq/cli first.";
+		return "Opaline refused this upload because it is smaller than the stored session. Check that the transcript is complete, then run `opaline upload <session> --force-replace` only if the replacement is intentional. If this CLI does not recognize the flag, upgrade your Opaline CLI installation first.";
 	}
 	if (
 		error instanceof ORPCError &&

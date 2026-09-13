@@ -9,7 +9,7 @@ team analytics. The production API is at
 Requires Node.js 20 or newer.
 
 ```bash
-npm install --global @opalinehq/cli
+npm install --global opaline
 opaline login
 opaline upload
 ```
@@ -22,6 +22,39 @@ installs the required Claude Code and/or Codex hooks, and uploads new sessions.
 Existing `rudel` users do not need to log in again. Opaline intentionally reads
 the existing `~/.rudel` credential and state directory, and the `rudel` package
 continues as a compatibility alias.
+
+### Install names and upgrades
+
+| Install | Command | Purpose |
+| --- | --- | --- |
+| `npm install --global opaline` | `opaline` | Recommended installation. |
+| `npm install --global @opalinehq/cli` | `opaline` | Supported scoped installation. |
+| `npm install --global rudel` | `rudel` | Compatibility for existing commands and scripts. |
+
+All three packages use the same CLI implementation and are released together.
+The `opaline` and `rudel` launchers depend on the exact matching
+`@opalinehq/cli` version, so upgrades cannot silently mix releases.
+
+Choose either `opaline` or `@opalinehq/cli` for a global installation; both
+provide the `opaline` executable. To switch from the scoped installation:
+
+```bash
+npm uninstall --global @opalinehq/cli
+npm install --global opaline
+```
+
+Your login, configuration, and upload history remain in `~/.rudel`.
+The `rudel` package can remain installed alongside
+`opaline`; update it with `npm install --global rudel@latest` to receive
+the current implementation.
+
+Hook setup uses the command you invoked: `opaline upload` installs `opaline`
+hooks and `rudel upload` installs `rudel` hooks. A `rudel`-only installation
+therefore continues to work. Both commands recognize existing hooks under
+either name; running setup with a different command updates those hooks.
+
+One-off invocations also work: `npx opaline@latest --help`,
+`npx @opalinehq/cli@latest --help`, and `npx rudel@latest --help`.
 
 Run `opaline upload` from any directory, including your home folder. The picker
 finds saved sessions across repositories and uploads the repositories you select.
@@ -153,4 +186,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow.
 
 ## License
 
-[MIT](LICENSE)
+Copyright (c) 2026 Opaline Labs, Inc. Licensed under [MIT](LICENSE).
