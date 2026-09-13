@@ -54,7 +54,7 @@ jobs:
         if: steps.release.outputs.prs_created == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          ref: ${{ fromJSON(steps.release.outputs.pr || '{}').headBranchName }}
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
 
       - name: Setup Bun for release lockfile
@@ -66,7 +66,7 @@ jobs:
       - name: Synchronize the release PR lockfile
         if: steps.release.outputs.prs_created == 'true'
         env:
-          RELEASE_PR_BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          RELEASE_PR_BRANCH: ${{ fromJSON(steps.release.outputs.pr || '{}').headBranchName }}
         run: |
           case "${RELEASE_PR_BRANCH}" in
             release-please--branches--main|release-please--branches--main--components--opaline-cli) ;;
@@ -191,11 +191,11 @@ jobs:
       - name: Wait for @opalinehq/cli registry availability
         run: |
           version="$(node -p "require('./apps/cli/package.json').version")"
-          for attempt in {1..30}; do
+          for attempt in {1..60}; do
             if [[ "$(npm view "@opalinehq/cli@${version}" version 2>/dev/null)" == "${version}" ]]; then
               exit 0
             fi
-            sleep 2
+            sleep 5
           done
           echo "@opalinehq/cli@${version} did not become available in time."
           exit 1
