@@ -1,16 +1,16 @@
-# `@opalinehq/cli`
+# `opaline`
 
 The canonical Opaline CLI package for Claude Code and OpenAI Codex session
 analytics.
 
 ```bash
-npx @opalinehq/cli@latest
-npx @opalinehq/cli@latest doctor
+npx opaline@latest
+npx opaline@latest doctor
 ```
 
 Run this from any directory. The CLI scans local Claude Code and Codex sessions,
 shows repository and session counts, and lets you choose which repos to upload
-and keep syncing. Login opens only after selection. `pnpx @opalinehq/cli@latest`
+and keep syncing. Login opens only after selection. `pnpx opaline@latest`
 works too. A global install remains optional.
 
 Copying the command from the Opaline demo adds a hidden `--code` value. That

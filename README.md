@@ -9,12 +9,12 @@ team analytics. The production API is at
 Requires Node.js 20 or newer.
 
 ```bash
-npx @opalinehq/cli@latest
+npx opaline@latest
 ```
 
 Run this from any directory. The CLI scans local Claude Code and Codex sessions,
 shows repository and session counts, and lets you choose which repos to upload
-and keep syncing. Login opens only after selection. `pnpx @opalinehq/cli@latest`
+and keep syncing. Login opens only after selection. `pnpx opaline@latest`
 works too. A global install remains optional.
 
 Copying the command from the Opaline demo adds a hidden `--code` value. That
