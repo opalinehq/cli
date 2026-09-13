@@ -19,4 +19,4 @@ separate global `opaline` installation is required.
 
 ## License
 
-Copyright (c) 2025 Opaline Labs, Inc. Licensed under [MIT](LICENSE).
+Copyright (c) 2026 Opaline Labs, Inc. Licensed under [MIT](LICENSE).

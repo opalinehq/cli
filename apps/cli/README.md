@@ -34,4 +34,4 @@ older servers continue to use the legacy ingest endpoint.
 
 ## License
 
-Copyright (c) 2025 Opaline Labs, Inc. Licensed under [MIT](LICENSE).
+Copyright (c) 2026 Opaline Labs, Inc. Licensed under [MIT](LICENSE).
