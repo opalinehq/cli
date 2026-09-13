@@ -50,6 +50,37 @@ jobs:
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
 
+      - name: Checkout release PR for lockfile synchronization
+        if: steps.release.outputs.prs_created == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+
+      - name: Setup Bun for release lockfile
+        if: steps.release.outputs.prs_created == 'true'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+
+      - name: Synchronize the release PR lockfile
+        if: steps.release.outputs.prs_created == 'true'
+        env:
+          RELEASE_PR_BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+        run: |
+          case "${RELEASE_PR_BRANCH}" in
+            release-please--branches--main|release-please--branches--main--components--opaline-cli) ;;
+            *) echo "Unexpected release PR branch: ${RELEASE_PR_BRANCH}"; exit 1 ;;
+          esac
+          bun install --lockfile-only --ignore-scripts
+          if ! git diff --quiet -- bun.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add bun.lock
+            git commit -m "chore: synchronize CLI release lockfile"
+            git push origin "HEAD:${RELEASE_PR_BRANCH}"
+          fi
+
   publish:
     if: >-
       always() &&
@@ -86,6 +117,13 @@ jobs:
 
           test "${CLI_RELEASE_TAG}" = "${expected_cli_tag}"
 
+          for package_dir in packages/opaline packages/rudel-alias; do
+            alias_version="$(node -p "require('./${package_dir}/package.json').version")"
+            alias_dependency="$(node -p "require('./${package_dir}/package.json').dependencies['@opalinehq/cli']")"
+            test "${package_version}" = "${alias_version}"
+            test "${package_version}" = "${alias_dependency}"
+          done
+
           git fetch --force --no-tags origin main:refs/remotes/origin/main
           git fetch --force --no-tags origin \
             "refs/tags/${expected_cli_tag}:refs/tags/${expected_cli_tag}"
@@ -109,8 +147,11 @@ jobs:
       - name: Setup Bun
         uses: ./.github/actions/setup
 
-      - name: Require completed manual npm bootstrap
-        run: npm view @opalinehq/cli version >/dev/null
+      - name: Require existing npm package records
+        run: |
+          npm view @opalinehq/cli version >/dev/null
+          npm view opaline version >/dev/null
+          npm view rudel version >/dev/null
 
       - name: Verify
         run: bun run verify
@@ -122,7 +163,7 @@ jobs:
           if npm view "@opalinehq/cli@${version}" version >/dev/null 2>&1; then
             echo "@opalinehq/cli@${version} is already published."
           else
-            npm publish --access public --provenance
+            npm publish --access public --provenance --tag latest
           fi
 
       - name: Wait for @opalinehq/cli registry availability
@@ -136,3 +177,19 @@ jobs:
           done
           echo "@opalinehq/cli@${version} did not become available in time."
           exit 1
+
+      - name: Publish opaline and rudel launchers with provenance
+        shell: bash
+        run: |
+          for package_dir in packages/opaline packages/rudel-alias; do
+            (
+              cd "${package_dir}"
+              name="$(node -p "require('./package.json').name")"
+              version="$(node -p "require('./package.json').version")"
+              if npm view "${name}@${version}" version >/dev/null 2>&1; then
+                echo "${name}@${version} is already published."
+              else
+                npm publish --access public --provenance --tag latest
+              fi
+            )
+          done

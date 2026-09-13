@@ -29,5 +29,6 @@ We aim to acknowledge reports within 48 hours and provide a fix or mitigation pl
 
 This policy covers the public Opaline CLI packages:
 
+- `opaline` (the recommended install name)
 - `@opalinehq/cli`
 - the `rudel` compatibility alias

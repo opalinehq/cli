@@ -82,12 +82,13 @@ jobs:
       - name: Setup Bun
         uses: ./.github/actions/setup
 
-      - name: Pack and install both CLI packages
+      - name: Pack and install all three CLI packages
         shell: bash
         run: |
           rm -rf .tmp/cli-smoke
           mkdir -p .tmp/cli-smoke/package .tmp/cli-smoke/install
           opaline_tarball="$(npm pack ./apps/cli --pack-destination .tmp/cli-smoke/package | tail -n 1)"
+          primary_tarball="$(npm pack ./packages/opaline --pack-destination .tmp/cli-smoke/package | tail -n 1)"
           rudel_tarball="$(npm pack ./packages/rudel-alias --pack-destination .tmp/cli-smoke/package | tail -n 1)"
           npm install \
             --prefix .tmp/cli-smoke/install \
@@ -95,16 +96,31 @@ jobs:
             --no-audit \
             --no-fund \
             ".tmp/cli-smoke/package/${opaline_tarball}" \
+            ".tmp/cli-smoke/package/${primary_tarball}" \
             ".tmp/cli-smoke/package/${rudel_tarball}"
 
       - name: Verify canonical and alias behavior
         shell: bash
         run: |
           opaline_cli=".tmp/cli-smoke/install/node_modules/@opalinehq/cli/dist/cli.js"
+          primary_cli=".tmp/cli-smoke/install/node_modules/opaline/bin/opaline.js"
           rudel_cli=".tmp/cli-smoke/install/node_modules/rudel/bin/rudel.js"
 
+          version="$(node -p "require('./apps/cli/package.json').version")"
+          for package_dir in packages/opaline packages/rudel-alias; do
+            test "$(node -p "require('./${package_dir}/package.json').version")" = "${version}"
+            test "$(node -p "require('./${package_dir}/package.json').dependencies['@opalinehq/cli']")" = "${version}"
+          done
+
+          for cli in "${opaline_cli}" "${primary_cli}" "${rudel_cli}"; do
+            test "$(node "${cli}" --version)" = "${version}"
+          done
+
           node "${opaline_cli}" --help > .tmp/cli-smoke/opaline-help.stdout 2> .tmp/cli-smoke/opaline-help.stderr
+          node "${primary_cli}" --help > .tmp/cli-smoke/primary-help.stdout 2> .tmp/cli-smoke/primary-help.stderr
           node "${rudel_cli}" --help > .tmp/cli-smoke/rudel-help.stdout 2> .tmp/cli-smoke/rudel-help.stderr
+          cmp .tmp/cli-smoke/opaline-help.stdout .tmp/cli-smoke/primary-help.stdout
+          cmp .tmp/cli-smoke/opaline-help.stderr .tmp/cli-smoke/primary-help.stderr
           cmp .tmp/cli-smoke/opaline-help.stdout .tmp/cli-smoke/rudel-help.stdout
           test "$(head -n 1 .tmp/cli-smoke/rudel-help.stderr)" = "rudel is now opaline"
           tail -n +2 .tmp/cli-smoke/rudel-help.stderr | cmp .tmp/cli-smoke/opaline-help.stderr -
@@ -112,31 +128,41 @@ jobs:
           set +e
           node "${opaline_cli}" not-a-command > .tmp/cli-smoke/opaline-error.stdout 2> .tmp/cli-smoke/opaline-error.stderr
           opaline_exit=$?
+          node "${primary_cli}" not-a-command > .tmp/cli-smoke/primary-error.stdout 2> .tmp/cli-smoke/primary-error.stderr
+          primary_exit=$?
           node "${rudel_cli}" not-a-command > .tmp/cli-smoke/rudel-error.stdout 2> .tmp/cli-smoke/rudel-error.stderr
           rudel_exit=$?
           set -e
 
           test "${opaline_exit}" -ne 0
           test "${opaline_exit}" -eq "${rudel_exit}"
+          test "${opaline_exit}" -eq "${primary_exit}"
+          cmp .tmp/cli-smoke/opaline-error.stdout .tmp/cli-smoke/primary-error.stdout
+          cmp .tmp/cli-smoke/opaline-error.stderr .tmp/cli-smoke/primary-error.stderr
           cmp .tmp/cli-smoke/opaline-error.stdout .tmp/cli-smoke/rudel-error.stdout
           tail -n +2 .tmp/cli-smoke/rudel-error.stderr | cmp .tmp/cli-smoke/opaline-error.stderr -
 
-          mkdir -p .tmp/cli-smoke/opaline-config .tmp/cli-smoke/rudel-config
+          mkdir -p .tmp/cli-smoke/opaline-config .tmp/cli-smoke/primary-config .tmp/cli-smoke/rudel-config
           hook_input='{"session_id":"","transcript_path":"","cwd":""}'
           printf '%s' "${hook_input}" | OPALINE_CONFIG_DIR=.tmp/cli-smoke/opaline-config node "${opaline_cli}" hooks claude session-end > .tmp/cli-smoke/opaline-stdin.stdout 2> .tmp/cli-smoke/opaline-stdin.stderr
           opaline_stdin_exit=$?
+          printf '%s' "${hook_input}" | OPALINE_CONFIG_DIR=.tmp/cli-smoke/primary-config node "${primary_cli}" hooks claude session-end > .tmp/cli-smoke/primary-stdin.stdout 2> .tmp/cli-smoke/primary-stdin.stderr
+          primary_stdin_exit=$?
           printf '%s' "${hook_input}" | OPALINE_CONFIG_DIR=.tmp/cli-smoke/rudel-config node "${rudel_cli}" hooks claude session-end > .tmp/cli-smoke/rudel-stdin.stdout 2> .tmp/cli-smoke/rudel-stdin.stderr
           rudel_stdin_exit=$?
 
           test "${opaline_stdin_exit}" -eq "${rudel_stdin_exit}"
+          test "${opaline_stdin_exit}" -eq "${primary_stdin_exit}"
+          cmp .tmp/cli-smoke/opaline-stdin.stdout .tmp/cli-smoke/primary-stdin.stdout
+          cmp .tmp/cli-smoke/opaline-stdin.stderr .tmp/cli-smoke/primary-stdin.stderr
           cmp .tmp/cli-smoke/opaline-stdin.stdout .tmp/cli-smoke/rudel-stdin.stdout
           tail -n +2 .tmp/cli-smoke/rudel-stdin.stderr | cmp .tmp/cli-smoke/opaline-stdin.stderr -
 
-      - name: Run packed CLI smoke suite
+      - name: Run packed CLI smoke suite through opaline
         shell: bash
         run: bun run --cwd apps/cli test:packed-smoke
         env:
-          OPALINE_PACKED_CLI: ${{ github.workspace }}/.tmp/cli-smoke/install/node_modules/@opalinehq/cli/dist/cli.js
+          OPALINE_PACKED_CLI: ${{ github.workspace }}/.tmp/cli-smoke/install/node_modules/opaline/bin/opaline.js
 
       - name: Verify Windows browser opening
         if: runner.os == 'Windows'

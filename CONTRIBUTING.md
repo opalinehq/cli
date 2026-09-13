@@ -44,13 +44,15 @@ bun run verify
 - Never include service, dashboard, deployment, or private monorepo code in
   this public CLI repository.
 
-Release Please versions `@opalinehq/cli` and `rudel` in lockstep. Publishing is
-performed by maintainers; contributors must not publish packages from a branch.
+Release Please versions `opaline`, `@opalinehq/cli`, and `rudel` together.
+Publishing is performed by maintainers; contributors must not publish packages
+from a branch. See [RELEASING.md](RELEASING.md) for npm setup and release recovery.
 
 ## Project structure
 
 ```text
 apps/cli/              @opalinehq/cli source, tests, and bundled contracts
+packages/opaline/      recommended opaline installation and executable
 packages/rudel-alias/  thin rudel compatibility executable
 ```
 
