@@ -1,7 +1,11 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { getCliCommand } from "../../cli-command.js";
+import {
+	getPersistentCliPath,
+	getPersistentHookCommand,
+	quoteHookArgument,
+} from "../../persistent-hook-command.js";
 
 const HOOK_COMMAND = "opaline hooks claude session-end";
 const LEGACY_HOOK_COMMAND = "rudel hooks claude session-end";
@@ -52,9 +56,12 @@ export function isHookEnabled(): boolean {
 }
 
 export function addHook(): void {
-	const settings = readClaudeSettings();
+	const argv = getPersistentHookCommand(["hooks", "claude", "session-end"]);
 	const command =
-		getCliCommand() === "rudel" ? LEGACY_HOOK_COMMAND : HOOK_COMMAND;
+		argv[0] === "opaline" || argv[0] === "rudel"
+			? `${argv[0]} hooks claude session-end`
+			: `${argv.slice(0, 2).map(quoteHookArgument).join(" ")} hooks claude session-end`;
+	const settings = readClaudeSettings();
 	if (!settings.hooks) {
 		settings.hooks = {};
 	}
@@ -105,5 +112,11 @@ export function removeHook(): void {
 }
 
 function isOpalineHookCommand(command: string): boolean {
-	return command === HOOK_COMMAND || command === LEGACY_HOOK_COMMAND;
+	return (
+		command === HOOK_COMMAND ||
+		command === LEGACY_HOOK_COMMAND ||
+		command.endsWith(
+			` ${quoteHookArgument(getPersistentCliPath())} hooks claude session-end`,
+		)
+	);
 }

@@ -4,26 +4,37 @@ import { app } from "./app.js";
 import { loadCredentials } from "./lib/credentials.js";
 import { debugLog } from "./lib/debug.js";
 import {
-	CliProductAnalyticsEvents,
-	captureCliProductAnalyticsEvent,
-	consumeCliFirstRun,
-	getBaseCliEventPayload,
 	shutdownCliProductAnalytics,
+	trackCliFirstRun,
 } from "./lib/product-analytics.js";
 import { initializeR2StagingCleanup } from "./lib/r2-staging-cleanup.js";
 
 export async function runCli(
 	args: readonly string[] = process.argv.slice(2),
 ): Promise<void> {
-	const commandName = getTopLevelCommandName(args);
+	const commandArgs =
+		args.length === 0 ||
+		(args[0]?.startsWith("--") &&
+			args.some((arg) => arg === "--code" || arg.startsWith("--code=")))
+			? ["connect", ...args]
+			: args;
+	const commandName = getTopLevelCommandName(commandArgs);
 	debugLog("starting command", { command: commandName, version: pkg.version });
 	await initializeR2StagingCleanup();
-	if (commandName !== "doctor") {
-		trackFirstRun(commandName);
-	}
-
 	try {
-		await run(app, args, { process });
+		if (commandName !== "doctor" && commandName !== "hooks") {
+			try {
+				const credentials = loadCredentials();
+				trackCliFirstRun({
+					commandName,
+					isAuthenticated: credentials !== null,
+					userId: credentials?.user?.id,
+				});
+			} catch {
+				debugLog("analytics startup failed");
+			}
+		}
+		await run(app, commandArgs, { process });
 	} finally {
 		await shutdownCliProductAnalytics();
 		debugLog("command finished", {
@@ -36,6 +47,7 @@ export async function runCli(
 function getTopLevelCommandName(args: readonly string[]) {
 	const commandName = args.find((argument) => !argument.startsWith("-"));
 	switch (commandName) {
+		case "connect":
 		case "login":
 		case "logout":
 		case "whoami":
@@ -50,22 +62,4 @@ function getTopLevelCommandName(args: readonly string[]) {
 		default:
 			return "help";
 	}
-}
-
-function trackFirstRun(commandName: ReturnType<typeof getTopLevelCommandName>) {
-	const { cliInstallationId, shouldTrack } = consumeCliFirstRun();
-	if (!shouldTrack) return;
-
-	captureCliProductAnalyticsEvent({
-		distinctId: cliInstallationId,
-		event: CliProductAnalyticsEvents.CLI_FIRST_RUN,
-		surface: "cli",
-		disablePersonProfile: true,
-		payload: {
-			cli_installation_id: cliInstallationId,
-			command_name: commandName,
-			is_authenticated: loadCredentials() !== null,
-			...getBaseCliEventPayload(),
-		},
-	});
 }

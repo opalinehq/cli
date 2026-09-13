@@ -1,4 +1,4 @@
-import { readdir, readFile } from "node:fs/promises";
+import { open, readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -27,13 +27,89 @@ export async function readJsonlFirstLine(
 	filePath: string,
 ): Promise<unknown | null> {
 	try {
-		const content = await readFile(filePath, "utf-8");
-		const firstLine = content.split("\n")[0];
-		if (!firstLine) return null;
-		return JSON.parse(firstLine);
+		const file = await open(filePath, "r");
+		try {
+			const chunks: Buffer[] = [];
+			for (let offset = 0; offset < 1024 * 1024; offset += 64 * 1024) {
+				const buffer = Buffer.alloc(64 * 1024);
+				const { bytesRead } = await file.read(buffer, 0, buffer.length, offset);
+				const data = buffer.subarray(0, bytesRead);
+				const newline = data.indexOf(10);
+				chunks.push(newline < 0 ? data : data.subarray(0, newline));
+				if (newline >= 0 || bytesRead < buffer.length) {
+					return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+				}
+			}
+			return null;
+		} finally {
+			await file.close();
+		}
 	} catch {
 		return null;
 	}
+}
+
+/** Read just the edges of a transcript; discovery must not load whole conversations. */
+export async function readSessionDiscoveryMetadata(filePath: string): Promise<{
+	cwd: string | undefined;
+	lastActivityAt: number | undefined;
+}> {
+	try {
+		const file = await open(filePath, "r");
+		try {
+			const { size, mtimeMs } = await file.stat();
+			const buffer = Buffer.alloc(Math.min(size, 64 * 1024));
+			const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+			const head = parseDiscoveryLines(
+				buffer.subarray(0, bytesRead).toString("utf8"),
+			);
+			let lastActivityAt = head.lastActivityAt;
+			if (size > buffer.length) {
+				const tailRead = await file.read(
+					buffer,
+					0,
+					buffer.length,
+					size - buffer.length,
+				);
+				const tail = buffer.subarray(0, tailRead.bytesRead).toString("utf8");
+				const metadata = parseDiscoveryLines(
+					tail.slice(tail.indexOf("\n") + 1),
+				);
+				if (metadata.lastActivityAt !== undefined)
+					lastActivityAt = Math.max(
+						lastActivityAt ?? 0,
+						metadata.lastActivityAt,
+					);
+			}
+			return { cwd: head.cwd, lastActivityAt: lastActivityAt ?? mtimeMs };
+		} finally {
+			await file.close();
+		}
+	} catch {
+		return { cwd: undefined, lastActivityAt: undefined };
+	}
+}
+
+function parseDiscoveryLines(content: string) {
+	let cwd: string | undefined;
+	let lastActivityAt: number | undefined;
+	for (const line of content.split("\n")) {
+		let entry: unknown;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (typeof entry !== "object" || entry === null) continue;
+		if (!cwd && "cwd" in entry && typeof entry.cwd === "string")
+			cwd = entry.cwd;
+		if ("timestamp" in entry && typeof entry.timestamp === "string") {
+			const timestamp = Date.parse(entry.timestamp);
+			if (Number.isFinite(timestamp))
+				lastActivityAt = Math.max(lastActivityAt ?? 0, timestamp);
+		}
+	}
+	return { cwd, lastActivityAt };
 }
 
 export async function walkJsonlFiles(dir: string): Promise<string[]> {

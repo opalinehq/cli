@@ -51,20 +51,20 @@ jobs:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
 
       - name: Checkout release PR for lockfile synchronization
-        if: steps.release.outputs.prs_created == 'true'
+        if: steps.release.outputs.prs_created == 'true' && steps.release.outputs.pr != ''
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ fromJSON(steps.release.outputs.pr || '{}').headBranchName }}
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
 
       - name: Setup Bun for release lockfile
-        if: steps.release.outputs.prs_created == 'true'
+        if: steps.release.outputs.prs_created == 'true' && steps.release.outputs.pr != ''
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: 1.3.9
+          bun-version: 1.3.10
 
       - name: Synchronize the release PR lockfile
-        if: steps.release.outputs.prs_created == 'true'
+        if: steps.release.outputs.prs_created == 'true' && steps.release.outputs.pr != ''
         env:
           RELEASE_PR_BRANCH: ${{ fromJSON(steps.release.outputs.pr || '{}').headBranchName }}
         run: |
@@ -180,18 +180,24 @@ jobs:
 
       - name: Publish @opalinehq/cli with provenance
         working-directory: apps/cli
+        env:
+          OPALINE_BUILD_POSTHOG_KEY: ${{ vars.OPALINE_BUILD_POSTHOG_KEY }}
+          OPALINE_BUILD_POSTHOG_HOST: ${{ vars.OPALINE_BUILD_POSTHOG_HOST }}
         run: |
+          test -n "${OPALINE_BUILD_POSTHOG_KEY}"
+          test -n "${OPALINE_BUILD_POSTHOG_HOST}"
           version="$(node -p "require('./package.json').version")"
           if npm view "@opalinehq/cli@${version}" version >/dev/null 2>&1; then
             echo "@opalinehq/cli@${version} is already published."
           else
-            npm publish --access public --provenance --tag latest
+            bun run build
+            npm publish --ignore-scripts --access public --provenance --tag latest
           fi
 
       - name: Wait for @opalinehq/cli registry availability
         run: |
           version="$(node -p "require('./apps/cli/package.json').version")"
-          for attempt in {1..60}; do
+          for attempt in {1..150}; do
             if [[ "$(npm view "@opalinehq/cli@${version}" version 2>/dev/null)" == "${version}" ]]; then
               exit 0
             fi

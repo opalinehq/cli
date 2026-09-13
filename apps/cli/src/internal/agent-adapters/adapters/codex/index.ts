@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import pMap from "p-map";
 import { scanBoundedJsonlFile } from "../../bounded-jsonl-scan.js";
 import { MissingTranscriptTimestampError } from "../../errors.js";
 import type {
@@ -12,6 +13,7 @@ import type {
 } from "../../types.js";
 import {
 	readJsonlFirstLine,
+	readSessionDiscoveryMetadata,
 	toDisplayPath,
 	walkJsonlFiles,
 } from "../../utils.js";
@@ -53,35 +55,36 @@ export interface CodexSessionMeta {
 	cwd: string;
 	gitBranch?: string;
 	gitSha?: string;
+	gitRemote?: string;
 }
 
 export async function readCodexSessionMeta(
 	filePath: string,
 ): Promise<CodexSessionMeta | null> {
-	const parsed = (await readJsonlFirstLine(filePath)) as {
-		type?: string;
-		payload?: {
-			id?: string;
-			cwd?: string;
-			git?: { branch?: string; sha?: string };
-		};
-	} | null;
-
-	if (parsed?.type !== "session_meta" || !parsed.payload) {
+	const parsed = await readJsonlFirstLine(filePath);
+	if (
+		!isRecord(parsed) ||
+		parsed.type !== "session_meta" ||
+		!isRecord(parsed.payload)
+	)
 		return null;
-	}
-
+	const payload = parsed.payload;
+	const git = isRecord(payload.git) ? payload.git : {};
 	return {
 		id:
-			parsed.payload.id ??
-			filePath
-				.split("/")
-				.pop()
-				?.replace(/\.jsonl$/, "") ??
-			"",
-		cwd: parsed.payload.cwd ?? "",
-		gitBranch: parsed.payload.git?.branch,
-		gitSha: parsed.payload.git?.sha,
+			typeof payload.id === "string"
+				? payload.id
+				: basename(filePath, ".jsonl"),
+		cwd: typeof payload.cwd === "string" ? payload.cwd : "",
+		gitBranch: typeof git.branch === "string" ? git.branch : undefined,
+		gitSha:
+			typeof git.commit_hash === "string"
+				? git.commit_hash
+				: typeof git.sha === "string"
+					? git.sha
+					: undefined,
+		gitRemote:
+			typeof git.repository_url === "string" ? git.repository_url : undefined,
 	};
 }
 
@@ -139,19 +142,31 @@ class CodexAdapter implements AgentAdapter {
 		const files = await walkJsonlFiles(SESSIONS_BASE_DIR);
 		const projectMap = new Map<string, SessionFile[]>();
 
-		for (const filePath of files) {
-			const meta = await readCodexSessionMeta(filePath);
-			if (!meta?.cwd) continue;
-
-			const sessions = projectMap.get(meta.cwd) ?? [];
-			sessions.push({
-				sessionId: meta.id,
-				transcriptPath: filePath,
-				projectPath: meta.cwd,
-				gitBranch: meta.gitBranch,
-				gitSha: meta.gitSha,
-			});
-			projectMap.set(meta.cwd, sessions);
+		const scanned = await pMap(
+			files,
+			async (filePath): Promise<SessionFile | null> => {
+				const [meta, metadata] = await Promise.all([
+					readCodexSessionMeta(filePath),
+					readSessionDiscoveryMetadata(filePath),
+				]);
+				if (!meta?.cwd) return null;
+				return {
+					sessionId: meta.id,
+					transcriptPath: filePath,
+					projectPath: meta.cwd,
+					gitBranch: meta.gitBranch,
+					gitSha: meta.gitSha,
+					gitRemote: meta.gitRemote,
+					lastActivityAt: metadata.lastActivityAt,
+				};
+			},
+			{ concurrency: 8 },
+		);
+		for (const session of scanned) {
+			if (!session) continue;
+			const sessions = projectMap.get(session.projectPath) ?? [];
+			sessions.push(session);
+			projectMap.set(session.projectPath, sessions);
 		}
 
 		const projects: ScannedProject[] = [];

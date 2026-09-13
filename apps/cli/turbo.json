@@ -1,8 +1,12 @@
 {
 	"extends": ["//"],
 	"tasks": {
+		"build": {
+			"env": ["OPALINE_BUILD_POSTHOG_KEY", "OPALINE_BUILD_POSTHOG_HOST"]
+		},
 		"dev": {
 			"passThroughEnv": [
+				"DO_NOT_TRACK",
 				"NODE_ENV",
 				"OPALINE_ALLOW_INSECURE_API_BASE",
 				"OPALINE_ALLOW_INSECURE_ENDPOINT",
@@ -20,6 +24,7 @@
 		},
 		"test": {
 			"passThroughEnv": [
+				"DO_NOT_TRACK",
 				"OPALINE_CONFIG_DIR",
 				"OPALINE_LOG_LEVEL",
 				"OPALINE_PACKED_CLI",
@@ -28,6 +33,7 @@
 		},
 		"test:integration": {
 			"passThroughEnv": [
+				"DO_NOT_TRACK",
 				"OPALINE_CONFIG_DIR",
 				"OPALINE_LOG_LEVEL",
 				"RUDEL_CONFIG_DIR"

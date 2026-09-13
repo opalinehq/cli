@@ -1,6 +1,7 @@
 import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import pMap from "p-map";
 import { scanBoundedJsonlFile } from "../../bounded-jsonl-scan.js";
 import { MissingTranscriptTimestampError } from "../../errors.js";
 import type {
@@ -12,7 +13,7 @@ import type {
 	SessionTimestamps,
 	UploadContext,
 } from "../../types.js";
-import { toDisplayPath } from "../../utils.js";
+import { readSessionDiscoveryMetadata, toDisplayPath } from "../../utils.js";
 import {
 	addHook,
 	getClaudeSettingsPath,
@@ -245,19 +246,37 @@ class ClaudeCodeAdapter implements AgentAdapter {
 
 			const decodedPath = await decodeProjectPath(dir);
 
-			const sessions: SessionFile[] = sessionFiles.map((f) => ({
-				sessionId: f.replace(/\.jsonl$/, ""),
-				transcriptPath: join(sessionDir, f),
-				projectPath: decodedPath,
-			}));
-
-			projects.push({
-				source: this.source,
-				projectPath: decodedPath,
-				displayPath: toDisplayPath(decodedPath),
-				sessions,
-				sessionCount: sessions.length,
-			});
+			const sessions = await pMap(
+				sessionFiles,
+				async (file): Promise<SessionFile> => {
+					const transcriptPath = join(sessionDir, file);
+					const metadata = await readSessionDiscoveryMetadata(transcriptPath);
+					return {
+						sessionId: file.replace(/\.jsonl$/, ""),
+						transcriptPath,
+						projectPath:
+							metadata.cwd && isAbsolute(metadata.cwd)
+								? metadata.cwd
+								: decodedPath,
+						lastActivityAt: metadata.lastActivityAt,
+					};
+				},
+				{ concurrency: 8 },
+			);
+			const byPath = new Map<string, SessionFile[]>();
+			for (const session of sessions) {
+				const grouped = byPath.get(session.projectPath) ?? [];
+				grouped.push(session);
+				byPath.set(session.projectPath, grouped);
+			}
+			for (const [projectPath, grouped] of byPath)
+				projects.push({
+					source: this.source,
+					projectPath,
+					displayPath: toDisplayPath(projectPath),
+					sessions: grouped,
+					sessionCount: grouped.length,
+				});
 		}
 
 		return projects;

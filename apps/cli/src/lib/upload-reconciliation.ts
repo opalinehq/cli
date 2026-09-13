@@ -45,6 +45,7 @@ export interface RepositoryUploadProject {
 	readonly newSessions: readonly SessionFile[];
 	readonly project: ScannedProject;
 	readonly repositoryIdentity: RepoIdentity;
+	readonly legacyRepositoryKey?: string;
 }
 
 export interface HookAwareRepositoryUploadProject
@@ -61,6 +62,76 @@ export interface UploadRepositoryGroup<
 }
 
 export type RepositoryHookState = "disabled" | "enabled" | "mixed";
+
+export function getRepositoryLegacyKeys<
+	TProject extends RepositoryUploadProject,
+>(repository: UploadRepositoryGroup<TProject>): string[] {
+	return [
+		...new Set(
+			repository.projects.flatMap((project) =>
+				project.legacyRepositoryKey ? [project.legacyRepositoryKey] : [],
+			),
+		),
+	];
+}
+
+export function getRepositorySessionCount<
+	TProject extends RepositoryUploadProject,
+>(repository: UploadRepositoryGroup<TProject>): number {
+	return new Set(
+		repository.projects.flatMap(({ project }) =>
+			project.sessions.map((session) => session.sessionId),
+		),
+	).size;
+}
+
+export function getRepositoryLastActivity<
+	TProject extends RepositoryUploadProject,
+>(repository: UploadRepositoryGroup<TProject>): number {
+	let latest = 0;
+	for (const { project } of repository.projects)
+		for (const session of project.sessions) {
+			if (
+				session.lastActivityAt !== undefined &&
+				Number.isFinite(session.lastActivityAt)
+			)
+				latest = Math.max(latest, session.lastActivityAt);
+		}
+	return latest;
+}
+
+// A month's inactivity halves a repo's rank. Logarithmic counts give a
+// substantial history a boost without letting the largest archive dominate.
+const REPOSITORY_ACTIVITY_HALF_LIFE_MS = 30 * 24 * 60 * 60 * 1000;
+
+export function orderUploadRepositoriesForSelection<
+	TProject extends RepositoryUploadProject,
+>(
+	repositories: readonly UploadRepositoryGroup<TProject>[],
+	now: number = Date.now(),
+): UploadRepositoryGroup<TProject>[] {
+	return repositories
+		.map((repository) => {
+			const count = getRepositorySessionCount(repository);
+			const latest = getRepositoryLastActivity(repository);
+			const age = Math.max(0, now - latest);
+			const score =
+				latest > 0
+					? Math.log2(1 + count) *
+						2 ** (-age / REPOSITORY_ACTIVITY_HALF_LIFE_MS)
+					: 0;
+			return { repository, score, count, latest };
+		})
+		.sort(
+			(a, b) =>
+				b.score - a.score ||
+				b.count - a.count ||
+				b.latest - a.latest ||
+				a.repository.label.localeCompare(b.repository.label) ||
+				a.repository.key.localeCompare(b.repository.key),
+		)
+		.map(({ repository }) => repository);
+}
 
 export async function reconcileUploadProjects(
 	targets: readonly UploadProjectTarget[],

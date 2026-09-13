@@ -6,6 +6,8 @@ export interface SessionFile {
 	projectPath: string;
 	gitBranch?: string;
 	gitSha?: string;
+	gitRemote?: string;
+	lastActivityAt?: number;
 }
 
 export interface ScannedProject {

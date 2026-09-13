@@ -15,6 +15,7 @@ export interface AutoUploadRepositorySelection {
 	readonly key: string;
 	readonly label: string;
 	readonly sources: readonly Source[];
+	readonly legacyKeys?: readonly string[];
 }
 
 interface AutoUploadRepositoryEntry {
@@ -37,10 +38,15 @@ export function loadAutoUploadConfig(): AutoUploadConfig | null {
 export function isRepositoryAutoUploadAllowed(
 	repoKey: string,
 	source: Source,
+	legacyKeys: readonly string[] = [],
 ): boolean {
 	const config = loadAutoUploadConfig();
 	if (config === null) return true;
-	return config.repositories[repoKey]?.sources.includes(source) ?? false;
+	const repository = config.repositories[repoKey];
+	if (repository) return repository.sources.includes(source);
+	return legacyKeys.some((key) =>
+		config.repositories[key]?.sources.includes(source),
+	);
 }
 
 export function saveVisibleAutoUploadSelections(
@@ -49,7 +55,10 @@ export function saveVisibleAutoUploadSelections(
 ): AutoUploadConfig {
 	const existing = loadAutoUploadConfig();
 	const visibleRepoKeys = new Set(
-		visibleRepositories.map((repository) => repository.key),
+		visibleRepositories.flatMap((repository) => [
+			repository.key,
+			...(repository.legacyKeys ?? []),
+		]),
 	);
 	const repositories: Record<string, AutoUploadRepositoryEntry> = {};
 
@@ -86,6 +95,8 @@ export function enableAutoUploadRepository(
 			sources: uniqueSources(repository.sources),
 		},
 	};
+	for (const key of repository.legacyKeys ?? [])
+		if (key !== repository.key) delete repositories[key];
 	const config: AutoUploadConfig = {
 		repositories,
 		version: AUTO_UPLOAD_CONFIG_VERSION,

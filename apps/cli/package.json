@@ -39,7 +39,7 @@
 	"scripts": {
 		"dev": "bun run src/bin/cli.ts",
 		"check-types": "tsc --noEmit",
-		"build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && bun build src/bin/cli.ts --outfile dist/cli.js --target node && bun build src/run-cli.ts --outfile dist/run-cli.js --target node",
+		"build": "bun run build.ts",
 		"prepack": "bun run build",
 		"test": "bun test",
 		"test:integration": "bun test ./src/__tests__/old-api-compat.test.ts ./src/__tests__/upload-destination.integration.test.ts",
