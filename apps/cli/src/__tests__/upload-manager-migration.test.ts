@@ -168,10 +168,7 @@ test("fills the table as sessions arrive and merges deleted Conductor worktrees 
 		"removed",
 	);
 	for (const [index, path] of [fixture.repo, missing].entries()) {
-		const directory = join(
-			claude.getSessionsBaseDir(),
-			path.replaceAll("/", "-"),
-		);
+		const directory = join(claude.getSessionsBaseDir(), `project-${index}`);
 		await mkdir(directory, { recursive: true });
 		await writeFile(
 			join(directory, `session-${index}.jsonl`),
