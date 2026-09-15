@@ -20,7 +20,8 @@ works too. A global install remains optional.
 Copying the command from the Opaline demo adds a hidden `--code` value. That
 one-time code pairs the terminal with your browser for live selection and upload
 status. It expires after ten minutes if unused. Approve login in the same browser
-where you copied the command; finishing setup opens your own Sessions page.
+where you copied the command. First-time uploads continue browser setup; returning
+users open their workspace Sessions page.
 
 Automatic uploads retain the bundled CLI under `~/.rudel/runtime` and use your
 Node executable, so hooks keep working after the temporary runner cache is gone.
@@ -28,7 +29,7 @@ Node executable, so hooks keep working after the temporary runner cache is gone.
 `opaline login` opens a browser-based device flow. `opaline upload` groups local
 worktrees by repository, lets you choose which repositories stay synchronized,
 installs the required Claude Code and/or Codex hooks, and uploads new sessions.
-`opaline enable` remains a shortcut for enabling the current repository.
+Open the same table to turn repositories ON or OFF.
 
 Existing `rudel` users do not need to log in again. Opaline intentionally reads
 the existing `~/.rudel` credential and state directory, and the `rudel` package
@@ -42,22 +43,14 @@ directory. Existing hooks and settings are preserved.
 
 ## Typical workflow
 
-```bash
-# Check the installation and service connection
-opaline doctor
+Run `opaline upload` (or `npx opaline@latest`) to open the repository table.
+The table fills during scanning, then shows local and already-uploaded session
+counts alongside ON/OFF toggles. Space changes a repository; Enter opens a review
+with newly added, already active, and deactivated repositories. Enter confirms;
+Esc returns to editing. Upload progress stays in the same table.
 
-# See the authenticated account
-opaline whoami
-
-# Upload existing sessions interactively
-opaline upload
-
-# Retry transient hook/upload failures
-opaline upload --retry
-
-# Stop automatic uploads
-opaline disable
-```
+Existing Rudel hooks are recognized as enabled. Saving migrates owned hooks to
+Opaline, removes duplicate local hooks, and preserves unrelated agent settings.
 
 ## Key concepts
 
@@ -79,19 +72,17 @@ opaline disable
 
 | Command | Description |
 | --- | --- |
-| `opaline` / `opaline connect` | Scan, select repositories, then log in and upload. |
-| `opaline --code <code>` | Connect to the demo that supplied the copied command. |
+| `opaline` / `opaline upload` | Manage automatic uploads and upload selected repositories. |
+| `opaline --code <code>` | Pair with the browser that supplied the copied command. |
 | `opaline login` | Authenticate through the browser device flow. |
 | `opaline logout` | Revoke the current credential and log out locally. |
 | `opaline whoami` | Show the authenticated user and local upload failures. |
-| `opaline doctor` | Run read-only auth, API latency, config, version, and hook diagnostics. |
-| `opaline enable` | Enable automatic upload for the current repository. |
-| `opaline disable` | Disable automatic upload and remove Opaline upload hooks. |
-| `opaline upload [session]` | Manage synchronized repositories or upload one session. |
-| `opaline upload --retry` | Retry locally queued transient upload failures. |
-| `opaline set-org` | Set the Opaline organization for the current project. |
-| `opaline --help` | Show complete command and flag help. |
+| `opaline --help` | Show command help. |
 | `opaline --version` | Print the installed CLI version. |
+
+Advanced commands remain available for existing scripts: `opaline import`,
+`opaline upload <session>`, `opaline upload --retry`, `opaline doctor`, and
+`opaline set-org`. Bare `enable` and `disable` open the upload table.
 
 ## Configuration
 
@@ -169,6 +160,7 @@ local paths, and session contents. Set `DO_NOT_TRACK=1` or
 bun install
 bun run verify
 bun run --cwd apps/cli dev --help
+bun run dev:cli # browser playground at http://127.0.0.1:4077
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow.

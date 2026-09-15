@@ -1,4 +1,8 @@
 export {
+	CliConnectionRepositoriesSchema,
+	CliConnectionSecretSchema,
+} from "./cli-connection.js";
+export {
 	type CliApiKeyCreateResponse,
 	CliApiKeyCreateResponseSchema,
 	type DeviceCodeResponse,
@@ -30,7 +34,11 @@ export {
 	type RepoIdentity,
 	resolveRepoIdentity,
 } from "./repo-identity.js";
-export { CLI_SESSION_UPLOAD_STATUS_MAX_IDS, contract } from "./rpc.js";
+export {
+	CLI_SESSION_UPLOAD_STATUS_MAX_IDS,
+	CliSessionUploadStatusOutputSchema,
+	contract,
+} from "./rpc.js";
 export {
 	parseSafeApiBase,
 	parseSafeApiEndpoint,

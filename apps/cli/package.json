@@ -38,7 +38,7 @@
 	],
 	"scripts": {
 		"dev": "bun run src/bin/cli.ts",
-		"check-types": "tsc --noEmit",
+		"check-types": "tsc --noEmit && tsc --noEmit -p playground/tsconfig.json",
 		"build": "bun run build.ts",
 		"prepack": "bun run build",
 		"test": "bun test",

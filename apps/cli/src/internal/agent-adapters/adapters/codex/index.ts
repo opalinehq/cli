@@ -8,6 +8,7 @@ import type {
 	FileBackedUploadRequest,
 	ScannedProject,
 	SessionFile,
+	SessionScanOptions,
 	SessionTimestamps,
 	UploadContext,
 } from "../../types.js";
@@ -17,12 +18,7 @@ import {
 	toDisplayPath,
 	walkJsonlFiles,
 } from "../../utils.js";
-import {
-	CONFIG_PATH,
-	installHook,
-	isHookInstalled,
-	removeHook,
-} from "./config.js";
+import { installHook, isHookInstalled, removeHook } from "./config.js";
 
 const SESSIONS_BASE_DIR = join(homedir(), ".codex", "sessions");
 
@@ -107,18 +103,25 @@ export async function findActiveRolloutFile(
 // ── Adapter ──
 
 class CodexAdapter implements AgentAdapter {
+	private readonly sessionsBaseDir: string;
+	private readonly hookConfigPath: string;
+	constructor(environment: { homeDir?: string } = {}) {
+		const homeDir = environment.homeDir ?? homedir();
+		this.sessionsBaseDir = join(homeDir, ".codex", "sessions");
+		this.hookConfigPath = join(homeDir, ".codex", "config.toml");
+	}
 	name = "OpenAI Codex";
 	source = "codex" as const;
 
 	getSessionsBaseDir(): string {
-		return SESSIONS_BASE_DIR;
+		return this.sessionsBaseDir;
 	}
 
 	async findProjectSessions(projectPath: string): Promise<SessionFile[]> {
 		const sessions: SessionFile[] = [];
 
 		try {
-			const files = await walkJsonlFiles(SESSIONS_BASE_DIR);
+			const files = await walkJsonlFiles(this.sessionsBaseDir);
 			for (const filePath of files) {
 				const meta = await readCodexSessionMeta(filePath);
 				if (meta?.cwd === projectPath) {
@@ -138,19 +141,23 @@ class CodexAdapter implements AgentAdapter {
 		return sessions;
 	}
 
-	async scanAllSessions(): Promise<ScannedProject[]> {
-		const files = await walkJsonlFiles(SESSIONS_BASE_DIR);
+	async scanAllSessions(
+		options: SessionScanOptions = {},
+	): Promise<ScannedProject[]> {
+		options.signal?.throwIfAborted();
+		const files = await walkJsonlFiles(this.sessionsBaseDir);
 		const projectMap = new Map<string, SessionFile[]>();
 
 		const scanned = await pMap(
 			files,
 			async (filePath): Promise<SessionFile | null> => {
+				options.signal?.throwIfAborted();
 				const [meta, metadata] = await Promise.all([
 					readCodexSessionMeta(filePath),
 					readSessionDiscoveryMetadata(filePath),
 				]);
 				if (!meta?.cwd) return null;
-				return {
+				const session: SessionFile = {
 					sessionId: meta.id,
 					transcriptPath: filePath,
 					projectPath: meta.cwd,
@@ -159,6 +166,9 @@ class CodexAdapter implements AgentAdapter {
 					gitRemote: meta.gitRemote,
 					lastActivityAt: metadata.lastActivityAt,
 				};
+				options.signal?.throwIfAborted();
+				await options.onSession?.(session);
+				return session;
 			},
 			{ concurrency: 8 },
 		);
@@ -184,19 +194,19 @@ class CodexAdapter implements AgentAdapter {
 	}
 
 	getHookConfigPath(): string {
-		return CONFIG_PATH;
+		return this.hookConfigPath;
 	}
 
 	installHook(): void {
-		installHook();
+		installHook(this.hookConfigPath);
 	}
 
 	removeHook(): void {
-		removeHook();
+		removeHook(this.hookConfigPath);
 	}
 
 	isHookInstalled(): boolean {
-		return isHookInstalled();
+		return isHookInstalled(this.hookConfigPath);
 	}
 
 	async buildUploadRequest(
@@ -266,4 +276,10 @@ export const codexAdapter = new CodexAdapter();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
+}
+
+export function createCodexAdapter(
+	environment: { homeDir?: string } = {},
+): AgentAdapter {
+	return new CodexAdapter(environment);
 }

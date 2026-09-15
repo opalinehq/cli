@@ -5,7 +5,6 @@ analytics.
 
 ```bash
 npx opaline@latest
-npx opaline@latest doctor
 ```
 
 Run this from any directory. The CLI scans local Claude Code and Codex sessions,
@@ -16,15 +15,16 @@ works too. A global install remains optional.
 Copying the command from the Opaline demo adds a hidden `--code` value. That
 one-time code pairs the terminal with your browser for live selection and upload
 status. It expires after ten minutes if unused. Approve login in the same browser
-where you copied the command; finishing setup opens your own Sessions page.
+where you copied the command. First-time uploads continue browser setup; returning
+users open their workspace Sessions page.
 
 Automatic uploads retain the bundled CLI under `~/.rudel/runtime` and use your
 Node executable, so hooks keep working after the temporary runner cache is gone.
 
 `opaline upload` groups discovered worktrees by repository, saves the selected
 repositories for automatic upload, and sends only sessions the server does not
-already have. `opaline enable` remains available to enable the current
-repository directly.
+already have. Press Space to toggle, Enter to review, then Enter to confirm.
+Existing Rudel hooks count as enabled and migrate when selections are saved.
 
 The CLI keeps using the existing `~/.rudel` state directory so upgrades do not
 require another login. Its production API is `https://opaline.so`.

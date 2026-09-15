@@ -53,6 +53,7 @@ export interface UploadConfig {
 	maxAggregateBytes?: number;
 	onRetry?: (attempt: number, maxAttempts: number, error: string) => void;
 	onProgress?: (progress: R2MultipartProgress) => void;
+	signal?: AbortSignal;
 	r2MultipartBaseDelayMs?: number;
 	r2StatusPollIntervalMs?: number;
 }
@@ -342,6 +343,7 @@ export async function uploadSession(
 	request: UploadSessionRequest,
 	config: UploadConfig,
 ): Promise<UploadResult> {
+	config.signal?.throwIfAborted();
 	const maxAggregateBytes =
 		config.maxAggregateBytes ?? INGEST_AGGREGATE_CONTENT_MAX_BYTES;
 	const endpoint = parseSafeApiEndpoint(config.endpoint, {
@@ -474,6 +476,7 @@ export async function uploadSession(
 	const { filteredRequest, filteredText } = legacy;
 
 	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+		config.signal?.throwIfAborted();
 		try {
 			const response: unknown = await client.ingestSession(filteredRequest);
 			// A proxy or SSO gateway can answer 200 with an HTML page or arbitrary

@@ -8,20 +8,21 @@ import type {
 	AgentAdapter,
 	FileBackedUploadRequest,
 	FileBackedUploadSubagent,
+	HookOptions,
 	ScannedProject,
 	SessionFile,
+	SessionScanOptions,
 	SessionTimestamps,
 	UploadContext,
 } from "../../types.js";
 import { readSessionDiscoveryMetadata, toDisplayPath } from "../../utils.js";
 import {
 	addHook,
-	getClaudeSettingsPath,
+	getClaudeProjectSettingsPath,
 	isHookEnabled,
 	removeHook,
 } from "./settings.js";
 
-const SESSIONS_BASE_DIR = join(homedir(), ".claude", "projects");
 const SAFE_BASENAME_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
 
 // ── Exported utilities ──
@@ -202,16 +203,23 @@ export async function readSubagentFiles(
 // ── Adapter ──
 
 class ClaudeCodeAdapter implements AgentAdapter {
+	private readonly sessionsBaseDir: string;
+	private readonly hookConfigPath: string;
+	constructor(environment: { homeDir?: string } = {}) {
+		const homeDir = environment.homeDir ?? homedir();
+		this.sessionsBaseDir = join(homeDir, ".claude", "projects");
+		this.hookConfigPath = join(homeDir, ".claude", "settings.json");
+	}
 	name = "Claude Code";
 	source = "claude_code" as const;
 
 	getSessionsBaseDir(): string {
-		return SESSIONS_BASE_DIR;
+		return this.sessionsBaseDir;
 	}
 
 	async findProjectSessions(projectPath: string): Promise<SessionFile[]> {
 		const encoded = encodeProjectPath(projectPath);
-		const sessionDir = join(SESSIONS_BASE_DIR, encoded);
+		const sessionDir = join(this.sessionsBaseDir, encoded);
 
 		const files = await this.listSessionFiles(sessionDir, projectPath);
 		if (files.length > 0) return files;
@@ -219,10 +227,13 @@ class ClaudeCodeAdapter implements AgentAdapter {
 		return this.findByDecoding(projectPath);
 	}
 
-	async scanAllSessions(): Promise<ScannedProject[]> {
+	async scanAllSessions(
+		options: SessionScanOptions = {},
+	): Promise<ScannedProject[]> {
+		options.signal?.throwIfAborted();
 		let projectDirs: string[];
 		try {
-			projectDirs = await readdir(SESSIONS_BASE_DIR);
+			projectDirs = await readdir(this.sessionsBaseDir);
 		} catch {
 			return [];
 		}
@@ -230,7 +241,8 @@ class ClaudeCodeAdapter implements AgentAdapter {
 		const projects: ScannedProject[] = [];
 
 		for (const dir of projectDirs) {
-			const sessionDir = `${SESSIONS_BASE_DIR}/${dir}`;
+			options.signal?.throwIfAborted();
+			const sessionDir = `${this.sessionsBaseDir}/${dir}`;
 			let files: string[];
 			try {
 				files = await readdir(sessionDir);
@@ -249,9 +261,10 @@ class ClaudeCodeAdapter implements AgentAdapter {
 			const sessions = await pMap(
 				sessionFiles,
 				async (file): Promise<SessionFile> => {
+					options.signal?.throwIfAborted();
 					const transcriptPath = join(sessionDir, file);
 					const metadata = await readSessionDiscoveryMetadata(transcriptPath);
-					return {
+					const session: SessionFile = {
 						sessionId: file.replace(/\.jsonl$/, ""),
 						transcriptPath,
 						projectPath:
@@ -260,6 +273,9 @@ class ClaudeCodeAdapter implements AgentAdapter {
 								: decodedPath,
 						lastActivityAt: metadata.lastActivityAt,
 					};
+					options.signal?.throwIfAborted();
+					await options.onSession?.(session);
+					return session;
 				},
 				{ concurrency: 8 },
 			);
@@ -282,20 +298,22 @@ class ClaudeCodeAdapter implements AgentAdapter {
 		return projects;
 	}
 
-	getHookConfigPath(): string {
-		return getClaudeSettingsPath();
+	getHookConfigPath(options: HookOptions = {}): string {
+		return options.projectPath
+			? getClaudeProjectSettingsPath(options.projectPath)
+			: this.hookConfigPath;
 	}
 
-	installHook(): void {
-		addHook();
+	installHook(options: HookOptions = {}): void {
+		addHook(this.getHookConfigPath(options));
 	}
 
-	removeHook(): void {
-		removeHook();
+	removeHook(options: HookOptions = {}): void {
+		removeHook(this.getHookConfigPath(options));
 	}
 
-	isHookInstalled(): boolean {
-		return isHookEnabled();
+	isHookInstalled(options: HookOptions = {}): boolean {
+		return isHookEnabled(this.getHookConfigPath(options));
 	}
 
 	async buildUploadRequest(
@@ -394,7 +412,7 @@ class ClaudeCodeAdapter implements AgentAdapter {
 	private async findByDecoding(projectPath: string): Promise<SessionFile[]> {
 		let projectDirs: string[];
 		try {
-			projectDirs = await readdir(SESSIONS_BASE_DIR);
+			projectDirs = await readdir(this.sessionsBaseDir);
 		} catch {
 			return [];
 		}
@@ -403,7 +421,7 @@ class ClaudeCodeAdapter implements AgentAdapter {
 			try {
 				const decoded = await decodeProjectPath(dir);
 				if (decoded === projectPath) {
-					const sessionDir = join(SESSIONS_BASE_DIR, dir);
+					const sessionDir = join(this.sessionsBaseDir, dir);
 					return this.listSessionFiles(sessionDir, projectPath);
 				}
 			} catch {
@@ -463,4 +481,10 @@ function isContainedPath(parentPath: string, candidatePath: string): boolean {
 		!pathFromParent.startsWith(`..${sep}`) &&
 		!isAbsolute(pathFromParent)
 	);
+}
+
+export function createClaudeCodeAdapter(
+	environment: { homeDir?: string } = {},
+): AgentAdapter {
+	return new ClaudeCodeAdapter(environment);
 }
