@@ -1,1177 +1,346 @@
-import { stat } from "node:fs/promises";
-import { basename } from "node:path";
 import * as p from "@clack/prompts";
 import { buildCommand } from "@stricli/core";
-import pMap from "p-map";
-import type { RepoIdentity, Source } from "../contracts/index.js";
+import { sanitizeForTerminalDisplay } from "../contracts/index.js";
+import type { AgentAdapter } from "../internal/agent-adapters/index.js";
+import { describeSavedCredentialsApiBaseRisk } from "../lib/api-base.js";
+import { createApiClient } from "../lib/api-client.js";
+import { getApiBaseOverride, getDefaultApiBase } from "../lib/api-target.js";
+import { verifyAuth } from "../lib/auth.js";
+import { loadAutoUploadConfig } from "../lib/auto-upload-config.js";
+import { cliMessage } from "../lib/cli-messages.js";
+import { loadCredentials } from "../lib/credentials.js";
+import type { GuidedUpload } from "../lib/guided-upload.js";
+import { getProjectOrgId } from "../lib/project-config.js";
 import {
-	claudeCodeAdapter,
-	type FileBackedUploadRequest,
-	getAdapter,
-	getAllAdapters,
-	getAvailableAdapters,
-	MissingTranscriptTimestampError,
-	type ScannedProject,
-	type SessionFile,
-} from "../internal/agent-adapters/index.js";
+	checkRepositoryUploads,
+	uploadRepositorySessions,
+} from "../lib/repository-session-upload.js";
 import {
-	type AutoUploadHookResult,
-	captureAutoUploadSetupResult,
-	summarizeAutoUploadRepositories,
-} from "../lib/auto-upload-analytics.js";
+	type RepositoryChange,
+	saveRepositoryChanges,
+} from "../lib/repository-upload.js";
+import { getUploadCompletion } from "../lib/upload-completion.js";
+import { allowsInsecureEndpointFromEnv } from "../lib/upload-endpoint.js";
 import {
-	type AutoUploadConfig,
-	getRequiredAutoUploadSources,
-	loadAutoUploadConfig,
-	saveVisibleAutoUploadSelections,
-} from "../lib/auto-upload-config.js";
-import type { BatchUploadItem } from "../lib/batch-upload.js";
-import { renderBatchSummary, runBatchUpload } from "../lib/batch-upload-ui.js";
-import { classifySessionFile } from "../lib/classifier.js";
-import { type Credentials, loadCredentials } from "../lib/credentials.js";
+	discoverUploadRepositories,
+	getUploadAdapters,
+	type UploadRepository,
+} from "../lib/upload-manager-repositories.js";
 import {
-	isRetryCandidate,
-	loadFailedUploads,
-	removeFailedUpload,
-} from "../lib/failed-uploads.js";
-import { type GitInfo, getGitInfo } from "../lib/git-info.js";
-import { getProjectOrgId, setProjectOrgId } from "../lib/project-config.js";
+	getDesiredUploadState,
+	getPendingRepositories,
+	getRepositoriesToUpload,
+	type UploadManagerState,
+} from "../lib/upload-manager-state.js";
 import {
-	discoverProjectRepositories,
-	getLegacyRepositoryKey,
-	resolveUploadRepositoryIdentity,
-} from "../lib/repository-discovery.js";
-import { resolveSession } from "../lib/session-resolver.js";
-import {
-	DEFAULT_ENDPOINT,
-	SESSION_TAGS,
-	type SessionTag,
-} from "../lib/types.js";
-import { allowsInsecureEndpoint } from "../lib/upload-endpoint.js";
-import { getDefaultUploadOrganizationId } from "../lib/upload-organization.js";
-import {
-	getRepositoryLegacyKeys,
-	groupUploadProjectsByRepository,
-	orderUploadRepositoriesForSelection,
-	type ReconciledUploadProject,
-	reconcileUploadProjects,
-	type UploadProjectTarget,
-	type UploadRepositoryGroup,
-} from "../lib/upload-reconciliation.js";
-import {
-	selectRepositoriesForUpload,
-	type UploadRepositoryOption,
-} from "../lib/upload-review.js";
-import {
-	formatRedactionSummary,
-	type UploadConfig,
-	uploadSession,
-} from "../lib/uploader.js";
+	promptUploadManager,
+	type UploadRepositoryScan,
+} from "../lib/upload-manager-terminal.js";
+import type { UploadConfig } from "../lib/uploader.js";
+import { runLogin } from "./login.js";
 
-interface UploadFlags {
-	tag?: SessionTag;
-	endpoint?: string;
-	allowInsecureEndpoint: boolean;
-	classify: boolean;
-	dryRun: boolean;
-	org?: string;
-	retry: boolean;
-	yes: boolean;
-	concurrency: number;
-	forceReplace: boolean;
-}
-
-interface ResolvedUploadFlags extends UploadFlags {
-	endpoint: string;
-}
-
-interface InteractiveUploadProject extends UploadProjectTarget {
-	readonly duplicateSessions: readonly SessionFile[];
-	readonly gitInfo: GitInfo | undefined;
-	readonly hookInstalled: boolean;
-	readonly newSessions: readonly SessionFile[];
-	readonly repositoryIdentity: RepoIdentity;
-	readonly legacyRepositoryKey: string;
-	readonly statusKnown: boolean;
-	readonly uploadedSessions: readonly SessionFile[];
-}
-
-type InteractiveUploadRepository =
-	UploadRepositoryGroup<InteractiveUploadProject>;
-
-interface UploadProjectMetadata {
-	readonly gitInfo: GitInfo | undefined;
-	readonly hookInstalled: boolean;
-	readonly repositoryIdentity: RepoIdentity;
-	readonly legacyRepositoryKey: string;
-}
-
-interface PreparedUploadTarget {
-	readonly metadata: UploadProjectMetadata;
-	readonly target: UploadProjectTarget;
-}
-
-interface GuidedUploadOptions {
-	readonly discovery: Awaited<
-		ReturnType<typeof discoverLocalUploadRepositories>
-	>;
-	readonly selectedKeys: ReadonlySet<string>;
-	readonly onUploadStarted: () => Promise<unknown>;
-	readonly onUploadFinished: (result: {
-		uploaded: number;
-		skipped: number;
-		failed: number;
-		hookFailures: number;
-	}) => Promise<unknown>;
-}
-
-export async function discoverLocalUploadRepositories() {
-	const allProjects = (
-		await Promise.all(
-			getAvailableAdapters().map((adapter) => adapter.scanAllSessions()),
-		)
-	).flat();
-	const recordedRemotes = new Map<string, string>();
-	for (const project of allProjects) {
-		const remotes = new Set(
-			project.sessions.flatMap((session) =>
-				session.gitRemote ? [session.gitRemote] : [],
-			),
-		);
-		const remote = remotes.values().next().value;
-		if (remotes.size === 1 && remote)
-			recordedRemotes.set(project.projectPath, remote);
-	}
-	const gitInfoByPath = await discoverProjectRepositories(
-		allProjects.map((project) => project.projectPath),
-		recordedRemotes,
-	);
-	const projects = allProjects.filter((project) => {
-		const info = gitInfoByPath.get(project.projectPath);
-		return info?.repositoryRoot || info?.gitRemote;
-	});
-	const matched = new Set(projects);
-	const unmatchedSessionCount = new Set(
-		allProjects
-			.filter((project) => !matched.has(project))
-			.flatMap((project) =>
-				project.sessions.map((session) => session.sessionId),
-			),
-	).size;
-	const prepared = await pMap(
-		projects,
-		(project) =>
-			prepareUploadTarget(
-				project,
-				undefined,
-				gitInfoByPath.get(project.projectPath),
-			),
-		{ concurrency: 10 },
-	);
-	const repositories = orderUploadRepositoriesForSelection(
-		groupUploadProjectsByRepository(
-			prepared.map(({ target, metadata }) => ({
-				...target,
-				...metadata,
-				newSessions: target.project.sessions,
-			})),
-		),
-	);
-	return { scan: { projects }, prepared, repositories, unmatchedSessionCount };
-}
-
-export async function uploadSelectedRepositories(
-	options: GuidedUploadOptions,
-	credentials: Credentials,
-	organizationId: string,
-	allowInsecureEndpoint: boolean,
-) {
-	return runInteractiveUpload(
-		{
-			endpoint: `${credentials.apiBaseUrl.replace(/\/+$/u, "")}/rpc`,
-			org: organizationId,
-			allowInsecureEndpoint,
-			classify: false,
-			dryRun: false,
-			retry: false,
-			yes: true,
-			concurrency: 3,
-			forceReplace: false,
-		},
-		allowsInsecureEndpoint(allowInsecureEndpoint),
-		credentials,
-		options,
-	);
-}
-
-async function runInteractiveUpload(
-	flags: ResolvedUploadFlags,
-	allowPlaintextEndpoint: boolean,
-	credentials: Credentials | null,
-	guided?: GuidedUploadOptions,
+export async function runUpload(
+	guided?: GuidedUpload,
+	env: { adapters?: AgentAdapter[]; cwd?: string } = {},
 ): Promise<undefined | Error> {
-	p.intro("opaline upload");
-
-	const spin = p.spinner();
-	spin.start("Scanning projects...");
-
-	const discovery =
-		guided?.discovery ?? (await discoverLocalUploadRepositories());
-	const allProjects = discovery.scan.projects;
-
-	if (allProjects.length === 0) {
-		spin.stop("No local sessions found");
-		p.log.warn("No projects with sessions found.");
-		p.outro("Nothing to upload.");
-		return;
-	}
-
-	const preparedTargets = discovery.prepared.map((prepared) => ({
-		...prepared,
-		target: {
-			...prepared.target,
-			organizationId: flags.org ?? prepared.target.organizationId,
-		},
-	}));
-	const organizations = credentials?.organizations ?? [];
-	let defaultOrganizationId = getDefaultUploadOrganizationId(
-		organizations,
-		credentials?.user?.id,
-	);
-	if (
-		preparedTargets.some(
-			(prepared) => prepared.target.organizationId === undefined,
-		) &&
-		defaultOrganizationId === undefined &&
-		organizations.length > 1
-	) {
-		spin.stop("Projects found");
-		const selected = await p.select({
-			message:
-				"Choose a workspace for repositories without a saved destination",
-			options: organizations.map((organization) => ({
-				value: organization.id,
-				label: organization.name,
-			})),
-		});
-		if (p.isCancel(selected)) {
-			p.cancel("Upload cancelled.");
-			return;
-		}
-		defaultOrganizationId = selected;
-		spin.start("Checking uploaded sessions...");
-	}
-	const targets = preparedTargets.map(({ target }) => ({
-		...target,
-		organizationId: target.organizationId ?? defaultOrganizationId,
-	}));
-	const metadataByProject = new Map<ScannedProject, UploadProjectMetadata>();
-	for (const prepared of preparedTargets) {
-		metadataByProject.set(prepared.target.project, prepared.metadata);
-	}
-	let uploadProjects: InteractiveUploadProject[];
-	if (credentials) {
-		spin.message("Checking which sessions are already uploaded...");
-		let reconciled: ReconciledUploadProject[];
-		try {
-			reconciled = await reconcileUploadProjects(targets, {
-				allowInsecureEndpoint: allowPlaintextEndpoint,
-				authType: credentials.authType,
-				endpoint: flags.endpoint,
-				token: credentials.token,
-			});
-		} catch (error) {
-			spin.stop("Could not check uploaded sessions");
-			return error instanceof Error ? error : new Error(String(error));
-		}
-		uploadProjects = reconciled.map((project) => ({
-			...project,
-			organizationId: project.resolvedOrganizationId,
-			...getUploadProjectMetadata(metadataByProject, project.project),
-			statusKnown: true,
-		}));
-	} else {
-		uploadProjects = targets.map((target) => ({
-			...target,
-			...getUploadProjectMetadata(metadataByProject, target.project),
-			duplicateSessions: [],
-			newSessions: target.project.sessions,
-			statusKnown: false,
-			uploadedSessions: [],
-		}));
-	}
-
-	const totalLocalSessions = allProjects.reduce(
-		(sum, project) => sum + project.sessionCount,
-		0,
-	);
-	const totalNewSessions = uploadProjects.reduce(
-		(sum, project) => sum + project.newSessions.length,
-		0,
-	);
-	const totalUploadedSessions = uploadProjects.reduce(
-		(sum, project) => sum + project.uploadedSessions.length,
-		0,
-	);
-	const totalDuplicateSessions = uploadProjects.reduce(
-		(sum, project) => sum + project.duplicateSessions.length,
-		0,
-	);
-	spin.stop(
-		credentials
-			? `${totalNewSessions} new · ${totalUploadedSessions} already uploaded${
-					totalDuplicateSessions > 0
-						? ` · ${totalDuplicateSessions} local duplicate`
-						: ""
-				}`
-			: `Found ${totalLocalSessions} local session(s)`,
-	);
-
-	const options: UploadRepositoryOption[] = [];
-	const autoUploadConfig = loadAutoUploadConfig();
-	const repositories = groupUploadProjectsByRepository(uploadProjects);
-	const orderedRepositories = orderUploadRepositoriesForSelection(repositories);
-
-	for (const repository of orderedRepositories) {
-		const autoUploadSelected = isRepositoryAutoUploadSelected(
-			repository,
-			autoUploadConfig,
+	if (!process.stdin.isTTY || !process.stdout.isTTY) {
+		return new Error(
+			"Open `opaline upload` in an interactive terminal to toggle repositories.",
 		);
-		options.push({
-			key: repository.key,
-			label: repository.label,
-			pickerLabel: `${repository.label} (${getRepositoryUploadHint(repository)} · ${getRepositoryAutoUploadHint(repository, autoUploadSelected, autoUploadConfig)})`,
-			sessionCount: getRepositorySessionsToUpload(
-				repository,
-				flags.forceReplace,
-			).length,
-			destination: Array.from(
-				new Set(
-					repository.projects.map(
-						(project) =>
-							organizations.find(
-								(organization) => organization.id === project.organizationId,
-							)?.name ??
-							project.organizationId ??
-							"Your Opaline workspace",
-					),
-				),
-			).join(", "),
-		});
 	}
-
-	const selected = guided
-		? Array.from(guided.selectedKeys)
-		: await selectRepositoriesForUpload(options, { dryRun: flags.dryRun });
-
-	if (selected === null) {
-		p.outro("Upload cancelled. Nothing uploaded.");
-		return;
-	}
-	if (selected.length === 0) {
-		p.outro("No repositories selected. Nothing uploaded.");
-		return;
-	}
-	const selectedRepoKeys = new Set(selected);
-	const selectedRepositories = orderedRepositories.filter((repository) =>
-		selectedRepoKeys.has(repository.key),
-	);
-
-	const totalSessions = selectedRepositories.reduce(
-		(sum, repository) =>
-			sum +
-			getRepositorySessionsToUpload(repository, flags.forceReplace).length,
-		0,
-	);
-	const skippedUploadedSessions = flags.forceReplace
-		? 0
-		: selectedRepositories.reduce(
-				(sum, repository) =>
-					sum + getRepositoryUploadedSessionCount(repository),
-				0,
+	try {
+		const adapters = env.adapters ?? getUploadAdapters();
+		const repositories: UploadRepository[] = [];
+		const state: UploadManagerState = {
+			query: "",
+			cursor: 0,
+			selectionVisible: false,
+			desired: new Map(),
+			message: "",
+			singleRun: Boolean(guided),
+		};
+		let scan: UploadRepositoryScan | undefined = async (
+			onRepositories,
+			signal,
+		) => {
+			const rows = await discoverUploadRepositories(
+				(_progress, discovered) => onRepositories(discovered),
+				{ signal, adapters, cwd: env.cwd },
 			);
-	const skippedDuplicateSessions = selectedRepositories.reduce(
-		(sum, repository) => sum + getRepositoryDuplicateSessionCount(repository),
-		0,
-	);
-
-	if (flags.dryRun) {
-		logAutoUploadSelectionPreview(
-			orderedRepositories,
-			selectedRepoKeys,
-			autoUploadConfig,
-		);
-		for (const repository of selectedRepositories) {
-			const count = getRepositorySessionsToUpload(
-				repository,
-				flags.forceReplace,
-			).length;
-			if (count === 0) continue;
-			p.log.info(
-				`Would upload ${sessionCountHint(count)} from ${repository.label}`,
-			);
-		}
-		logSkippedSessions(skippedUploadedSessions, skippedDuplicateSessions);
-		p.outro("Dry run complete — no settings changed and no sessions uploaded.");
-		return;
-	}
-
-	if (!credentials) {
-		return new Error("Not authenticated. Run `opaline login` first.");
-	}
-	for (const repository of selectedRepositories) {
-		for (const project of repository.projects) {
-			if (project.organizationId) {
-				await setProjectOrgId(
-					project.project.projectPath,
-					project.organizationId,
-				);
-			}
-		}
-	}
-	const savedAutoUploadConfig = saveVisibleAutoUploadSelections(
-		orderedRepositories.map(toAutoUploadRepositorySelection),
-		selectedRepoKeys,
-	);
-	const repositorySummaries = summarizeAutoUploadRepositories(
-		selectedRepositories.flatMap((repository) =>
-			repository.projects.map((project) => ({
-				repositoryKey: repository.key,
-				organizationId: project.organizationId,
-				source: project.project.source,
-				sessionIds: project.project.sessions.map(
-					(session) => session.sessionId,
-				),
-			})),
-		),
-	);
-	const hookFailures = reconcileAutoUploadHooks(
-		savedAutoUploadConfig,
-		(result) => {
-			captureAutoUploadSetupResult({
-				result,
-				summaries: repositorySummaries,
-				userId: credentials.user?.id,
-				command: "upload",
-			});
-		},
-	);
-
-	const uploadingRepositoryCount = selectedRepositories.filter(
-		(repository) =>
-			getRepositorySessionsToUpload(repository, flags.forceReplace).length > 0,
-	).length;
-	await guided?.onUploadStarted();
-	if (totalSessions > 0) {
-		p.log.info(
-			`Uploading ${totalSessions} session(s) from ${uploadingRepositoryCount} ${repositoryCountHint(uploadingRepositoryCount)}`,
-		);
-	} else if (selectedRepositories.length === 0) {
-		p.log.info("Automatic upload is off for all visible repositories.");
-	} else {
-		p.log.info("No new sessions in the selected repositories.");
-	}
-	logSkippedSessions(skippedUploadedSessions, skippedDuplicateSessions);
-	if (totalSessions === 0) {
-		await guided?.onUploadFinished({
-			uploaded: 0,
-			skipped: skippedUploadedSessions + skippedDuplicateSessions,
-			failed: 0,
-			hookFailures,
-		});
-		p.outro("Automatic upload settings saved.");
-		if (hookFailures > 0) {
-			return new Error(`${hookFailures} auto-upload hook change(s) failed.`);
-		}
-		return;
-	}
-
-	const uploadConfig: UploadConfig = {
-		endpoint: flags.endpoint,
-		token: credentials.token,
-		allowInsecureEndpoint: allowPlaintextEndpoint,
-		authType: credentials.authType,
-	};
-
-	// Flatten all sessions with their project context for concurrent upload
-	const work: Array<{
-		session: SessionFile;
-		project: ScannedProject;
-		adapter: ReturnType<typeof getAdapter>;
-		gitInfo: Awaited<ReturnType<typeof getGitInfo>>;
-		organizationId: string | undefined;
-		repositoryLabel: string;
-	}> = [];
-
-	for (const repository of selectedRepositories) {
-		for (const uploadProject of repository.projects) {
-			const project = uploadProject.project;
-			const adapter = getAdapter(project.source);
-			const gitInfo =
-				uploadProject.gitInfo ?? (await getGitInfo(project.projectPath));
-			const organizationId = uploadProject.organizationId;
-			for (const session of getSessionsToUpload(
-				uploadProject,
-				flags.forceReplace,
-			)) {
-				work.push({
-					adapter,
-					gitInfo,
-					organizationId,
-					project,
-					repositoryLabel: repository.label,
-					session,
-				});
-			}
-		}
-	}
-
-	type InteractiveItem = BatchUploadItem & {
-		session: (typeof work)[number]["session"];
-		adapter: (typeof work)[number]["adapter"];
-		gitInfo: (typeof work)[number]["gitInfo"];
-	};
-
-	const items: InteractiveItem[] = work.map((w) => ({
-		sessionId: w.session.sessionId,
-		label: `${w.repositoryLabel}/${w.session.sessionId}`,
-		transcriptPath: w.session.transcriptPath,
-		projectPath: w.session.projectPath,
-		source: w.project.source,
-		organizationId: w.organizationId,
-		session: w.session,
-		adapter: w.adapter,
-		gitInfo: w.gitInfo,
-	}));
-
-	const summary = await runBatchUpload({
-		items,
-		label: "Uploading sessions...",
-		concurrency: flags.concurrency,
-		upload: async (item, onRetry) => {
-			const request = await item.adapter.buildUploadRequest(item.session, {
-				tag: flags.tag,
-				gitInfo: item.gitInfo,
-				organizationId: item.organizationId,
-				uploadMode: "manual",
-			});
-			if (flags.forceReplace) request.metadata.force_replace = true;
-
-			if (!flags.tag && flags.classify) {
-				const classified = await classifySessionFile(request.transcriptPath);
-				if (classified) {
-					request.metadata.tag = classified;
+			const config = guided ? undefined : getManagerUploadConfig();
+			if (config) {
+				try {
+					await checkRepositoryUploads(
+						rows,
+						config,
+						() => onRepositories(rows),
+						signal,
+					);
+				} catch (error) {
+					signal.throwIfAborted();
+					state.message = `Upload history unavailable: ${error instanceof Error ? error.message : String(error)}`;
 				}
 			}
-
-			return uploadSession(request, { ...uploadConfig, onRetry });
-		},
-	});
-
-	await guided?.onUploadFinished({
-		uploaded: summary.succeeded,
-		skipped:
-			skippedUploadedSessions + skippedDuplicateSessions + summary.skipped,
-		failed: summary.failed,
-		hookFailures,
-	});
-	renderBatchSummary(summary, { showRetryHint: summary.failed > 0 });
-
-	p.outro("Done!");
-
-	if (summary.failed > 0) {
-		return new Error(`${summary.failed} upload(s) failed.`);
-	}
-	if (hookFailures > 0) {
-		return new Error(`${hookFailures} auto-upload hook change(s) failed.`);
-	}
-}
-
-async function prepareUploadTarget(
-	project: ScannedProject,
-	overrideOrganizationId: string | undefined,
-	knownGitInfo?: GitInfo,
-): Promise<PreparedUploadTarget> {
-	const [gitInfo, organizationId] = await Promise.all([
-		knownGitInfo ?? getGitInfo(project.projectPath),
-		overrideOrganizationId === undefined
-			? getProjectOrgId(project.projectPath)
-			: overrideOrganizationId,
-	]);
-	const repositoryIdentity = resolveUploadRepositoryIdentity(
-		project.projectPath,
-		gitInfo,
-	);
-
-	return {
-		metadata: {
-			gitInfo,
-			hookInstalled: getAdapter(project.source).isHookInstalled(),
-			repositoryIdentity,
-			legacyRepositoryKey: getLegacyRepositoryKey(project.projectPath, gitInfo),
-		},
-		target: { organizationId, project },
-	};
-}
-
-function getUploadProjectMetadata(
-	metadataByProject: ReadonlyMap<ScannedProject, UploadProjectMetadata>,
-	project: ScannedProject,
-): UploadProjectMetadata {
-	const metadata = metadataByProject.get(project);
-	if (!metadata) throw new Error("Upload project metadata is missing");
-	return metadata;
-}
-
-function isRepositoryAutoUploadSelected(
-	repository: InteractiveUploadRepository,
-	config: AutoUploadConfig | null,
-): boolean {
-	if (config)
-		return [repository.key, ...getRepositoryLegacyKeys(repository)].some(
-			(key) => config.repositories[key] !== undefined,
-		);
-	return repository.projects.some((project) => project.hookInstalled);
-}
-
-function getRepositoryAutoUploadHint(
-	repository: InteractiveUploadRepository,
-	autoUploadSelected: boolean,
-	config: AutoUploadConfig | null,
-): string {
-	if (!autoUploadSelected) return "auto-upload off";
-	const installedBySource = new Map<Source, boolean>();
-	for (const project of repository.projects) {
-		const source = project.project.source;
-		const sourceSelected =
-			config === null ||
-			config.repositories[repository.key]?.sources.includes(source) === true;
-		installedBySource.set(source, sourceSelected && project.hookInstalled);
-	}
-	const states = Array.from(installedBySource.values());
-	if (states.every(Boolean)) return "auto-upload on";
-	if (states.every((installed) => !installed) && states.length === 1) {
-		return "auto-upload selected · hook missing";
-	}
-	return Array.from(
-		installedBySource,
-		([source, installed]) =>
-			`${getAdapterName(source)} ${installed ? "on" : "off"}`,
-	).join(" · ");
-}
-
-function getRepositoryUploadHint(
-	repository: InteractiveUploadRepository,
-): string {
-	const newSessions = repository.projects.reduce(
-		(sum, project) => sum + project.newSessions.length,
-		0,
-	);
-	const uploadedSessions = getRepositoryUploadedSessionCount(repository);
-	const duplicateSessions = getRepositoryDuplicateSessionCount(repository);
-	const statusKnown = repository.projects.every(
-		(project) => project.statusKnown,
-	);
-	if (!statusKnown) return sessionCountHint(newSessions);
-	const details = [`${newSessions} new`, `${uploadedSessions} uploaded`];
-	if (duplicateSessions > 0) {
-		details.push(`${duplicateSessions} local duplicate`);
-	}
-	return details.join(" · ");
-}
-
-function getRepositorySessionsToUpload(
-	repository: InteractiveUploadRepository,
-	forceReplace: boolean,
-): readonly SessionFile[] {
-	return repository.projects.flatMap((project) =>
-		getSessionsToUpload(project, forceReplace),
-	);
-}
-
-function getRepositoryUploadedSessionCount(
-	repository: InteractiveUploadRepository,
-): number {
-	return repository.projects.reduce(
-		(sum, project) => sum + project.uploadedSessions.length,
-		0,
-	);
-}
-
-function getRepositoryDuplicateSessionCount(
-	repository: InteractiveUploadRepository,
-): number {
-	return repository.projects.reduce(
-		(sum, project) => sum + project.duplicateSessions.length,
-		0,
-	);
-}
-
-function toAutoUploadRepositorySelection(
-	repository: InteractiveUploadRepository,
-): {
-	readonly key: string;
-	readonly label: string;
-	readonly sources: readonly Source[];
-	readonly legacyKeys: readonly string[];
-} {
-	return {
-		legacyKeys: getRepositoryLegacyKeys(repository),
-		key: repository.key,
-		label: repository.label,
-		sources: Array.from(
-			new Set(repository.projects.map((project) => project.project.source)),
-		),
-	};
-}
-
-function logAutoUploadSelectionPreview(
-	repositories: readonly InteractiveUploadRepository[],
-	selectedRepoKeys: ReadonlySet<string>,
-	config: AutoUploadConfig | null,
-): void {
-	for (const repository of repositories) {
-		const currentlySelected = isRepositoryAutoUploadSelected(
-			repository,
-			config,
-		);
-		const willBeSelected = selectedRepoKeys.has(repository.key);
-		if (currentlySelected === willBeSelected) continue;
-		p.log.info(
-			`Would ${willBeSelected ? "enable" : "disable"} automatic upload for ${repository.label}`,
-		);
-	}
-}
-
-function reconcileAutoUploadHooks(
-	config: AutoUploadConfig,
-	onResult: (result: AutoUploadHookResult) => void,
-): number {
-	const requiredSources = getRequiredAutoUploadSources(config);
-	let failures = 0;
-	for (const adapter of getAllAdapters()) {
-		const required = requiredSources.has(adapter.source);
-		const installed = adapter.isHookInstalled();
-		if (!required && !installed) continue;
-		try {
-			if (required) {
-				adapter.installHook();
-				p.log.success(`${adapter.name}: automatic upload hook enabled`);
-				onResult({
-					source: adapter.source,
-					status: "enabled",
-					alreadyInstalled: installed,
-				});
-			} else {
-				adapter.removeHook();
-				p.log.success(`${adapter.name}: automatic upload hook removed`);
-			}
-		} catch (error) {
-			failures++;
-			if (required)
-				onResult({ source: adapter.source, status: "failed", error });
-			p.log.error(
-				`${adapter.name}: could not ${required ? "enable" : "remove"} automatic upload hook (${error instanceof Error ? error.message : String(error)})`,
+			return rows;
+		};
+		let operation: ((signal: AbortSignal) => Promise<void>) | undefined;
+		let operationError: Error | undefined;
+		let hasPreviousUploads: boolean | undefined;
+		while (
+			(await promptUploadManager(repositories, state, scan, operation)) ===
+			"save"
+		) {
+			scan = undefined;
+			operation = undefined;
+			const selected = repositories.filter((repo) =>
+				getDesiredUploadState(repo, state),
 			);
+			if (guided && !selected.length) {
+				state.message = "Select at least one repository to continue setup.";
+				continue;
+			}
+			const changes: RepositoryChange[] = getPendingRepositories(
+				repositories,
+				state,
+			).map((repository) => ({
+				repository,
+				enabled: getDesiredUploadState(repository, state),
+			}));
+			const targets = guided
+				? selected
+				: getRepositoriesToUpload(repositories, state);
+			// A newly enabled repository may use a different destination. Recheck
+			// its history there even when every session exists in the old one.
+			for (const change of changes)
+				if (
+					change.enabled &&
+					change.repository.sessionCount > 0 &&
+					!targets.includes(change.repository)
+				)
+					targets.push(change.repository);
+			const destinations = [...changes];
+			for (const repository of targets)
+				if (!destinations.some((change) => change.repository === repository))
+					destinations.push({ repository, enabled: true });
+			try {
+				const destination = guided
+					? await resolveGuidedDestination(
+							guided,
+							repositories,
+							state,
+							destinations,
+						)
+					: await resolveDestinations(destinations);
+				if (destination.cancelled) {
+					state.message = "Save cancelled. Your changes are still pending.";
+					continue;
+				}
+				for (const change of destinations)
+					if (
+						change.enabled &&
+						(guided ||
+							change.organizationId !== change.repository.organizationId) &&
+						!changes.includes(change)
+					)
+						changes.push(change);
+				const config = getManagerUploadConfig(guided);
+				if (targets.length && !config)
+					throw new Error("Sign in to upload existing sessions.");
+				if (guided) hasPreviousUploads = guided.hasPreviousUploads;
+				else if (targets.length && hasPreviousUploads === undefined) {
+					const credentials = loadCredentials();
+					if (!credentials)
+						throw new Error("Sign in to upload existing sessions.");
+					// Capture account-wide history before this run uploads anything.
+					// Retrying a first upload must still continue onboarding afterward.
+					const setup = await createApiClient(credentials).cli.setupStatus();
+					hasPreviousUploads = setup.hasUploadedSessions === true;
+				}
+				state.stage = "upload";
+				state.completion = undefined;
+				operation = async (signal) => {
+					try {
+						signal.throwIfAborted();
+						if (changes.length)
+							await saveRepositoryChanges(repositories, changes, adapters, {
+								defaultOrganizationId: destination.defaultOrganizationId,
+							});
+						state.desired.clear();
+						state.message = "";
+						signal.throwIfAborted();
+						if (targets.length && config) {
+							await guided?.start();
+							if (state.operation)
+								state.operation.label = cliMessage("uploadProgress");
+							const summary = await uploadRepositorySessions(
+								targets.filter((repo) => repo.enabled),
+								config,
+								() => {},
+								signal,
+							);
+							state.message =
+								summary.failed + summary.skipped
+									? `${summary.succeeded} uploaded · ${summary.failed + summary.skipped} need attention.`
+									: cliMessage("uploadSummary", { count: summary.succeeded });
+							if (!summary.failed && !summary.skipped) {
+								const uploadedWorkspaces = new Set(
+									targets.map(
+										(repo) =>
+											repo.uploadedOrganizationId ?? repo.organizationId,
+									),
+								);
+								const completion = getUploadCompletion(
+									config.endpoint,
+									hasPreviousUploads ?? false,
+									destination.organizations.filter((org) =>
+										uploadedWorkspaces.has(org.id),
+									),
+								);
+								if (guided) {
+									await guided.complete({
+										uploaded: summary.succeeded,
+										skipped:
+											targets.reduce(
+												(count, repo) => count + repo.sessionCount,
+												0,
+											) - summary.total,
+										failed: 0,
+									});
+									state.completion = guided.completionLink(completion);
+								} else state.completion = completion;
+								state.selectionVisible = false;
+							} else if (guided) throw new Error(state.message);
+						} else
+							state.message = cliMessage("saveSummary", {
+								changes: `${changes.length} change${changes.length === 1 ? "" : "s"}`,
+							});
+					} catch (error) {
+						if (guided && !signal.aborted) {
+							operationError =
+								error instanceof Error ? error : new Error(String(error));
+							await guided.close(operationError);
+						}
+						throw error;
+					}
+				};
+			} catch (error) {
+				if (guided) throw error;
+				state.message = cliMessage("saveError", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
 		}
-	}
-	return failures;
-}
-
-function getAdapterName(source: Source): string {
-	return getAdapter(source).name;
-}
-
-function sessionCountHint(count: number): string {
-	return `${count} session${count !== 1 ? "s" : ""}`;
-}
-
-function repositoryCountHint(count: number): string {
-	return count === 1 ? "repository" : "repositories";
-}
-
-function getSessionsToUpload(
-	project: InteractiveUploadProject,
-	forceReplace: boolean,
-): readonly SessionFile[] {
-	return forceReplace
-		? [...project.newSessions, ...project.uploadedSessions]
-		: project.newSessions;
-}
-
-function logSkippedSessions(uploaded: number, duplicates: number): void {
-	if (uploaded > 0) {
-		p.log.info(
-			`Skipping ${sessionCountHint(uploaded)} already uploaded to Opaline.`,
+		if (operationError) return operationError;
+		p.outro(
+			getPendingRepositories(repositories, state).length
+				? cliMessage("discarded")
+				: cliMessage("closed"),
 		);
-	}
-	if (duplicates > 0) {
-		p.log.info(
-			`Skipping ${sessionCountHint(duplicates)} duplicated in local discovery.`,
-		);
-	}
-}
-
-async function runSingleUpload(
-	flags: ResolvedUploadFlags,
-	session: string,
-	allowPlaintextEndpoint: boolean,
-	credentials: Credentials | null,
-): Promise<undefined | Error> {
-	const write = (msg: string) => {
-		process.stdout.write(`${msg}\n`);
-	};
-
-	write(`Resolving session: ${session}`);
-	let sessionInfo: Awaited<ReturnType<typeof resolveSession>>;
-	try {
-		sessionInfo = await resolveSession(session);
 	} catch (error) {
 		return error instanceof Error ? error : new Error(String(error));
 	}
-	write(`Found session at: ${sessionInfo.transcriptPath}`);
-
-	const gitInfo = await getGitInfo(sessionInfo.projectPath);
-	const displayName =
-		gitInfo.gitRemote ||
-		gitInfo.packageName ||
-		basename(sessionInfo.projectPath);
-	if (displayName) write(`Repository: ${displayName}`);
-	if (gitInfo.branch) write(`Branch: ${gitInfo.branch}`);
-
-	const organizationId =
-		flags.org ?? (await getProjectOrgId(sessionInfo.projectPath));
-	if (organizationId) write(`Organization: ${organizationId}`);
-
-	write("Building upload request...");
-	const sessionFile: SessionFile = {
-		sessionId: sessionInfo.sessionId,
-		transcriptPath: sessionInfo.transcriptPath,
-		projectPath: sessionInfo.projectPath,
-		gitBranch: sessionInfo.gitBranch,
-		gitSha: sessionInfo.gitSha,
-	};
-
-	let request: FileBackedUploadRequest;
-	try {
-		request = await getAdapter(sessionInfo.source).buildUploadRequest(
-			sessionFile,
-			{
-				tag: flags.tag,
-				gitInfo,
-				organizationId,
-				uploadMode: "manual",
-			},
-		);
-	} catch (error) {
-		if (error instanceof MissingTranscriptTimestampError) {
-			return new Error(
-				"This transcript has no timestamped user/assistant messages, so it cannot be uploaded.",
-			);
-		}
-		throw error;
-	}
-
-	const transcriptBytes = (await stat(request.transcriptPath)).size;
-	write(`Transcript: ${transcriptBytes} bytes`);
-	if (request.subagents.length > 0) {
-		write(`Subagents: ${request.subagents.length} file(s)`);
-	}
-
-	if (flags.forceReplace) request.metadata.force_replace = true;
-
-	if (flags.dryRun) {
-		const subagents = await Promise.all(
-			request.subagents.map(async (subagent) => ({
-				agentId: subagent.agentId,
-				content: `[${(await stat(subagent.path)).size} bytes]`,
-			})),
-		);
-		const preview = {
-			...request.metadata,
-			content: `[${transcriptBytes} bytes]`,
-			subagents: subagents.length > 0 ? subagents : undefined,
-		};
-		write("Dry run - would upload:");
-		write(JSON.stringify(preview, null, 2));
-		return;
-	}
-
-	if (!credentials) {
-		return new Error("Not authenticated. Run `opaline login` first.");
-	}
-
-	if (!flags.tag && flags.classify) {
-		write("Classifying session...");
-		const classified = await classifySessionFile(request.transcriptPath);
-		if (classified) {
-			request.metadata.tag = classified;
-			write(`Classified as: ${classified}`);
-		}
-	}
-
-	write("Uploading...");
-	const result = await uploadSession(request, {
-		endpoint: flags.endpoint,
-		token: credentials.token,
-		allowInsecureEndpoint: allowPlaintextEndpoint,
-		authType: credentials.authType,
-	});
-
-	if (result.success) {
-		write("Upload successful!");
-		await removeFailedUpload(request.metadata.sessionId);
-		const redactionSummary = formatRedactionSummary(
-			result.redacted,
-			result.redactedBytes,
-		);
-		if (redactionSummary) {
-			write(redactionSummary);
-		}
-	} else {
-		return new Error(`Upload failed: ${result.error}`);
-	}
 }
 
-async function runRetryUpload(
-	flags: ResolvedUploadFlags,
-	allowPlaintextEndpoint: boolean,
-	credentials: Credentials | null,
-): Promise<undefined | Error> {
-	p.intro("opaline upload --retry");
-
-	const failures = await loadFailedUploads();
-	if (failures.length === 0) {
-		p.outro("No failed uploads to retry.");
-		return;
-	}
-
-	const retryableFailures = failures.filter((failure) =>
-		isRetryCandidate(failure, flags.forceReplace),
-	);
-	const permanentFailures = failures.filter(
-		(failure) => failure.status === "permanent",
-	);
-	p.log.info(
-		`Found ${failures.length} failed upload(s): ${retryableFailures.length} retryable, ${permanentFailures.length} permanent`,
-	);
-	for (const f of failures.slice(0, 10)) {
-		p.log.warn(`  [${f.status}] ${f.sessionId}: ${f.error} (${f.failedAt})`);
-	}
-	if (failures.length > 10) {
-		p.log.warn(`  ...and ${failures.length - 10} more`);
-	}
-	if (permanentFailures.length > 0) {
-		p.log.warn(
-			flags.forceReplace
-				? "Permanent shrink rejections are promoted by --force-replace; other permanent failures remain recorded."
-				: "Permanent failures are retained for visibility and are not retried automatically.",
-		);
-	}
-	if (retryableFailures.length === 0) {
-		p.outro("No retryable uploads. Permanent failures remain recorded.");
-		return;
-	}
-
-	if (flags.dryRun) {
-		p.outro(
-			`Dry run complete — ${retryableFailures.length} retryable upload(s) were not sent.`,
-		);
-		return;
-	}
-
-	if (!credentials) {
-		return new Error("Not authenticated. Run `opaline login` first.");
-	}
-
-	if (!flags.yes) {
-		const shouldRetry = await p.confirm({
-			message: `Retry ${retryableFailures.length} retryable upload(s)?`,
-			initialValue: true,
-		});
-
-		if (p.isCancel(shouldRetry) || !shouldRetry) {
-			p.cancel("Retry cancelled.");
-			return;
-		}
-	}
-
-	type RetryItem = BatchUploadItem & {
-		failure: (typeof failures)[number];
-	};
-
-	const items: RetryItem[] = retryableFailures.map((f) => ({
-		sessionId: f.sessionId,
-		label: f.sessionId,
-		transcriptPath: f.transcriptPath,
-		projectPath: f.projectPath,
-		source: f.source,
-		organizationId: f.organizationId,
-		failure: f,
-	}));
-
-	const { token, authType } = credentials;
-	const summary = await runBatchUpload({
-		items,
-		label: "Retrying uploads...",
-		concurrency: flags.concurrency,
-		upload: async (item, onRetry) => {
-			const adapter = item.failure.source
-				? getAdapter(item.failure.source)
-				: claudeCodeAdapter;
-			const sessionFile: SessionFile = {
-				sessionId: item.failure.sessionId,
-				transcriptPath: item.failure.transcriptPath,
-				projectPath: item.failure.projectPath,
-			};
-			const gitInfo = await getGitInfo(item.failure.projectPath);
-			const organizationId =
-				flags.org ??
-				item.failure.organizationId ??
-				(await getProjectOrgId(item.failure.projectPath));
-
-			const request = await adapter.buildUploadRequest(sessionFile, {
-				tag: flags.tag,
-				gitInfo,
-				organizationId,
-				uploadMode: "retry",
-			});
-			if (flags.forceReplace) request.metadata.force_replace = true;
-
-			return uploadSession(request, {
-				endpoint: flags.endpoint,
-				token,
-				allowInsecureEndpoint: allowPlaintextEndpoint,
-				authType,
-				onRetry,
-			});
-		},
-	});
-
-	renderBatchSummary(summary);
-
-	p.outro("Done!");
-
-	if (summary.failed > 0) {
-		return new Error(`${summary.failed} upload(s) failed.`);
-	}
-}
-
-async function runUpload(
-	flags: UploadFlags,
-	...sessions: string[]
-): Promise<undefined | Error> {
+function getManagerUploadConfig(
+	guided?: GuidedUpload,
+): UploadConfig | undefined {
 	const credentials = loadCredentials();
-	if (!credentials && !flags.dryRun) {
-		return new Error("Not authenticated. Run `opaline login` first.");
-	}
-	const apiBaseUrl = credentials?.apiBaseUrl.replace(/\/+$/u, "");
-	const resolvedFlags: ResolvedUploadFlags = {
-		...flags,
-		endpoint:
-			flags.endpoint ??
-			(apiBaseUrl === undefined ? DEFAULT_ENDPOINT : `${apiBaseUrl}/rpc`),
+	if (!credentials) return undefined;
+	return {
+		endpoint: `${guided?.apiBase ?? getApiBaseOverride() ?? credentials.apiBaseUrl}/rpc`,
+		token: credentials.token,
+		authType: credentials.authType,
+		allowInsecureEndpoint:
+			guided?.allowInsecureApiBase || allowsInsecureEndpointFromEnv(),
 	};
-	const allowPlaintextEndpoint = allowsInsecureEndpoint(
-		resolvedFlags.allowInsecureEndpoint,
-	);
-	if (resolvedFlags.retry) {
-		return runRetryUpload(resolvedFlags, allowPlaintextEndpoint, credentials);
+}
+
+async function resolveGuidedDestination(
+	guided: GuidedUpload,
+	repositories: UploadRepository[],
+	state: UploadManagerState,
+	changes: RepositoryChange[],
+) {
+	const approved = await guided.authorize(repositories, state);
+	for (const change of changes)
+		if (change.enabled) change.organizationId = approved.organizationId;
+	return {
+		cancelled: false,
+		defaultOrganizationId: approved.organizationId,
+		organizations: approved.organizations,
+	};
+}
+
+async function resolveDestinations(changes: RepositoryChange[]): Promise<
+	| { cancelled: true }
+	| {
+			cancelled: false;
+			defaultOrganizationId?: string;
+			organizations: Array<{ id: string; slug: string }>;
+	  }
+> {
+	const enabling = changes.filter((change) => change.enabled);
+	if (enabling.length === 0) return { cancelled: false, organizations: [] };
+	const risk = describeSavedCredentialsApiBaseRisk();
+	if (risk) p.log.warn(risk);
+	const apiBase = loadCredentials()?.apiBaseUrl ?? getDefaultApiBase();
+	let auth = await verifyAuth();
+	if (
+		!auth.authenticated &&
+		(auth.reason === "no_credentials" || auth.reason === "token_expired")
+	) {
+		const error = await runLogin({
+			apiBase,
+			allowInsecureApiBase: false,
+			noBrowser: false,
+		});
+		if (error) throw error;
+		auth = await verifyAuth();
 	}
-	if (sessions.length === 0) {
-		return runInteractiveUpload(
-			resolvedFlags,
-			allowPlaintextEndpoint,
-			credentials,
+	if (!auth.authenticated) throw new Error(auth.message);
+	const organizations =
+		auth.credentials.authType === "api-key"
+			? (auth.credentials.organizations ?? [])
+			: await createApiClient(auth.credentials).listMyOrganizations();
+	if (!organizations.length)
+		throw new Error(
+			"No upload destinations found. Create an organization in Opaline first.",
 		);
+	const config = loadAutoUploadConfig();
+	let defaultOrganizationId = organizations.find(
+		(org) => org.id === config?.defaultOrganizationId,
+	)?.id;
+	for (const change of enabling) {
+		const path = change.repository.paths[0];
+		const previous =
+			change.repository.organizationId ??
+			(path ? await getProjectOrgId(path) : undefined);
+		let organizationId =
+			organizations.find((org) => org.id === previous)?.id ??
+			defaultOrganizationId;
+		if (!organizationId && organizations.length === 1)
+			organizationId = organizations[0]?.id;
+		if (!organizationId) {
+			const selected = await p.select({
+				message: cliMessage("destination"),
+				options: organizations.map((org) => ({
+					value: org.id,
+					label: sanitizeForTerminalDisplay(org.name),
+				})),
+			});
+			if (p.isCancel(selected)) return { cancelled: true };
+			organizationId = selected;
+			defaultOrganizationId = selected;
+		}
+		change.organizationId = organizationId;
 	}
-	return runSingleUpload(
-		resolvedFlags,
-		sessions[0] as string,
-		allowPlaintextEndpoint,
-		credentials,
-	);
+	return { cancelled: false, defaultOrganizationId, organizations };
 }
 
 export const uploadCommand = buildCommand({
-	loader: async () => ({ default: runUpload }),
-	parameters: {
-		positional: {
-			kind: "array",
-			parameter: {
-				brief: "Session ID or path to a session .jsonl file",
-				parse: String,
-				placeholder: "session",
-			},
-		},
-		flags: {
-			tag: {
-				kind: "enum",
-				values: [...SESSION_TAGS],
-				brief: "Session tag/category",
-				optional: true,
-			},
-			endpoint: {
-				kind: "parsed",
-				parse: String,
-				brief: "Override the upload endpoint URL",
-				optional: true,
-			},
-			allowInsecureEndpoint: {
-				kind: "boolean",
-				brief: "Allow plaintext uploads to a non-loopback endpoint",
-				default: false,
-			},
-			classify: {
-				kind: "boolean",
-				brief: "Auto-classify session tag using Claude CLI",
-				default: false,
-			},
-			dryRun: {
-				kind: "boolean",
-				brief: "Preview what would be uploaded without sending",
-				default: false,
-			},
-			org: {
-				kind: "parsed",
-				parse: String,
-				brief: "Override the organization ID to upload to",
-				optional: true,
-			},
-			retry: {
-				kind: "boolean",
-				brief: "Retry previously failed uploads",
-				default: false,
-			},
-			yes: {
-				kind: "boolean",
-				brief: "Skip the confirmation prompt for --retry",
-				default: false,
-			},
-			concurrency: {
-				kind: "parsed",
-				parse: Number,
-				brief: "Max concurrent uploads",
-				default: "5",
-			},
-			forceReplace: {
-				kind: "boolean",
-				brief: "Intentionally replace a stored session with smaller content",
-				default: false,
-			},
-		},
-		aliases: {
-			t: "tag",
-			c: "classify",
-			n: "dryRun",
-			o: "org",
-			r: "retry",
-			y: "yes",
-			j: "concurrency",
-		},
-	},
+	loader: async () => ({ default: () => runUpload() }),
+	parameters: {},
 	docs: {
-		brief:
-			"Sync sessions and manage automatic upload by repository. Pass a session for a one-off upload.",
+		brief: "Turn automatic session uploads on or off for each repository",
 	},
 });

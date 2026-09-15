@@ -201,6 +201,7 @@ export async function runLogin(
 		readonly id: string;
 		readonly browserOrigin: string;
 		readonly registerDevice: (deviceCode: string) => Promise<unknown>;
+		readonly readUploadHistory?: (hasPreviousUploads: boolean) => void;
 	},
 ): Promise<undefined | Error> {
 	let openedBrowser = false;
@@ -352,6 +353,10 @@ export async function runLogin(
 			name: org.name,
 			slug: org.slug,
 		}));
+		if (connection?.readUploadHistory) {
+			const setup = await client.cli.setupStatus();
+			connection.readUploadHistory(setup.hasUploadedSessions === true);
+		}
 	} catch (error) {
 		captureLoginFailure("account_fetch", error);
 		spin.stop("Authentication failed");

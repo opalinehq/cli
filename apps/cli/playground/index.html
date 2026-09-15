@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>CLI playground · Opaline</title>
+	<link rel="icon" href="data:,">
+	<link rel="stylesheet" href="/playground.css">
+	<script type="module" src="/client.js"></script>
+</head>
+<body>
+	<header class="page-header">
+		<div class="brand-group"><a class="brand" href="/" aria-label="Homepage"><span class="brand-mark" aria-hidden="true">o</span>Opaline</a><span class="slash">/</span><h1>CLI playground</h1><div class="local-label"><i></i>Local</div></div>
+		<div class="header-actions"><p id="save-status" role="status">Loading theme…</p><button id="reset-theme" type="button">Reset changes</button><button id="apply-theme" class="primary" type="button" disabled>Apply to CLI <span aria-hidden="true">↗</span></button></div>
+	</header>
+	<main class="workspace">
+		<section class="preview-pane" aria-labelledby="preview-heading">
+			<div class="preview-toolbar"><div><h2 id="preview-heading">Live preview</h2><p>Adjust the look. Try the flow.</p></div><div class="preview-toolbar-actions"><fieldset class="segmented" aria-label="Terminal background"><button id="dark" type="button" aria-pressed="true">Dark</button><button id="light" type="button" aria-pressed="false">Light</button></fieldset><label class="scenario-label">Sample data<select id="dataset" name="dataset"><option value="standard">Everyday repos</option><option value="long">80 repositories</option><option value="unicode">Long & Unicode names</option><option value="empty">No repositories</option><option value="repair">Setup issue</option></select></label></div></div>
+			<div class="flow-bar">
+ <label class="screen-select" for="screen">Screen <select id="screen" name="screen"></select></label>
+ <div class="flow-navigation"><button id="previous-screen" class="small" type="button" aria-label="Previous screen">←</button><output id="screen-position"></output><button id="next-screen" class="small" type="button" aria-label="Next screen">→</button></div>
+ <button id="play-flow" type="button" class="small">Play upload flow</button>
+ </div>
+ <p id="screen-description" class="screen-description"></p>
+ <div class="terminal-stage">
+				<div class="terminal-window" id="terminal-window"><div class="terminal-chrome"><div class="window-dots" aria-hidden="true"><i></i><i></i><i></i></div><div id="terminal-command">opaline upload</div><output id="dimensions">80 × 24</output></div><div class="terminal-viewport"><!-- biome-ignore lint/a11y/noNoninteractiveTabindex: The terminal emulator handles CLI keyboard input. -->
+<div id="terminal" class="terminal" tabindex="0" role="application" aria-label="Interactive CLI preview" aria-describedby="terminal-help"><div class="loading">Loading preview…</div></div></div></div>
+			</div>
+			<div class="playback-toolbar"><label>Workspaces<select id="workspaces"><option value="1">1 workspace</option><option value="3">3 workspaces</option></select></label><button id="replay-motion" type="button" class="small">Replay motion</button><label>Speed<select id="playback-speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select></label><label id="progress-control">Progress<input id="progress" type="range" min="0" max="100" value="0"><output id="progress-value">0%</output></label></div>
+ <div class="demo-toolbar"><p id="terminal-help">Click a repo to toggle. Or focus the terminal and use <kbd>↑↓</kbd> <kbd>Space</kbd> <kbd>Enter</kbd>.</p><div><button id="edit-repos" type="button" class="small" hidden>Add repos</button><button id="save-demo" type="button" class="small">Review selection</button><button id="reset-demo" type="button" class="small">Reset demo</button></div></div>
+			<div class="preview-settings"><div class="viewport-controls"><label>Columns<input id="columns" name="columns" type="number" min="38" max="160" value="80"></label><span class="multiply">×</span><label>Rows<input id="rows" name="rows" type="number" min="13" max="45" value="24"></label><label>Text size<select id="font-size" name="font-size"><option value="12">12 px</option><option value="14" selected>14 px</option><option value="16">16 px</option><option value="18">18 px</option></select></label></div><p>Terminal size, background, and font size are preview settings.</p></div>
+			<div class="preview-note"><span class="note-dot"></span><p><span id="preview-source">Uses the real CLI renderer with sample repositories.</span> No sessions are uploaded.</p></div>
+			<details class="export"><summary>Theme settings <span id="copy-status"></span></summary><div class="export-heading"><p>These settings are used by the local CLI.</p><button id="copy-theme" type="button" class="small">Copy JSON</button></div><pre id="theme-json"></pre></details>
+		</section>
+		<aside class="inspector" aria-labelledby="customize-heading">
+			<div class="inspector-heading"><h2 id="customize-heading">Customize</h2><p id="theme-status">Current CLI theme</p></div>
+			<fieldset class="copy-fieldset"><legend>Screen copy</legend><div id="screen-copy"></div><p class="field-note">Edits apply to this flow in the local CLI. Keep the {placeholders} for live values.</p></fieldset>
+ <fieldset><legend>Motion</legend>
+ <div id="switch-motion"><label class="range-label" for="motionDuration">Switch duration <output id="motionDuration-value">160 ms</output></label><input id="motionDuration" type="range" min="0" max="400" step="20" value="160">
+ <p class="field-note">Applied to the CLI as three terminal frames. Set to 0 to turn it off.</p></div>
+ <label class="range-label" for="screen-duration">Screen fade <output id="screen-duration-value">180 ms</output></label><input id="screen-duration" type="range" min="0" max="400" step="20" value="180">
+ <p class="field-note">Screen fades and playback speed are preview only. Reduced motion follows your system setting.</p>
+ </fieldset>
+ <p id="layout-scope" class="field-note" hidden>Table styling below is available on repository screens. These prompts use the CLI’s Clack layout.</p><fieldset data-manager><legend>Layout</legend>
+				<label class="range-label" for="maxWidth">Maximum width <output id="maxWidth-value">96 cols</output></label><input id="maxWidth" name="maxWidth" type="range" min="64" max="120" value="96">
+				<label class="range-label" for="padding">Side padding <output id="padding-value">2 cols</output></label><input id="padding" name="padding" type="range" min="1" max="4" value="2">
+				<label class="range-label" for="columnGap">Column gap <output id="columnGap-value">3 cols</output></label><input id="columnGap" name="columnGap" type="range" min="1" max="6" value="3">
+				<p class="field-note">Narrow terminals tighten spacing automatically.</p>
+			</fieldset>
+			<fieldset data-manager><legend>Table</legend><label class="select-label" for="separators">Separators<select id="separators" name="separators"><option value="line">Thin lines</option><option value="dots">Dotted</option><option value="none">Whitespace</option></select></label><label class="select-label" for="focus">Focused repository<select id="focus" name="focus"><option value="inverse">Inverse highlight</option><option value="bold">Bold text</option><option value="underline">Underline</option></select></label></fieldset>
+			<fieldset data-manager><legend>Details</legend><label class="switch-row" for="showSummary">Repository count in header<input id="showSummary" name="showSummary" type="checkbox" checked></label><label class="switch-row" for="showTotals">ON / OFF totals in footer<input id="showTotals" name="showTotals" type="checkbox" checked></label><label class="switch-row" for="showRepoIdentity">Repository path in footer<input id="showRepoIdentity" name="showRepoIdentity" type="checkbox" checked></label><label class="switch-row" for="dimSecondary">Quiet secondary text<input id="dimSecondary" name="dimSecondary" type="checkbox" checked></label></fieldset>
+			<fieldset data-manager><legend>Colors</legend><label class="color-row" for="accentColor">Brand & cursor<div><output id="accentColor-value">Terminal cyan</output><input id="accentColor" name="accentColor" type="color" value="#80c9d4"></div></label><label class="color-row" for="onColor">ON<div><output id="onColor-value">Terminal green</output><input id="onColor" name="onColor" type="color" value="#8ccc91"></div></label><label class="color-row" for="offColor">OFF<div><output id="offColor-value">Terminal red</output><input id="offColor" name="offColor" type="color" value="#eb7b7b"></div></label><button id="terminal-colors" type="button" class="small text-button">Use terminal colors</button></fieldset>
+			<p class="apply-note"><strong>Apply to CLI</strong> saves this theme and rebuilds the CLI in this workspace.</p>
+		</aside>
+	</main>
+	<div id="error" role="alert" hidden></div>
+</body>
+</html>

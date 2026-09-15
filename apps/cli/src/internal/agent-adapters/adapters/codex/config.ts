@@ -51,6 +51,22 @@ function isOpalineHookCommand(command: readonly string[]): boolean {
 	);
 }
 
+// Preflight is read-only. The manager validates every adapter before changing hooks.
+export function validateHook(configPath: string = CONFIG_PATH): void {
+	const { notify } = readConfig(configPath);
+	if (
+		notify === undefined ||
+		(Array.isArray(notify) &&
+			(!notify.length ||
+				isOpalineHookCommand(notify) ||
+				(notify.length === 1 && notify[0] === MALFORMED_LEGACY_HOOK_COMMAND)))
+	)
+		return;
+	throw new Error(
+		`Codex notify is already configured in ${configPath}. Codex supports only one notify command, so Opaline left the existing command unchanged.`,
+	);
+}
+
 export function installHook(configPath: string = CONFIG_PATH): void {
 	const config = readConfig(configPath);
 	const notify = config.notify;

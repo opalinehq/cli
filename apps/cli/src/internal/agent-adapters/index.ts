@@ -1,11 +1,13 @@
 export {
 	claudeCodeAdapter,
+	createClaudeCodeAdapter,
 	decodeProjectPath,
 	extractAgentIds,
 	readSubagentFiles,
 } from "./adapters/claude-code/index.js";
 export {
 	codexAdapter,
+	createCodexAdapter,
 	findActiveRolloutFile,
 	readCodexSessionMeta,
 } from "./adapters/codex/index.js";
@@ -25,8 +27,10 @@ export type {
 	FileBackedUploadRequest,
 	FileBackedUploadSubagent,
 	GitInfo,
+	HookOptions,
 	ScannedProject,
 	SessionFile,
+	SessionScanOptions,
 	SessionTimestamps,
 	UploadContext,
 } from "./types.js";

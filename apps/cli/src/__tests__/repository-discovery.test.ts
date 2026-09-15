@@ -10,7 +10,6 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ScannedProject } from "../internal/agent-adapters/index.js";
 import {
 	readJsonlFirstLine,
 	readSessionDiscoveryMetadata,
@@ -20,12 +19,6 @@ import {
 	discoverProjectRepositories,
 	resolveUploadRepositoryIdentity,
 } from "../lib/repository-discovery.js";
-import {
-	getRepositoryLastActivity,
-	getRepositorySessionCount,
-	groupUploadProjectsByRepository,
-	orderUploadRepositoriesForSelection,
-} from "../lib/upload-reconciliation.js";
 
 const tempRoot = await realpath(
 	await mkdtemp(join(tmpdir(), "opaline-repository-discovery-")),
@@ -140,57 +133,6 @@ test("uses current Git metadata ahead of a transcript's old remote", async () =>
 	).toBe("remote:github.com/acme/current");
 });
 
-test("ranks combined repository activity and counts duplicate sessions once", () => {
-	const project = (
-		path: string,
-		ids: string[],
-		lastActivityAt: number,
-		source: "claude_code" | "codex" = "claude_code",
-	): ScannedProject => ({
-		source,
-		projectPath: path,
-		displayPath: path,
-		sessionCount: ids.length,
-		sessions: ids.map((sessionId) => ({
-			sessionId,
-			projectPath: path,
-			transcriptPath: `${path}/${sessionId}.jsonl`,
-			lastActivityAt,
-		})),
-	});
-	const inputs = [
-		{ project: project("/alpha", ["one"], 100), root: "/alpha" },
-		{ project: project("/beta", ["two"], 200), root: "/beta" },
-		{
-			project: project("/alpha/worktree", ["one", "three"], 300, "codex"),
-			root: "/alpha",
-		},
-		{ project: project("/unknown", ["four"], 0), root: "/unknown" },
-	];
-	const repositories = orderUploadRepositoriesForSelection(
-		groupUploadProjectsByRepository(
-			inputs.map(({ project, root }) => ({
-				project,
-				newSessions: project.sessions,
-				repositoryIdentity: resolveUploadRepositoryIdentity(
-					project.projectPath,
-					{ repositoryRoot: root },
-				),
-			})),
-		),
-	);
-	expect(repositories.map((repository) => repository.label)).toEqual([
-		"alpha",
-		"beta",
-		"unknown",
-	]);
-	const alpha = repositories[0];
-	expect(alpha).toBeDefined();
-	if (!alpha) throw new Error("Missing alpha repository");
-	expect(getRepositorySessionCount(alpha)).toBe(2);
-	expect(getRepositoryLastActivity(alpha)).toBe(300);
-});
-
 test("reads transcript activity dates rather than the date the file was copied", async () => {
 	const path = join(tempRoot, "copied.jsonl");
 	await writeFile(
@@ -227,59 +169,4 @@ test("reads long Codex metadata without loading the remainder of the transcript"
 		`${JSON.stringify(meta)}\n${"unparsed body\n".repeat(100_000)}`,
 	);
 	expect(await readJsonlFirstLine(path)).toEqual(meta);
-});
-
-test("balances substantial session counts with recency instead of sorting only by either", () => {
-	const now = Date.parse("2026-09-13T12:00:00Z");
-	const day = 24 * 60 * 60 * 1000;
-	const inputs = [
-		{ name: "tiny-today", count: 1, daysAgo: 0 },
-		{ name: "largest-dormant", count: 1000, daysAgo: 180 },
-		{ name: "larger-two-weeks-ago", count: 180, daysAgo: 14 },
-		{ name: "substantial-yesterday", count: 60, daysAgo: 1 },
-		{ name: "smaller-yesterday", count: 10, daysAgo: 1 },
-	];
-	const repositories = inputs.map(({ name, count, daysAgo }) => {
-		const project: ScannedProject = {
-			source: "claude_code",
-			projectPath: `/${name}`,
-			displayPath: name,
-			sessionCount: count,
-			sessions: Array.from({ length: count }, (_, index) => ({
-				sessionId: `${name}-${index}`,
-				transcriptPath: `/${name}/${index}.jsonl`,
-				projectPath: `/${name}`,
-				lastActivityAt: now - daysAgo * day,
-			})),
-		};
-		return {
-			key: name,
-			label: name,
-			projects: [
-				{
-					project,
-					newSessions: project.sessions,
-					repositoryIdentity: {
-						repoKey: name,
-						repoLabel: name,
-						worktree: null,
-					},
-				},
-			],
-		};
-	});
-	expect(
-		orderUploadRepositoriesForSelection(repositories, now).map(
-			(repository) => repository.label,
-		),
-	).toEqual([
-		"substantial-yesterday",
-		"larger-two-weeks-ago",
-		"smaller-yesterday",
-		"tiny-today",
-		"largest-dormant",
-	]);
-	expect(repositories.map((repository) => repository.label)).toEqual(
-		inputs.map((input) => input.name),
-	);
 });

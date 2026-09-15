@@ -41,7 +41,7 @@ const CliSessionUploadStatusInputSchema = z.object({
 		}),
 });
 
-const CliSessionUploadStatusOutputSchema = z.object({
+export const CliSessionUploadStatusOutputSchema = z.object({
 	organizationId: z.string(),
 	uploadedSessionIds: z.array(z.string()),
 });
@@ -56,6 +56,12 @@ export const contract = {
 	me: oc.output(UserSchema),
 	cli: {
 		authStatus: oc.output(CliUserSchema),
+		setupStatus: oc.output(
+			z.object({
+				hasCliLogin: z.boolean(),
+				hasUploadedSessions: z.boolean().optional(),
+			}),
+		),
 		revokeToken: oc.output(z.object({ success: z.literal(true) })),
 		sessionUploadStatus: oc
 			.input(CliSessionUploadStatusInputSchema)

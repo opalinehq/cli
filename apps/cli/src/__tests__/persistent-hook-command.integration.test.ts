@@ -38,6 +38,7 @@ test("published hooks survive runner-cache removal and preserve unrelated settin
 						matcher: "",
 						hooks: [
 							{ type: "command", command: "echo keep-me" },
+							{ type: "command", command: "rudel hooks claude session-end" },
 							{ type: "command", command: "opaline hooks claude session-end" },
 						],
 					},

@@ -5,7 +5,6 @@ analytics.
 
 ```bash
 npx opaline@latest
-npx opaline@latest doctor
 ```
 
 Run this from any directory. The CLI scans local Claude Code and Codex sessions,
@@ -16,15 +15,16 @@ works too. A global install remains optional.
 Copying the command from the Opaline demo adds a hidden `--code` value. That
 one-time code pairs the terminal with your browser for live selection and upload
 status. It expires after ten minutes if unused. Approve login in the same browser
-where you copied the command; finishing setup opens your own Sessions page.
+where you copied the command. First-time uploads continue browser setup; returning
+users open their workspace Sessions page.
 
 Automatic uploads retain the bundled CLI under `~/.rudel/runtime` and use your
 Node executable, so hooks keep working after the temporary runner cache is gone.
 
 `opaline upload` groups discovered worktrees by repository, saves the selected
 repositories for automatic upload, and sends only sessions the server does not
-already have. `opaline enable` remains available to enable the current
-repository directly.
+already have. Press Space to toggle, Enter to review, then Enter to confirm.
+Existing Rudel hooks count as enabled and migrate when selections are saved.
 
 The CLI keeps using the existing `~/.rudel` state directory so upgrades do not
 require another login. Its production API is `https://opaline.so`.
@@ -45,8 +45,8 @@ Setup results include the selected repository count, total local session count,
 and an anonymous list of session counts per repository, grouped by agent and
 destination workspace. Duplicate discoveries within a repository count once.
 These describe the selected local sessions, including previously uploaded ones,
-and do not measure successful uploads. `enable` measures the current repository;
-the `upload` picker measures the selected repositories. Counts are snapshots,
+and do not measure successful uploads. The upload table measures the selected repositories, including when opened
+through the legacy `enable` or `disable` names. Counts are snapshots,
 not values to sum across repeated setup events or agents sharing a repository.
 An anonymous local identifier links activity to your Opaline account after login.
 Command arguments, connection codes, repository names, local paths, and session

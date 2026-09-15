@@ -50,6 +50,15 @@ export interface SessionTimestamps {
 	lastInteractionDate: string;
 }
 
+export interface SessionScanOptions {
+	signal?: AbortSignal;
+	onSession?: (session: SessionFile) => void | Promise<void>;
+}
+export interface HookOptions {
+	global?: boolean;
+	projectPath?: string;
+}
+
 export interface AgentAdapter {
 	name: string;
 	source: Source;
@@ -57,13 +66,14 @@ export interface AgentAdapter {
 	// Session Discovery (CLI)
 	getSessionsBaseDir(): string;
 	findProjectSessions(projectPath: string): Promise<SessionFile[]>;
-	scanAllSessions(): Promise<ScannedProject[]>;
+	scanAllSessions(options?: SessionScanOptions): Promise<ScannedProject[]>;
 
 	// Hook Management (CLI)
-	getHookConfigPath(): string;
-	installHook(): void;
-	removeHook(): void;
-	isHookInstalled(): boolean;
+	getHookConfigPath(options?: HookOptions): string;
+	validateHook(options?: HookOptions): void;
+	installHook(options?: HookOptions): void;
+	removeHook(options?: HookOptions): void;
+	isHookInstalled(options?: HookOptions): boolean;
 
 	// Upload Request Building (CLI)
 	buildUploadRequest(

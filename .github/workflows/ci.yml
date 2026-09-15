@@ -82,6 +82,11 @@ jobs:
       - name: Setup Bun
         uses: ./.github/actions/setup
 
+      - name: Verify settings recovery and hook migration
+        env:
+          POSTHOG_ENABLED: "false"
+        run: bun test apps/cli/src/__tests__/auto-upload-config.test.ts apps/cli/src/__tests__/upload-manager-migration.test.ts
+
       - name: Pack and install all three CLI packages
         shell: bash
         run: |

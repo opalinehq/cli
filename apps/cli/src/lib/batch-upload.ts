@@ -29,6 +29,7 @@ export interface BatchUploadOptions<T extends BatchUploadItem> {
 		onRetry: (attempt: number, maxAttempts: number, error: string) => void,
 	) => Promise<UploadResult>;
 	concurrency?: number;
+	signal?: AbortSignal;
 	onItemComplete?: (completed: number, total: number) => void;
 	onRetry?: (
 		label: string,
@@ -85,6 +86,7 @@ export async function batchUpload<T extends BatchUploadItem>(
 	await pMap(
 		items,
 		async (item) => {
+			if (options.signal?.aborted) return;
 			if (rateLimited) {
 				deferred++;
 				const error =
@@ -135,6 +137,7 @@ export async function batchUpload<T extends BatchUploadItem>(
 					});
 				}
 			} catch (err) {
+				if (options.signal?.aborted) return;
 				const error = err instanceof Error ? err.message : String(err);
 				if (
 					err instanceof MissingTranscriptTimestampError ||
