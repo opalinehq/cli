@@ -3,7 +3,12 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as parseTOML } from "smol-toml";
-import { installHook, isHookInstalled, removeHook } from "./config.js";
+import {
+	installHook,
+	isHookInstalled,
+	removeHook,
+	validateHook,
+} from "./config.js";
 
 let tempDir: string;
 
@@ -25,6 +30,31 @@ async function readNotify(path: string): Promise<unknown> {
 }
 
 describe("Codex notify configuration", () => {
+	test("recognizes and migrates Rudel inside Computer Use without retaining a second upload hook", async () => {
+		const path = configPath("wrapped-rudel");
+		const outer = [
+			"/Applications/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient",
+			"turn-ended",
+			"--previous-notify",
+		];
+		await writeFile(
+			path,
+			`notify = ${JSON.stringify([...outer, JSON.stringify(["rudel", "hooks", "codex", "turn-complete"])])}\n`,
+		);
+		expect(isHookInstalled(path)).toBe(true);
+		installHook(path);
+		expect(await readNotify(path)).toEqual([
+			...outer,
+			JSON.stringify(["opaline", "hooks", "codex", "turn-complete"]),
+		]);
+		removeHook(path);
+		expect(await readNotify(path)).toEqual(outer.slice(0, 2));
+		installHook(path);
+		expect(await readNotify(path)).toEqual([
+			...outer,
+			JSON.stringify(["opaline", "hooks", "codex", "turn-complete"]),
+		]);
+	});
 	test("installs Opaline as one argv vector and is idempotent", async () => {
 		const path = configPath("fresh");
 
@@ -94,12 +124,25 @@ describe("Codex notify configuration", () => {
 		const original = 'notify = ["python3", "/tmp/notify.py"]\n';
 		await writeFile(path, original, { flag: "wx" });
 
-		expect(() => installHook(path)).toThrow("supports only one notify command");
-		expect(await readFile(path, "utf8")).toBe(original);
-		expect(isHookInstalled(path)).toBe(false);
+		validateHook(path);
+		installHook(path);
+		const installed = await readFile(path, "utf8");
+		installHook(path);
+		expect(await readFile(path, "utf8")).toBe(installed);
+		expect(await readNotify(path)).toEqual([
+			"opaline",
+			"hooks",
+			"codex",
+			"turn-complete",
+			"--previous-notify",
+			JSON.stringify(["python3", "/tmp/notify.py"]),
+		]);
+		expect(isHookInstalled(path)).toBe(true);
+		removeHook(path);
+		expect(await readNotify(path)).toEqual(["python3", "/tmp/notify.py"]);
 	});
 
-	test("repairs a previously corrupted notify command without replacing it", async () => {
+	test("preserves every argument of a custom notifier, including a legacy-looking argument", async () => {
 		const path = configPath("legacy-appended");
 		await writeFile(
 			path,
@@ -107,9 +150,74 @@ describe("Codex notify configuration", () => {
 			{ flag: "wx" },
 		);
 
-		expect(() => installHook(path)).toThrow("restoring the previous command");
-		expect(await readNotify(path)).toEqual(["python3", "/tmp/notify.py"]);
-		expect(isHookInstalled(path)).toBe(false);
+		validateHook(path);
+		installHook(path);
+		expect(await readNotify(path)).toEqual([
+			"opaline",
+			"hooks",
+			"codex",
+			"turn-complete",
+			"--previous-notify",
+			JSON.stringify([
+				"python3",
+				"/tmp/notify.py",
+				"rudel hooks codex turn-complete",
+			]),
+		]);
+		expect(isHookInstalled(path)).toBe(true);
+		removeHook(path);
+		expect(await readNotify(path)).toEqual([
+			"python3",
+			"/tmp/notify.py",
+			"rudel hooks codex turn-complete",
+		]);
+	});
+
+	test("preserves the Computer Use notification chain, including its nested custom command", async () => {
+		const path = configPath("computer-use");
+		const previous = [
+			"/Applications/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient",
+			"turn-ended",
+			"--previous-notify",
+			JSON.stringify([
+				"/home/me/.local/bin/codex-notify",
+				"rudel hooks codex turn-complete",
+			]),
+		];
+		await writeFile(
+			path,
+			`model = "keep-me"\nnotify = ${JSON.stringify(previous)}\n`,
+		);
+		validateHook(path);
+		installHook(path);
+		const installed = await readFile(path, "utf8");
+		installHook(path);
+		expect(await readFile(path, "utf8")).toBe(installed);
+		expect(isHookInstalled(path)).toBe(true);
+		expect(await readNotify(path)).toEqual([
+			...previous.slice(0, 3),
+			JSON.stringify([
+				"opaline",
+				"hooks",
+				"codex",
+				"turn-complete",
+				"--previous-notify",
+				previous[3],
+			]),
+		]);
+		expect(parseTOML(installed).model).toBe("keep-me");
+		removeHook(path);
+		expect(await readNotify(path)).toEqual(previous);
+	});
+
+	test("an invalid notify setting explains the global scope, file and recovery without changing it", async () => {
+		const path = configPath("invalid");
+		const original = 'notify = "not an argv array"\n';
+		await writeFile(path, original);
+		expect(() => validateHook(path)).toThrow("all repositories");
+		expect(() => installHook(path)).toThrow(path);
+		expect(() => installHook(path)).toThrow("list of strings");
+		expect(await readFile(path, "utf8")).toBe(original);
 	});
 
 	test("removes only Opaline's notify command", async () => {

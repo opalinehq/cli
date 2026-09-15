@@ -53,7 +53,10 @@ export function promptUploadManager(
 		const render = () => {
 			if (finished) return;
 			const enableMouse =
-				state.stage === "review" && !state.operation && !state.scan;
+				state.stage === "review" &&
+				!state.operation &&
+				!state.scan &&
+				!state.error;
 			if (enableMouse !== mouseEnabled) {
 				output.write(
 					enableMouse
@@ -213,8 +216,10 @@ export function promptUploadManager(
 				.then(() => operation(controller.signal))
 				.catch((error: unknown) => {
 					if (!controller.signal.aborted)
-						state.message =
-							error instanceof Error ? error.message : String(error);
+						state.error = {
+							message: error instanceof Error ? error.message : String(error),
+							page: 0,
+						};
 				})
 				.finally(() => {
 					clearInterval(operationTimer);

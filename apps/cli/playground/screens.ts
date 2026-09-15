@@ -13,6 +13,17 @@ interface Screen {
 
 export const SCREENS: Screen[] = [
 	{
+		id: "error",
+		label: "Upload error",
+		group: "Auto upload",
+		command: "opaline upload",
+		description:
+			"The full error explains the cause and next step. Long details have pages. Retry with Enter or return to your selection with Escape.",
+		manager: true,
+		loading: false,
+		copy: [],
+	},
+	{
 		id: "scan",
 		label: "Repository discovery",
 		group: "Auto upload",
