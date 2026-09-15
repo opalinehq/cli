@@ -188,41 +188,25 @@ test("discovery fills the same table and preserves choices through completion", 
 	expect(stripVTControlCharacters(complete.ansi)).not.toContain("after scan");
 });
 
-test("bulk choices survive preview updates without replacing a pending footer with saved copy", () => {
-	const started = createPreview({
-		...fixture,
-		screen: "scan",
-		progress: 0,
-		state: { ...fixture.state, bulkDesired: true },
-	});
-	expect(started.allState).toBe("on");
+test("All repos choices survive preview updates and keep the pending footer", () => {
+	const initial = createPreview(fixture);
+	const desired = Object.fromEntries(initial.allKeys.map((key) => [key, true]));
 	const complete = createPreview({
 		...fixture,
-		screen: "scan",
-		progress: 100,
-		state: { ...started.state, desired: { "github.com/team/opaline": false } },
+		state: { ...fixture.state, desired },
 	});
-	expect(complete.allKeys).toHaveLength(15);
-	expect(complete.allState).toBe("mixed");
-	expect(complete.pendingCount).toBe(11);
-	expect(complete.state.bulkDesired).toBe(true);
-	const editedSaved = createPreview({
+	expect(complete.allState).toBe("on");
+	expect(complete.pendingCount).toBe(10);
+	expect(complete.state.desired).toEqual(desired);
+	const edited = createPreview({
 		...fixture,
 		screen: "saved",
-		state: { ...fixture.state, bulkDesired: true },
+		state: { ...fixture.state, desired },
 	});
-	expect(stripVTControlCharacters(editedSaved.ansi)).toContain(
-		"10 changes pending",
-	);
-	expect(stripVTControlCharacters(editedSaved.ansi)).not.toContain(
+	expect(stripVTControlCharacters(edited.ansi)).toContain("10 changes pending");
+	expect(stripVTControlCharacters(edited.ansi)).not.toContain(
 		"Saved 2 changes",
 	);
-	expect(() =>
-		createPreview({
-			...fixture,
-			state: { ...fixture.state, bulkDesired: "yes" },
-		}),
-	).toThrow();
 });
 
 test("review keeps saved ON repos and new choices visible without saving or uploading", () => {

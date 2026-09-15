@@ -20,6 +20,7 @@ import {
 	addHook,
 	getClaudeProjectSettingsPath,
 	isHookEnabled,
+	readClaudeSettings,
 	removeHook,
 } from "./settings.js";
 
@@ -302,6 +303,10 @@ class ClaudeCodeAdapter implements AgentAdapter {
 		return options.projectPath
 			? getClaudeProjectSettingsPath(options.projectPath)
 			: this.hookConfigPath;
+	}
+
+	validateHook(options: HookOptions = {}): void {
+		readClaudeSettings(this.getHookConfigPath(options));
 	}
 
 	installHook(options: HookOptions = {}): void {

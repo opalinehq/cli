@@ -80,9 +80,10 @@ Opaline, removes duplicate local hooks, and preserves unrelated agent settings.
 | `opaline --help` | Show command help. |
 | `opaline --version` | Print the installed CLI version. |
 
-Advanced commands remain available for existing scripts: `opaline import`,
+Advanced commands remain available for existing scripts: `opaline import <session>`,
 `opaline upload <session>`, `opaline upload --retry`, `opaline doctor`, and
-`opaline set-org`. Bare `enable` and `disable` open the upload table.
+`opaline set-org`. `enable` and `disable` are aliases for the upload table. Repository selection
+uses that table; file/retry flags require a session argument or `--retry`.
 
 ## Configuration
 

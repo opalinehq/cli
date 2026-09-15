@@ -1,19 +1,16 @@
-import { existsSync } from "node:fs";
-import { mkdir, open, rm } from "node:fs/promises";
-import { join } from "node:path";
 import type { AgentAdapter } from "../internal/agent-adapters/index.js";
 import {
 	captureAutoUploadSetupResult,
 	summarizeAutoUploadRepositories,
 } from "./auto-upload-analytics.js";
+import {
+	type AutoUploadConfig,
+	updateAutoUploadConfig,
+} from "./auto-upload-config.js";
+import { migrateAutoUploadHooks } from "./auto-upload-hooks.js";
 import { loadCredentials } from "./credentials.js";
 import { getConfigDir } from "./local-state.js";
 import { setProjectOrgId } from "./project-config.js";
-import {
-	type AutoUploadConfig,
-	loadAutoUploadConfig,
-	saveAutoUploadConfig,
-} from "./upload-manager-config.js";
 import type { UploadRepository } from "./upload-manager-repositories.js";
 
 export interface RepositoryChange {
@@ -29,13 +26,7 @@ export async function saveRepositoryChanges(
 	options: { configDir?: string; defaultOrganizationId?: string } = {},
 ): Promise<void> {
 	const configDir = options.configDir ?? getConfigDir();
-	await mkdir(configDir, { recursive: true, mode: 0o700 });
-	const lockPath = join(configDir, "auto-upload.lock");
-	const lock = await open(lockPath, "wx", 0o600).catch(() => {
-		throw new Error("Another upload manager is saving. Try again in a moment.");
-	});
-	try {
-		const existing = loadAutoUploadConfig(configDir);
+	await updateAutoUploadConfig(async (existing, save) => {
 		const config: AutoUploadConfig = existing ?? {
 			version: 1,
 			repositories: Object.fromEntries(
@@ -76,7 +67,7 @@ export async function saveRepositoryChanges(
 				};
 			}
 		}
-		await saveAutoUploadConfig(config, configDir);
+		await save(config);
 		for (const change of changes.filter((change) => !change.enabled))
 			change.repository.enabled = false;
 
@@ -97,48 +88,19 @@ export async function saveRepositoryChanges(
 					),
 			);
 			const userId = loadCredentials()?.user?.id;
-			for (const adapter of adapters) {
-				try {
-					const alreadyInstalled = adapter.isHookInstalled({ global: true });
-					adapter.installHook({ global: true });
+			migrateAutoUploadHooks(
+				repositories,
+				adapters,
+				changes.some((change) => change.enabled),
+				(result) => {
 					captureAutoUploadSetupResult({
-						result: {
-							source: adapter.source,
-							status: "enabled",
-							alreadyInstalled,
-						},
+						result,
 						summaries,
 						userId,
 						command: "upload",
 					});
-				} catch (error) {
-					captureAutoUploadSetupResult({
-						result: { source: adapter.source, status: "failed", error },
-						summaries,
-						userId,
-						command: "upload",
-					});
-					throw error;
-				}
-			}
-			// Global Claude hooks cover future worktrees too. Remove our old local
-			// hooks to avoid running twice, preserving every unrelated hook/setting.
-			const claude = adapters.find(
-				(adapter) => adapter.source === "claude_code",
+				},
 			);
-			if (claude) {
-				const globalPath = claude.getHookConfigPath({ global: true });
-				for (const repository of repositories) {
-					for (const projectPath of repository.paths.filter(existsSync)) {
-						if (
-							claude.getHookConfigPath({ projectPath }) !== globalPath &&
-							claude.isHookInstalled({ projectPath })
-						) {
-							claude.removeHook({ projectPath });
-						}
-					}
-				}
-			}
 		}
 
 		for (const change of changes) {
@@ -156,7 +118,7 @@ export async function saveRepositoryChanges(
 		}
 		if (options.defaultOrganizationId)
 			config.defaultOrganizationId = options.defaultOrganizationId;
-		await saveAutoUploadConfig(config, configDir);
+		await save(config);
 		for (const change of changes) {
 			change.repository.enabled = change.enabled;
 			change.repository.problem = undefined;
@@ -164,8 +126,5 @@ export async function saveRepositoryChanges(
 			change.repository.organizationId =
 				change.organizationId ?? change.repository.organizationId;
 		}
-	} finally {
-		await lock.close();
-		await rm(lockPath, { force: true });
-	}
+	}, configDir);
 }

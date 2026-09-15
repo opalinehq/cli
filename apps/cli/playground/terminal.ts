@@ -60,7 +60,7 @@ export function renderAnsiLines(
 				span.href = href;
 				span.target = "_blank";
 				span.rel = "noopener noreferrer";
-				span.setAttribute("aria-label", `View sessions in dashboard: ${text}`);
+				span.setAttribute("aria-label", text);
 			} else span.setAttribute("aria-hidden", "true");
 			// Glyph fallback fonts must not change terminal cell widths. In particular,
 			// circles and brackets get the same centered cell in either switch state.

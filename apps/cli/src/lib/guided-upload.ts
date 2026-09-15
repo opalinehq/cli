@@ -7,7 +7,7 @@ import {
 	getUploadAdapters,
 	type UploadRepository,
 } from "./upload-manager-repositories.js";
-import type { UploadManagerState } from "./upload-manager-ui.js";
+import type { UploadManagerState } from "./upload-manager-state.js";
 
 export type GuidedUpload = ReturnType<typeof createGuidedUpload>;
 

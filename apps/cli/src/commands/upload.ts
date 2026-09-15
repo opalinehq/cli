@@ -6,6 +6,7 @@ import { describeSavedCredentialsApiBaseRisk } from "../lib/api-base.js";
 import { createApiClient } from "../lib/api-client.js";
 import { getApiBaseOverride, getDefaultApiBase } from "../lib/api-target.js";
 import { verifyAuth } from "../lib/auth.js";
+import { loadAutoUploadConfig } from "../lib/auto-upload-config.js";
 import { cliMessage } from "../lib/cli-messages.js";
 import { loadCredentials } from "../lib/credentials.js";
 import type { GuidedUpload } from "../lib/guided-upload.js";
@@ -20,7 +21,6 @@ import {
 } from "../lib/repository-upload.js";
 import { getUploadCompletion } from "../lib/upload-completion.js";
 import { allowsInsecureEndpointFromEnv } from "../lib/upload-endpoint.js";
-import { loadAutoUploadConfig } from "../lib/upload-manager-config.js";
 import {
 	discoverUploadRepositories,
 	getUploadAdapters,
@@ -30,10 +30,12 @@ import {
 	getDesiredUploadState,
 	getPendingRepositories,
 	getRepositoriesToUpload,
-	promptUploadManager,
 	type UploadManagerState,
+} from "../lib/upload-manager-state.js";
+import {
+	promptUploadManager,
 	type UploadRepositoryScan,
-} from "../lib/upload-manager-ui.js";
+} from "../lib/upload-manager-terminal.js";
 import type { UploadConfig } from "../lib/uploader.js";
 import { runLogin } from "./login.js";
 
@@ -164,7 +166,6 @@ export async function runUpload(
 								defaultOrganizationId: destination.defaultOrganizationId,
 							});
 						state.desired.clear();
-						state.bulkDesired = undefined;
 						state.message = "";
 						signal.throwIfAborted();
 						if (targets.length && config) {

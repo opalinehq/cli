@@ -18,7 +18,12 @@ import {
 	toDisplayPath,
 	walkJsonlFiles,
 } from "../../utils.js";
-import { installHook, isHookInstalled, removeHook } from "./config.js";
+import {
+	installHook,
+	isHookInstalled,
+	removeHook,
+	validateHook,
+} from "./config.js";
 
 const SESSIONS_BASE_DIR = join(homedir(), ".codex", "sessions");
 
@@ -195,6 +200,10 @@ class CodexAdapter implements AgentAdapter {
 
 	getHookConfigPath(): string {
 		return this.hookConfigPath;
+	}
+
+	validateHook(): void {
+		validateHook(this.hookConfigPath);
 	}
 
 	installHook(): void {

@@ -1,7 +1,6 @@
 import { expect, test } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
 import type { UploadRepository } from "../lib/upload-manager-repositories.js";
-import { UPLOAD_MANAGER_THEME } from "../lib/upload-manager-theme.js";
 import {
 	editUploadSelection,
 	filterRepositories,
@@ -10,11 +9,12 @@ import {
 	getPendingRepositories,
 	getRepositoriesToUpload,
 	getTableRepositories,
-	renderUploadManager,
 	reviewUploadSelection,
 	toggleUploadRepository,
 	type UploadManagerState,
-} from "../lib/upload-manager-ui.js";
+} from "../lib/upload-manager-state.js";
+import { UPLOAD_MANAGER_THEME } from "../lib/upload-manager-theme.js";
+import { renderUploadManager } from "../lib/upload-manager-ui.js";
 
 const TEST_THEME = {
 	...UPLOAD_MANAGER_THEME,
@@ -312,11 +312,10 @@ test("All repos stays locked until scan completion, then stages hidden rows with
 	const partial = repositories.slice(0, 3);
 	expect(getAllUploadState(partial, state)).toBe("mixed");
 	toggleUploadRepository(partial, state);
-	expect(state.bulkDesired).toBeUndefined();
 	expect(state.desired.size).toBe(0);
 	state.scan = undefined;
-	toggleUploadRepository(partial, state);
-	expect(state.bulkDesired).toBe(true);
+	toggleUploadRepository(repositories, state);
+	expect(state.desired.size).toBe(repositories.length);
 	expect(getAllUploadState(repositories, state)).toBe("on");
 	expect(getPendingRepositories(repositories, state)).toHaveLength(40);
 	state.cursor = 1;
@@ -336,7 +335,7 @@ test("All repos stays locked until scan completion, then stages hidden rows with
 	const ansi = renderUploadManager(repositories, state, 80, 24, TEST_THEME);
 	expect(ansi).toContain("\u001b[1;7m 40 UNSAVED ");
 	expect(ansi).not.toContain("\u001b[33m");
-	state.bulkDesired = undefined;
+	state.desired.clear();
 	expect(getPendingRepositories(repositories, state)).toHaveLength(0);
 });
 
@@ -454,8 +453,7 @@ test("review of an all-OFF selection retains deactivations without queuing uploa
 	const state: UploadManagerState = {
 		query: "",
 		cursor: 0,
-		desired: new Map(),
-		bulkDesired: false,
+		desired: new Map(rows.map((repo) => [repo.key, false])),
 		message: "",
 	};
 	reviewUploadSelection(state);

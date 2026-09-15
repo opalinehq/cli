@@ -1,4 +1,11 @@
 import {
+	activateUploadReview,
+	applyUploadKey,
+	toggleUploadRepository,
+	type UploadKey,
+	type UploadManagerState,
+} from "../src/lib/upload-manager-state.js";
+import {
 	parseUploadManagerTheme,
 	UPLOAD_MANAGER_THEME,
 	type UploadManagerTheme,
@@ -247,77 +254,25 @@ function bindControls() {
 				else if (event.key === "Escape") changeScreen("repositories");
 				return;
 			}
-			if (
-				preview?.uploading &&
-				!["ArrowDown", "ArrowUp", "Escape"].includes(event.key) &&
-				!(event.ctrlKey && event.key === "c")
-			)
-				return;
-			if (state.stage === "review" && !(event.ctrlKey && event.key === "c")) {
-				if (event.key === "Escape") editSelection();
-				else if (event.key === "Enter")
-					activateReview(state.reviewAction ?? "confirm");
-				else if (["ArrowUp", "PageUp"].includes(event.key))
-					activateReview("previous");
-				else if (["ArrowDown", "PageDown"].includes(event.key))
-					activateReview("next");
-				else if (event.key === "ArrowLeft") state.reviewAction = "confirm";
-				else if (event.key === "ArrowRight") state.reviewAction = "back";
-				else if (event.key === "Tab")
-					state.reviewAction =
-						state.reviewAction === "back" ? "confirm" : "back";
-				return;
-			}
-			if (state.stage && !preview?.uploading) {
-				if (event.key.toLowerCase() === "a" || event.key === "Escape") {
-					editSelection();
-					return;
-				}
-				if (
-					!["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key) &&
-					!(event.ctrlKey && event.key === "c")
-				)
-					return;
-			}
-			if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-				state.followScan = false;
-				if (state.selectionVisible === false) state.selectionVisible = true;
-				else
-					state.cursor = Math.max(
-						state.stage && preview?.repositories.length ? 1 : 0,
-						Math.min(
-							preview?.repositories.length ?? 0,
-							state.cursor + (event.key === "ArrowDown" ? 1 : -1),
-						),
-					);
-			} else if (event.key === " ") toggleFocused();
-			else if (event.key === "Enter") saveDemo();
-			else if (event.key === "Escape" || (event.ctrlKey && event.key === "c")) {
-				stopPlayback();
-				state.desired = {};
-				state.bulkDesired = undefined;
-				if (preview?.uploading) {
-					changeScreen("repositories", false);
-					state.message =
-						"Upload stopped. Press Enter to upload remaining sessions.";
-				}
-				closed = true;
-			} else if (event.ctrlKey && event.key === "u") {
-				state.selectionVisible = true;
-				state.followScan = false;
-				state.query = "";
-				state.cursor = 0;
-			} else if (event.key === "Backspace") {
-				state.selectionVisible = true;
-				state.followScan = false;
-				state.query = [...state.query].slice(0, -1).join("");
-				state.cursor = 0;
-			} else if (event.key.length === 1 && state.query.length < 100) {
-				state.selectionVisible = true;
-				state.followScan = false;
-				state.query += event.key;
-				state.cursor = 0;
-			}
+			const keys: Record<string, string> = {
+				Enter: "return",
+				Escape: "escape",
+				ArrowUp: "up",
+				ArrowDown: "down",
+				ArrowLeft: "left",
+				ArrowRight: "right",
+				PageUp: "pageup",
+				PageDown: "pagedown",
+				Tab: "tab",
+				Backspace: "backspace",
+				" ": "space",
+			};
+			handleManagerKey({
+				name: keys[event.key] ?? event.key,
+				text: event.key.length === 1 ? event.key : undefined,
+				ctrl: event.ctrlKey,
+				meta: event.metaKey,
+			});
 		});
 	});
 }
@@ -597,64 +552,73 @@ function interact(action: () => void) {
 		.catch(showError);
 }
 
-function toggleFocused() {
-	if (!preview || isScanning() || preview.uploading || state.stage === "review")
-		return;
-	state.selectionVisible = true;
-	showSavedConfirmation = false;
-	state.uploadSucceeded = false;
-	if (state.cursor === 0) {
-		if (state.stage) return;
-		state.bulkDesired = preview.allState !== "on";
+function updateManager(
+	action: (
+		manager: UploadManagerState,
+	) => "save" | "cancel" | "changed" | "ignored",
+) {
+	if (!preview) return;
+	const manager: UploadManagerState = {
+		...state,
+		desired: new Map(Object.entries(state.desired)),
+		scan: isScanning() ? { frame } : undefined,
+		operation: preview.uploading ? { label: "Uploading", frame } : undefined,
+	};
+	const result = action(manager);
+	if (result === "ignored") return;
+	const { desired, scan: _scan, operation: _operation, ...selection } = manager;
+	state = { ...state, ...selection, desired: Object.fromEntries(desired) };
+	if (result === "cancel") {
+		stopPlayback();
 		state.desired = {};
-	} else {
-		const repo = preview.repositories[state.cursor - 1];
-		if (!repo) return;
-		state.focusKey = repo.key;
-		state.desired[repo.key] = !(
-			state.desired[repo.key] ??
-			state.bulkDesired ??
-			repo.enabled
-		);
+		closed = true;
+	} else if (result === "save") startDemoUpload();
+	else {
+		if (manager.stage === "review" && currentScreen !== "review")
+			changeScreen("review", false);
+		else if (
+			!manager.stage &&
+			currentScreen !== "repositories" &&
+			currentScreen !== "repair" &&
+			!isScanning()
+		)
+			changeScreen("repositories", false);
+		showSavedConfirmation = false;
+		state.uploadSucceeded = false;
 	}
-	state.message = "";
+}
+
+function handleManagerKey(key: UploadKey) {
+	updateManager((manager) =>
+		applyUploadKey(preview?.selectionRepositories ?? [], manager, key),
+	);
+}
+
+function toggleFocused() {
+	updateManager((manager) => {
+		if (manager.scan || manager.operation || manager.stage === "review")
+			return "ignored";
+		toggleUploadRepository(preview?.selectionRepositories ?? [], manager);
+		return "changed";
+	});
 }
 
 function activateReview(action: "confirm" | "back" | "previous" | "next") {
-	if (state.stage !== "review") return;
-	if (action === "confirm") saveDemo();
-	else if (action === "back") editSelection();
-	else
-		state.reviewPage = Math.max(
-			0,
-			Math.min(
-				(state.reviewPageCount ?? 1) - 1,
-				(state.reviewPage ?? 0) + (action === "next" ? 1 : -1),
-			),
-		);
+	updateManager((manager) => activateUploadReview(manager, action));
 }
 
 function saveDemo() {
-	if (preview?.uploading || isScanning()) return;
-	if (currentScreen !== "review") {
-		state.uploadSucceeded = false;
-		if (currentScreen === "repair")
-			state.desired["github.com/team/opaline"] = true;
-		changeScreen("review", false);
-		state.query = "";
-		state.cursor = 0;
-		state.selectionVisible = false;
-		state.viewportStart = 0;
-		state.message = "";
-		return;
-	}
+	handleManagerKey({ name: "return" });
+}
+
+function editSelection() {
+	handleManagerKey({ name: "escape" });
+}
+
+function startDemoUpload() {
 	const count = preview?.pendingCount ?? 0;
-	if (state.bulkDesired !== undefined)
-		for (const key of preview?.allKeys ?? [])
-			state.enabled[key] = state.bulkDesired;
 	state.enabled = { ...state.enabled, ...state.desired };
 	state.desired = {};
-	state.bulkDesired = undefined;
 	savedChangeCount = count;
 	savedUploadCount = preview?.uploadTotal ?? 0;
 	state.uploadKeys = preview?.uploadKeys;
@@ -664,18 +628,6 @@ function saveDemo() {
 		select("dataset").value = "standard";
 	changeScreen("saving", false);
 	startPlayback("save");
-}
-
-function editSelection() {
-	if (isScanning() || preview?.uploading) return;
-	changeScreen("repositories", false);
-	state.query = "";
-	state.cursor = 0;
-	state.selectionVisible = false;
-	state.viewportStart = 0;
-	state.followScan = false;
-	state.message = "";
-	state.uploadSucceeded = false;
 }
 
 function isScanning(): boolean {

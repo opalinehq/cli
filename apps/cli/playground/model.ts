@@ -3,19 +3,19 @@ import { cliMessage } from "../src/lib/cli-messages.js";
 import { getUploadCompletion } from "../src/lib/upload-completion.js";
 import type { UploadRepository } from "../src/lib/upload-manager-repositories.js";
 import {
-	parseUploadManagerTheme,
-	type UploadManagerTheme,
-} from "../src/lib/upload-manager-theme.js";
-import {
 	filterRepositories,
 	getAllUploadState,
 	getPendingRepositories,
 	getRepositoriesToUpload,
 	getTableRepositories,
 	type ReviewControl,
-	renderUploadManager,
 	type UploadManagerState,
-} from "../src/lib/upload-manager-ui.js";
+} from "../src/lib/upload-manager-state.js";
+import {
+	parseUploadManagerTheme,
+	type UploadManagerTheme,
+} from "../src/lib/upload-manager-theme.js";
+import { renderUploadManager } from "../src/lib/upload-manager-ui.js";
 import { renderFlowPreview } from "./flow-preview.js";
 import { isUploadCompleteScreen, screenById } from "./screens.js";
 
@@ -23,8 +23,6 @@ export interface DemoState {
 	query: string;
 	cursor: number;
 	selectionVisible?: boolean;
-	// Consumed by one preview update to preserve focus when a row changes group.
-	focusKey?: string;
 	stage?: "review" | "upload";
 	reviewPage?: number;
 	reviewPageCount?: number;
@@ -34,7 +32,6 @@ export interface DemoState {
 	message: string;
 	viewportStart?: number;
 	followScan?: boolean;
-	bulkDesired?: boolean;
 	uploaded?: Record<string, number>;
 	uploadStart?: Record<string, number>;
 	uploadKeys?: string[];
@@ -66,6 +63,7 @@ export interface PreviewResponse {
 	ansi: string;
 	state: DemoState;
 	repositories: { key: string; name: string; enabled: boolean }[];
+	selectionRepositories: UploadRepository[];
 	visibleRows: { line: number; index: number; key: string; name: string }[];
 	reviewControls: ReviewControl[];
 }
@@ -150,7 +148,6 @@ export function createPreview(value: unknown): PreviewResponse {
 		message: shortText(value.state.message),
 		viewportStart: boundedInteger(value.state.viewportStart ?? 0, 0, 100),
 		followScan: optionalBoolean(value.state.followScan),
-		bulkDesired: optionalBoolean(value.state.bulkDesired),
 		...(screen.id === "scan" && progress < 100 ? { scan: { frame } } : {}),
 	};
 	const repositories =
@@ -218,14 +215,6 @@ export function createPreview(value: unknown): PreviewResponse {
 		getPendingRepositories(repositories, state).length === 0
 	)
 		state.message = cliMessage("saveSummary", { changes: "2 changes" }, theme);
-	const focusKey = shortText(value.state.focusKey ?? "");
-	if (focusKey && state.stage !== "review") {
-		const nextIndex = filterRepositories(
-			getTableRepositories(repositories, state),
-			state.query,
-		).findIndex((repo) => repo.key === focusKey);
-		if (nextIndex >= 0) state.cursor = nextIndex + 1;
-	}
 	const flow = screen.manager
 		? undefined
 		: renderFlowPreview(screen.id, theme, columns, frame, choice);
@@ -261,6 +250,7 @@ export function createPreview(value: unknown): PreviewResponse {
 		index++;
 	}
 	return {
+		selectionRepositories: repositories,
 		screen: screen.id,
 		scanning: state.scan !== undefined,
 		uploading: state.operation !== undefined,
@@ -289,7 +279,6 @@ export function createPreview(value: unknown): PreviewResponse {
 			message: state.message,
 			viewportStart: state.viewportStart,
 			followScan: state.followScan,
-			bulkDesired: state.bulkDesired,
 			uploaded,
 			uploadStart,
 			uploadKeys: selectedKeys,

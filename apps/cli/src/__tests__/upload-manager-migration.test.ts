@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +10,7 @@ import {
 	createCodexAdapter,
 } from "../internal/agent-adapters/index.js";
 import { isRepositoryAutoUploadAllowed } from "../lib/auto-upload-config.js";
+import { updateHookSettings } from "../lib/auto-upload-hooks.js";
 import { getGitInfo } from "../lib/git-info.js";
 import {
 	getLegacyRepositoryKey,
@@ -187,6 +189,121 @@ test("fills the table as sessions arrive and merges deleted Conductor worktrees 
 	expect(rows).toHaveLength(1);
 	expect(rows[0]?.sessionCount).toBe(2);
 	expect(rows[0]?.paths).toContain(missing);
+});
+
+test("a conflicting Codex notifier leaves existing Rudel hooks intact and retry migrates once", async () => {
+	const fixture = await createFixture();
+	const claude = createClaudeCodeAdapter({ homeDir: fixture.root });
+	const codex = createCodexAdapter({ homeDir: fixture.root });
+	const localPath = claude.getHookConfigPath({ projectPath: fixture.repo });
+	await mkdir(join(localPath, ".."), { recursive: true });
+	const original = JSON.stringify({
+		permissions: { allow: ["Read"] },
+		hooks: {
+			SessionEnd: [
+				{
+					hooks: [
+						{ type: "command", command: "rudel hooks claude session-end" },
+					],
+				},
+			],
+		},
+	});
+	await writeFile(localPath, original);
+	await mkdir(join(fixture.root, ".codex"));
+	const notifier = 'model = "keep-me"\nnotify = ["existing-notifier"]\n';
+	await writeFile(codex.getHookConfigPath(), notifier);
+	const adapters = [claude, codex];
+	const rows = await discoverUploadRepositories(() => {}, {
+		cwd: fixture.repo,
+		configDir: fixture.config,
+		adapters,
+	});
+	const row = rows.find((row) => row.current);
+	assert(row);
+	await expect(
+		saveRepositoryChanges(
+			rows,
+			[{ repository: row, enabled: true }],
+			adapters,
+			{ configDir: fixture.config },
+		),
+	).rejects.toThrow("Codex notify is already configured");
+	expect(claude.isHookInstalled({ global: true })).toBe(false);
+	expect(await readFile(localPath, "utf8")).toBe(original);
+	expect(await readFile(codex.getHookConfigPath(), "utf8")).toBe(notifier);
+	// Once the user removes their conflicting notifier, the same selection is retryable.
+	await writeFile(codex.getHookConfigPath(), 'model = "keep-me"\n');
+	for (let attempt = 0; attempt < 2; attempt++)
+		await saveRepositoryChanges(
+			rows,
+			[{ repository: row, enabled: true }],
+			adapters,
+			{ configDir: fixture.config },
+		);
+	expect(claude.isHookInstalled({ global: true })).toBe(true);
+	expect(claude.isHookInstalled({ projectPath: fixture.repo })).toBe(false);
+	expect(
+		(await readFile(claude.getHookConfigPath({ global: true }), "utf8")).match(
+			/opaline hooks claude session-end/gu,
+		),
+	).toHaveLength(1);
+	expect(await readFile(localPath, "utf8")).toContain('"Read"');
+	expect(
+		parseToml(await readFile(codex.getHookConfigPath(), "utf8")).model,
+	).toBe("keep-me");
+});
+
+test("turning a repository OFF succeeds without replacing an unrelated Codex notifier", async () => {
+	const fixture = await createFixture();
+	const claude = createClaudeCodeAdapter({ homeDir: fixture.root });
+	const codex = createCodexAdapter({ homeDir: fixture.root });
+	claude.installHook({ global: true });
+	await mkdir(join(fixture.root, ".codex"));
+	const notifier = 'notify = ["existing-notifier"]\n';
+	await writeFile(codex.getHookConfigPath(), notifier);
+	const adapters = [claude, codex];
+	const rows = await discoverUploadRepositories(() => {}, {
+		cwd: fixture.repo,
+		configDir: fixture.config,
+		adapters,
+	});
+	const row = rows.find((row) => row.current);
+	assert(row);
+	await saveRepositoryChanges(
+		rows,
+		[{ repository: row, enabled: false }],
+		adapters,
+		{ configDir: fixture.config },
+	);
+	expect(row.enabled).toBe(false);
+	expect(isRepositoryAutoUploadAllowed(row.key, "claude_code")).toBe(false);
+	expect(await readFile(codex.getHookConfigPath(), "utf8")).toBe(notifier);
+});
+
+test("a later filesystem failure restores removed local hooks and removes a new global hook", async () => {
+	const fixture = await createFixture();
+	const claude = createClaudeCodeAdapter({ homeDir: fixture.root });
+	const local = claude.getHookConfigPath({ projectPath: fixture.repo });
+	const global = claude.getHookConfigPath({ global: true });
+	await mkdir(join(local, ".."), { recursive: true });
+	const original =
+		'{"permissions":{"allow":["Read"]},"hooks":{"SessionEnd":[{"hooks":[{"command":"rudel hooks claude session-end"}]}]}}';
+	await writeFile(local, original);
+	expect(() =>
+		updateHookSettings([local, global], () => {
+			claude.installHook({ global: true });
+			claude.removeHook({ projectPath: fixture.repo });
+			// A real failed write after the first agent migration; no adapter or FS mocks.
+			writeFileSync(
+				join(fixture.root, "missing-directory", "config.toml"),
+				"notify = []",
+			);
+		}),
+	).toThrow("ENOENT");
+	expect(await readFile(local, "utf8")).toBe(original);
+	expect(claude.isHookInstalled({ global: true })).toBe(false);
+	expect(claude.isHookInstalled({ projectPath: fixture.repo })).toBe(true);
 });
 
 async function createFixture() {

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { getConnectionSelection } from "../lib/cli-connection-selection.js";
 import { getCommandArgs } from "../lib/command-args.js";
 import type { UploadRepository } from "../lib/upload-manager-repositories.js";
-import type { UploadManagerState } from "../lib/upload-manager-ui.js";
+import type { UploadManagerState } from "../lib/upload-manager-state.js";
 
 describe("browser-coded command routing", () => {
 	test("routes both code spellings and leading options into pairing", () => {

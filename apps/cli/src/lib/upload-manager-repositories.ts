@@ -8,15 +8,15 @@ import {
 	type SessionFile,
 } from "../internal/agent-adapters/index.js";
 import {
+	loadAutoUploadConfig,
+	type RepositoryUploadSetting,
+} from "./auto-upload-config.js";
+import { getGitInfo } from "./git-info.js";
+import {
 	discoverProjectRepositories,
 	getLegacyRepositoryKey,
 	resolveUploadRepositoryIdentity,
 } from "./repository-discovery.js";
-import {
-	getRepositoryKey,
-	loadAutoUploadConfig,
-	type RepositoryUploadSetting,
-} from "./upload-manager-config.js";
 
 export interface UploadRepository extends RepositoryUploadSetting {
 	key: string;
@@ -275,4 +275,11 @@ function hasHook(adapter: AgentAdapter, options: HookOptions): boolean {
 	} catch {
 		return false;
 	} // A broken agent config must not prevent turning uploads Off.
+}
+
+async function getRepositoryKey(projectPath: string): Promise<string> {
+	return resolveUploadRepositoryIdentity(
+		projectPath,
+		await getGitInfo(projectPath),
+	).repoKey;
 }

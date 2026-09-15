@@ -45,8 +45,8 @@ Setup results include the selected repository count, total local session count,
 and an anonymous list of session counts per repository, grouped by agent and
 destination workspace. Duplicate discoveries within a repository count once.
 These describe the selected local sessions, including previously uploaded ones,
-and do not measure successful uploads. `enable` measures the current repository;
-the `upload` picker measures the selected repositories. Counts are snapshots,
+and do not measure successful uploads. The upload table measures the selected repositories, including when opened
+through the legacy `enable` or `disable` names. Counts are snapshots,
 not values to sum across repeated setup events or agents sharing a repository.
 An anonymous local identifier links activity to your Opaline account after login.
 Command arguments, connection codes, repository names, local paths, and session

@@ -70,6 +70,7 @@ export interface AgentAdapter {
 
 	// Hook Management (CLI)
 	getHookConfigPath(options?: HookOptions): string;
+	validateHook(options?: HookOptions): void;
 	installHook(options?: HookOptions): void;
 	removeHook(options?: HookOptions): void;
 	isHookInstalled(options?: HookOptions): boolean;

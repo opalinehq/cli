@@ -8,7 +8,7 @@ import type { UploadRepository } from "./upload-manager-repositories.js";
 import {
 	getDesiredUploadState,
 	type UploadManagerState,
-} from "./upload-manager-ui.js";
+} from "./upload-manager-state.js";
 
 export function getConnectionSelection(
 	repositories: UploadRepository[],
