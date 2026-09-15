@@ -188,7 +188,7 @@ test("fills the table as sessions arrive and merges deleted Conductor worktrees 
 	expect(rows[0]?.paths).toContain(missing);
 });
 
-test("a conflicting Codex notifier leaves existing Rudel hooks intact and retry migrates once", async () => {
+test("an invalid Codex setting leaves existing Rudel hooks intact and retry migrates once", async () => {
 	const fixture = await createFixture();
 	const claude = createClaudeCodeAdapter({ homeDir: fixture.root });
 	const codex = createCodexAdapter({ homeDir: fixture.root });
@@ -208,7 +208,7 @@ test("a conflicting Codex notifier leaves existing Rudel hooks intact and retry 
 	});
 	await writeFile(localPath, original);
 	await mkdir(join(fixture.root, ".codex"));
-	const notifier = 'model = "keep-me"\nnotify = ["existing-notifier"]\n';
+	const notifier = 'model = "keep-me"\nnotify = "invalid-command"\n';
 	await writeFile(codex.getHookConfigPath(), notifier);
 	const adapters = [claude, codex];
 	const rows = await discoverUploadRepositories(() => {}, {
@@ -225,12 +225,15 @@ test("a conflicting Codex notifier leaves existing Rudel hooks intact and retry 
 			adapters,
 			{ configDir: fixture.config },
 		),
-	).rejects.toThrow("Codex notify is already configured");
+	).rejects.toThrow("Couldn't enable Codex auto upload");
 	expect(claude.isHookInstalled({ global: true })).toBe(false);
 	expect(await readFile(localPath, "utf8")).toBe(original);
 	expect(await readFile(codex.getHookConfigPath(), "utf8")).toBe(notifier);
-	// Once the user removes their conflicting notifier, the same selection is retryable.
-	await writeFile(codex.getHookConfigPath(), 'model = "keep-me"\n');
+	// Correcting the type is enough: an existing notifier can remain installed.
+	await writeFile(
+		codex.getHookConfigPath(),
+		'model = "keep-me"\nnotify = ["existing-notifier"]\n',
+	);
 	for (let attempt = 0; attempt < 2; attempt++)
 		await saveRepositoryChanges(
 			rows,

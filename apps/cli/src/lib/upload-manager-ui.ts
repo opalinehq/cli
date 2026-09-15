@@ -88,6 +88,32 @@ export function renderUploadManager(
 	};
 	const paint = (text: string, style: TextStyle) =>
 		`\u001b[${styles[style]}m${text}\u001b[0m`;
+	if (state.error) {
+		const body = wrapErrorMessage(state.error.message, contentWidth);
+		const pageSize = Math.max(1, height - 8);
+		state.error.pageCount = Math.max(1, Math.ceil(body.length / pageSize));
+		state.error.page = Math.min(state.error.page, state.error.pageCount - 1);
+		const offset = state.error.page * pageSize;
+		return [
+			`${margin}${paint(cliMessage("managerTitle", {}, theme), "brand")}`,
+			"",
+			`${margin}${paint("Upload stopped", "danger")}`,
+			"",
+			...body
+				.slice(offset, offset + pageSize)
+				.map((line) => `${margin}${paint(line, "regular")}`),
+			"",
+			`${margin}${paint(
+				state.error.pageCount > 1
+					? `Details ${state.error.page + 1}/${state.error.pageCount} · ↑↓ pages`
+					: state.singleRun
+						? "Run browser setup again to retry."
+						: "Your repository selection is kept.",
+				"muted",
+			)}`,
+			`${margin}${paint(state.singleRun ? "Close [Enter / Esc]" : "Retry [Enter]   Go back [Esc]", "strong")}`,
+		].join("\n");
+	}
 	const number = new Intl.NumberFormat("en-US");
 	const compactNumber = new Intl.NumberFormat("en-US", {
 		notation: "compact",
@@ -524,6 +550,39 @@ function getReviewGroup(
 		: repository.enabled
 			? "selectionActive"
 			: "selectionNew";
+}
+
+// Errors need their complete cause and recovery instructions. Wrap and paginate
+// them instead of using the table's clipped labels or its 200-character sanitizer.
+function wrapErrorMessage(message: string, width: number): string[] {
+	return message.split(/\r?\n/u).flatMap((paragraph) => {
+		const clean = [...paragraph].map(sanitizeForTerminalDisplay).join("");
+		const segments = [
+			...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(
+				clean,
+			),
+		].map((item) => item.segment);
+		const lines: string[] = [];
+		let start = 0;
+		while (start < segments.length) {
+			let end = start;
+			let used = 0;
+			let space = -1;
+			while (end < segments.length) {
+				const segment = segments[end] ?? "";
+				const size = /^[\x20-\x7e]+$/u.test(segment) ? segment.length : 2;
+				if (used + size > width) break;
+				used += size;
+				if (segment === " ") space = end;
+				end++;
+			}
+			if (end < segments.length && space > start) end = space;
+			lines.push(segments.slice(start, end).join(""));
+			start = end;
+			while (segments[start] === " ") start++;
+		}
+		return lines.length ? lines : [""];
+	});
 }
 
 // Conservatively reserve two columns for non-ASCII graphemes. This keeps long

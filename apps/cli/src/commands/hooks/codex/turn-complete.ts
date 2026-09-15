@@ -1,5 +1,7 @@
+import { spawn } from "node:child_process";
 import { getLogger } from "@logtape/logtape";
 import { buildCommand } from "@stricli/core";
+import { parsePreviousNotify } from "../../../internal/agent-adapters/adapters/codex/config.js";
 import {
 	codexAdapter,
 	findActiveRolloutFile,
@@ -45,13 +47,19 @@ function parseNotification(raw: string): CodexNotifyInput | null {
 }
 
 async function runTurnComplete(
-	_flags: Record<string, never>,
+	flags: { previousNotify?: string[] },
 	notification: string,
 ): Promise<undefined | Error> {
-	await setupHookLogging();
+	// A custom notifier may call the Opaline/Rudel alias itself. Forwarding must
+	// not recursively upload the same turn. This marker exists only in the child.
+	if (process.env.OPALINE_CODEX_NOTIFY_FORWARDED === "1") return;
+	const forwarded = flags.previousNotify
+		? forwardNotification(flags.previousNotify, notification)
+		: Promise.resolve();
 	const logger = getLogger(["opaline", "cli", "hook"]);
 
 	try {
+		await setupHookLogging();
 		if (!notification.trim()) return;
 
 		const input = parseNotification(notification);
@@ -137,14 +145,58 @@ async function runTurnComplete(
 			`Opaline Codex hook failed: ${error instanceof Error ? error.message : String(error)}\n`,
 		);
 	} finally {
+		await forwarded;
 		await disposeLogging();
 	}
+}
+
+function forwardNotification(
+	command: string[],
+	notification: string,
+): Promise<void> {
+	return new Promise((resolve) => {
+		const [executable, ...args] = command;
+		if (!executable) return resolve();
+		// No shell: preserve paths, flags and the exact JSON payload as arguments.
+		// Notifications and uploads run independently, including when uploads are OFF.
+		const child = spawn(executable, [...args, notification], {
+			env: { ...process.env, OPALINE_CODEX_NOTIFY_FORWARDED: "1" },
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+		timer.unref();
+		let failedToStart = false;
+		child.once("error", () => {
+			clearTimeout(timer);
+			failedToStart = true;
+			process.stderr.write(
+				"Opaline could not run your previous Codex notification command. Check notify in ~/.codex/config.toml. Session upload is handled separately.\n",
+			);
+			resolve();
+		});
+		child.once("close", (code) => {
+			clearTimeout(timer);
+			if (!failedToStart && code !== 0)
+				process.stderr.write(
+					"Your previous Codex notification command failed. Session upload is handled separately.\n",
+				);
+			resolve();
+		});
+	});
 }
 
 export const turnCompleteCommand = buildCommand({
 	loader: async () => ({ default: runTurnComplete }),
 	parameters: {
-		flags: {},
+		flags: {
+			previousNotify: {
+				kind: "parsed",
+				parse: parsePreviousNotify,
+				optional: true,
+				brief: "Existing Codex notification command (managed by Opaline)",
+			},
+		},
 		positional: {
 			kind: "tuple",
 			parameters: [

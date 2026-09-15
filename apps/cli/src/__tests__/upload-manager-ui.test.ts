@@ -24,6 +24,49 @@ const TEST_THEME = {
 	showTotals: true,
 };
 
+test("setup errors show the cause, full path and recovery at every terminal size", () => {
+	const path = `/Users/evrendombak/${"long workspace path/".repeat(18)}.codex/config.toml`;
+	const message = `Couldn't enable Codex auto upload.\nThe global notify setting is invalid. This setting applies to all repositories.\nConfig: ${path}\nFix notify in this file, then retry. Existing notifications were left unchanged.`;
+	for (const [columns, height] of [
+		[38, 13],
+		[80, 24],
+		[120, 40],
+	]) {
+		const state: UploadManagerState = {
+			query: "",
+			cursor: 0,
+			desired: new Map(),
+			message: "",
+			error: { message, page: 0 },
+		};
+		const pages: string[] = [];
+		const contents: string[] = [];
+		for (let page = 0; page < (state.error?.pageCount ?? 1); page++) {
+			if (!state.error) throw new Error("Missing error state");
+			state.error.page = page;
+			const screen = stripVTControlCharacters(
+				renderUploadManager([], state, columns ?? 80, height ?? 24, TEST_THEME),
+			);
+			pages.push(screen);
+			contents.push(screen.split("\n").slice(4, -3).join(" "));
+			expect(screen).toContain("Upload stopped");
+			expect(screen).toContain("Retry [Enter]");
+			expect(screen).toContain("Go back [Esc]");
+			expect(screen).not.toContain("…");
+			expect(screen.split("\n").length).toBeLessThan(height ?? 24);
+			for (const line of screen.split("\n"))
+				expect(line.length).toBeLessThan(columns ?? 80);
+		}
+		const text = contents.join(" ").replace(/\s+/gu, " ");
+		expect(text).toContain("Fix notify in this file, then retry.");
+		expect(text).toContain("Existing notifications were left unchanged.");
+		expect(pages.join("").replace(/\s+/gu, "")).toContain(".codex/config.toml");
+		expect(contents.join("").replace(/\s+/gu, "")).toBe(
+			message.replace(/\s+/gu, ""),
+		);
+	}
+});
+
 const repositories: UploadRepository[] = Array.from(
 	{ length: 80 },
 	(_, index) => ({

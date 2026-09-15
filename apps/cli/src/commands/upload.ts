@@ -209,7 +209,19 @@ export async function runUpload(
 									state.completion = guided.completionLink(completion);
 								} else state.completion = completion;
 								state.selectionVisible = false;
-							} else if (guided) throw new Error(state.message);
+							} else {
+								state.error = {
+									message: [
+										state.message,
+										...targets
+											.filter((repo) => repo.uploadError)
+											.map((repo) => `${repo.name}: ${repo.uploadError}`),
+										"Already uploaded sessions are kept. Retry to upload the remaining sessions.",
+									].join("\n\n"),
+									page: 0,
+								};
+								if (guided) throw new Error(state.error.message);
+							}
 						} else
 							state.message = cliMessage("saveSummary", {
 								changes: `${changes.length} change${changes.length === 1 ? "" : "s"}`,
@@ -225,9 +237,10 @@ export async function runUpload(
 				};
 			} catch (error) {
 				if (guided) throw error;
-				state.message = cliMessage("saveError", {
-					error: error instanceof Error ? error.message : String(error),
-				});
+				state.error = {
+					message: error instanceof Error ? error.message : String(error),
+					page: 0,
+				};
 			}
 		}
 		if (operationError) return operationError;

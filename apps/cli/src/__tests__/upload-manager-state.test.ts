@@ -16,6 +16,42 @@ const previewRequest = {
 	state: { query: "", cursor: 0, enabled: {}, desired: {}, message: "" },
 };
 
+test("error pages preserve selection, allow retry/back, and never toggle rows", () => {
+	const state: UploadManagerState = {
+		query: "",
+		cursor: 0,
+		desired: new Map([["ob-db", true]]),
+		message: "",
+		stage: "upload",
+		error: { message: "Cannot write Codex settings", page: 0, pageCount: 3 },
+	};
+	expect(applyUploadKey([], state, { name: "space" })).toBe("ignored");
+	expect(applyUploadKey([], state, { name: "down" })).toBe("changed");
+	expect(state.error?.page).toBe(1);
+	expect(applyUploadKey([], state, { name: "return" })).toBe("save");
+	expect(state.error).toBeUndefined();
+	expect([...state.desired]).toEqual([["ob-db", true]]);
+	state.error = { message: "Still cannot write", page: 0 };
+	expect(applyUploadKey([], state, { name: "escape" })).toBe("changed");
+	expect(state.stage).toBeUndefined();
+	expect([...state.desired]).toEqual([["ob-db", true]]);
+});
+
+test("a failed browser pairing can page through the error but cannot retry a closed connection", () => {
+	const state: UploadManagerState = {
+		query: "",
+		cursor: 0,
+		desired: new Map(),
+		message: "",
+		stage: "upload",
+		singleRun: true,
+		error: { message: "Setup failed", page: 0, pageCount: 2 },
+	};
+	expect(applyUploadKey([], state, { name: "down" })).toBe("changed");
+	expect(state.error?.page).toBe(1);
+	expect(applyUploadKey([], state, { name: "return" })).toBe("cancel");
+});
+
 test("scan locks selection; review pages and Go back preserve the same choices in terminal and browser", () => {
 	const preview = createPreview(previewRequest);
 	const repositories = preview.selectionRepositories;

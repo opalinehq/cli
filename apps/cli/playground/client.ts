@@ -403,11 +403,13 @@ async function refreshPreview() {
 	button("save-demo").disabled = next.scanning || next.uploading;
 	button("save-demo").textContent = next.uploading
 		? "Uploading…"
-		: next.scanning
-			? "Review after scan"
-			: currentScreen === "review"
-				? "Confirm upload"
-				: "Review selection";
+		: state.error
+			? "Retry upload"
+			: next.scanning
+				? "Review after scan"
+				: currentScreen === "review"
+					? "Confirm upload"
+					: "Review selection";
 	button("save-demo").hidden =
 		!screenById(currentScreen).manager || state.stage === "review";
 	button("edit-repos").hidden =
@@ -578,6 +580,7 @@ function updateManager(
 			changeScreen("review", false);
 		else if (
 			!manager.stage &&
+			!manager.error &&
 			currentScreen !== "repositories" &&
 			currentScreen !== "repair" &&
 			!isScanning()
@@ -596,7 +599,12 @@ function handleManagerKey(key: UploadKey) {
 
 function toggleFocused() {
 	updateManager((manager) => {
-		if (manager.scan || manager.operation || manager.stage === "review")
+		if (
+			manager.scan ||
+			manager.operation ||
+			manager.error ||
+			manager.stage === "review"
+		)
 			return "ignored";
 		toggleUploadRepository(preview?.selectionRepositories ?? [], manager);
 		return "changed";
@@ -720,6 +728,7 @@ function syncScreen() {
 		screen.description;
 	element("terminal-command", HTMLDivElement).textContent = screen.command;
 	element("terminal-help", HTMLParagraphElement).hidden =
+		screen.id === "error" ||
 		screen.id === "scan" ||
 		screen.id === "saving" ||
 		isUploadCompleteScreen(screen.id);

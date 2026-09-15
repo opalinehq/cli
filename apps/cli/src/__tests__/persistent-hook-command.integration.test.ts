@@ -111,15 +111,107 @@ addHook(); installHook();`,
 		"turn-complete",
 	]);
 	await rm(cache, { recursive: true, force: true });
-	expect((await run([node, durablePath, "--version"], env)).trim()).toMatch(
-		/^\d+\.\d+\.\d+$/u,
-	);
+	expect(
+		(await run([node, durablePath, "--version"], env)).stdout.trim(),
+	).toMatch(/^\d+\.\d+\.\d+$/u);
 	const claude = commands.find((command) => command !== "echo keep-me");
 	assert(claude);
 	// Execute the exact shell command, including spaces and an apostrophe in HOME.
 	await run(["sh", "-c", claude], env, "{}");
 	const notify = z.array(z.string()).parse(config.notify);
 	await run([...notify, '{"type":"unrelated-event"}'], env);
+}, 30_000);
+
+test("the published Codex hook preserves notifications when OFF and isolates notifier failures", async () => {
+	const home = await mkdtemp(join(tmpdir(), "opaline notify's home "));
+	directories.push(home);
+	const cache = join(home, "runner cache");
+	await mkdir(cache);
+	await mkdir(join(home, ".codex"));
+	const foundNode = Bun.which("node");
+	assert(foundNode);
+	const node = await realpath(foundNode);
+	const record = join(home, "notifications.jsonl");
+	const notifier = join(home, "custom notifier.mjs");
+	const notifierSource = `import { appendFileSync } from 'node:fs';
+const [record, ...args] = process.argv.slice(2);
+appendFileSync(record, JSON.stringify(args) + '\\n');`;
+	await writeFile(notifier, notifierSource);
+	const previous = [
+		node,
+		notifier,
+		record,
+		"argument with ' quotes",
+		"$(literal)",
+	];
+	const configPath = join(home, ".codex", "config.toml");
+	await writeFile(
+		configPath,
+		`model = "keep-me"\nnotify = ${JSON.stringify(previous)}\n`,
+	);
+	const installer = join(cache, "installer.ts");
+	await writeFile(
+		installer,
+		`import { installHook } from ${JSON.stringify(resolve(import.meta.dir, "../internal/agent-adapters/adapters/codex/config.ts"))}; installHook();`,
+	);
+	for (const entry of [resolve(import.meta.dir, "../bin/cli.ts"), installer]) {
+		await run(
+			[
+				process.execPath,
+				"build",
+				entry,
+				"--outdir",
+				cache,
+				"--target=node",
+				"--define=OPALINE_BUNDLED_ANALYTICS=null",
+			],
+			process.env,
+		);
+	}
+	await writeFile(join(cache, "package.json"), '{"type":"module"}');
+	const env = {
+		...process.env,
+		HOME: home,
+		USERPROFILE: home,
+		OPALINE_CONFIG_DIR: join(home, ".rudel"),
+		POSTHOG_ENABLED: "false",
+	};
+	await run([node, join(cache, "installer.js")], env);
+	const installed = await readFile(configPath, "utf8");
+	await run([node, join(cache, "installer.js")], env);
+	expect(await readFile(configPath, "utf8")).toBe(installed);
+	const notify = z.array(z.string()).parse(parse(installed).notify);
+	await rm(cache, { recursive: true, force: true });
+	const payload = JSON.stringify({
+		type: "agent-turn-complete",
+		"thread-id": "notification-fixture",
+		cwd: home,
+		"last-assistant-message": "Unicode café 🌈 and ' quotes",
+	});
+	const allowlist = join(home, ".rudel", "auto-upload.json");
+	await writeFile(allowlist, JSON.stringify({ version: 1, repositories: {} }));
+	const off = await run([...notify, payload], env);
+	expect(off.stderr).toBe("");
+	expect(
+		(await readFile(record, "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line)),
+	).toEqual([[...previous.slice(3), payload]]);
+	await rm(allowlist);
+	await writeFile(notifier, `${notifierSource}\nprocess.exitCode = 7;`);
+	const failed = await run([...notify, payload], env);
+	expect(failed.stderr).toContain("previous Codex notification command failed");
+	// The upload handler still runs independently and reports its own auth state.
+	expect(failed.stderr).toContain("not authenticated");
+	expect((await readFile(record, "utf8")).trim().split("\n")).toHaveLength(2);
+	const missing = [...notify];
+	missing[missing.length - 1] = JSON.stringify([join(home, "does not exist")]);
+	const unavailable = await run([...missing, payload], env);
+	expect(unavailable.stderr).toContain(
+		"could not run your previous Codex notification command",
+	);
+	expect(unavailable.stderr).toContain("not authenticated");
 }, 30_000);
 
 async function run(command: string[], env: NodeJS.ProcessEnv, stdin = "") {
@@ -135,5 +227,5 @@ async function run(command: string[], env: NodeJS.ProcessEnv, stdin = "") {
 		child.exited,
 	]);
 	expect(code, stderr).toBe(0);
-	return stdout;
+	return { stdout, stderr };
 }
