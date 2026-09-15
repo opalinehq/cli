@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.7.0...opaline-cli@0.8.0) (2026-09-15)
+
+
+### Features
+
+* manage session uploads in a single repository table ([#481](https://github.com/opalinehq/cli/issues/481)) ([a5b8744](https://github.com/opalinehq/cli/commit/a5b87449535994d36f210f8315cb509794ac0ea3))
+
 ## [0.7.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.6.0...opaline-cli@0.7.0) (2026-09-13)
 
 
