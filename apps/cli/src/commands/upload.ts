@@ -33,6 +33,7 @@ import {
 	type UploadManagerState,
 } from "../lib/upload-manager-state.js";
 import {
+	createUploadScreen,
 	promptUploadManager,
 	type UploadRepositoryScan,
 } from "../lib/upload-manager-terminal.js";
@@ -48,6 +49,7 @@ export async function runUpload(
 			"Open `opaline upload` in an interactive terminal to toggle repositories.",
 		);
 	}
+	const screen = createUploadScreen();
 	try {
 		const adapters = env.adapters ?? getUploadAdapters();
 		const repositories: UploadRepository[] = [];
@@ -92,8 +94,13 @@ export async function runUpload(
 		let skippedBeforeRun: number | undefined;
 		const uploadedWorkspaces = new Set<string | undefined>();
 		while (
-			(await promptUploadManager(repositories, state, scan, operation)) ===
-			"save"
+			(await promptUploadManager(
+				repositories,
+				state,
+				scan,
+				operation,
+				screen,
+			)) === "save"
 		) {
 			scan = undefined;
 			operation = undefined;
@@ -134,8 +141,9 @@ export async function runUpload(
 							repositories,
 							state,
 							destinations,
+							screen.close,
 						)
-					: await resolveDestinations(destinations);
+					: await resolveDestinations(destinations, screen.close);
 				if (destination.cancelled) {
 					state.message = "Save cancelled. Your changes are still pending.";
 					continue;
@@ -252,6 +260,7 @@ export async function runUpload(
 				};
 			}
 		}
+		screen.close();
 		if (operationError) return operationError;
 		if (state.completion) {
 			p.log.success(state.message);
@@ -268,6 +277,8 @@ export async function runUpload(
 		);
 	} catch (error) {
 		return error instanceof Error ? error : new Error(String(error));
+	} finally {
+		screen.close();
 	}
 }
 
@@ -290,8 +301,9 @@ async function resolveGuidedDestination(
 	repositories: UploadRepository[],
 	state: UploadManagerState,
 	changes: RepositoryChange[],
+	showPrompt: () => void,
 ) {
-	const approved = await guided.authorize(repositories, state);
+	const approved = await guided.authorize(repositories, state, showPrompt);
 	for (const change of changes)
 		if (change.enabled) change.organizationId = approved.organizationId;
 	return {
@@ -301,7 +313,10 @@ async function resolveGuidedDestination(
 	};
 }
 
-async function resolveDestinations(changes: RepositoryChange[]): Promise<
+async function resolveDestinations(
+	changes: RepositoryChange[],
+	showPrompt: () => void,
+): Promise<
 	| { cancelled: true }
 	| {
 			cancelled: false;
@@ -312,13 +327,17 @@ async function resolveDestinations(changes: RepositoryChange[]): Promise<
 	const enabling = changes.filter((change) => change.enabled);
 	if (enabling.length === 0) return { cancelled: false, organizations: [] };
 	const risk = describeSavedCredentialsApiBaseRisk();
-	if (risk) p.log.warn(risk);
+	if (risk) {
+		showPrompt();
+		p.log.warn(risk);
+	}
 	const apiBase = loadCredentials()?.apiBaseUrl ?? getDefaultApiBase();
 	let auth = await verifyAuth();
 	if (
 		!auth.authenticated &&
 		(auth.reason === "no_credentials" || auth.reason === "token_expired")
 	) {
+		showPrompt();
 		const error = await runLogin({
 			apiBase,
 			allowInsecureApiBase: false,
@@ -351,6 +370,7 @@ async function resolveDestinations(changes: RepositoryChange[]): Promise<
 		if (!organizationId && organizations.length === 1)
 			organizationId = organizations[0]?.id;
 		if (!organizationId) {
+			showPrompt();
 			const selected = await p.select({
 				message: cliMessage("destination"),
 				options: organizations.map((org) => ({

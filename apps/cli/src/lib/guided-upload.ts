@@ -41,6 +41,7 @@ export function createGuidedUpload(
 		async authorize(
 			repositories: UploadRepository[],
 			state: UploadManagerState,
+			showPrompt?: () => void,
 		) {
 			if (authorization) return authorization;
 			await connection.update({
@@ -53,6 +54,7 @@ export function createGuidedUpload(
 			});
 			// A paired browser may belong to a different account than saved CLI
 			// credentials. Always obtain fresh authorization for this connection.
+			showPrompt?.();
 			const error = await runLogin(flags, {
 				id: connection.id,
 				browserOrigin: connection.browserOrigin,

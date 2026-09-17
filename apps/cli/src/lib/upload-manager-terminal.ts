@@ -28,15 +28,57 @@ export type UploadRepositoryScan = (
 	signal: AbortSignal,
 ) => Promise<UploadRepository[]>;
 
+/** Keep the table visible between prompts while account/workspace checks run. */
+export function createUploadScreen() {
+	let visible = false;
+	const interrupt = () => {
+		close();
+		process.exit(130);
+	};
+	const terminate = () => {
+		close();
+		process.exit(143);
+	};
+	const stopHandoff = () => {
+		process.off("SIGINT", interrupt);
+		process.off("SIGTERM", terminate);
+	};
+	function close() {
+		stopHandoff();
+		process.off("exit", close);
+		if (!visible) return;
+		visible = false;
+		process.stdout.write("\u001b[?25h\u001b[?1049l");
+	}
+	return {
+		open() {
+			stopHandoff();
+			if (visible) return;
+			visible = true;
+			process.once("exit", close);
+			process.stdout.write("\u001b[?1049h\u001b[?25l");
+		},
+		handoff() {
+			// The prompt releases its input handlers during these async checks.
+			// Restore the terminal if the user interrupts before the next prompt.
+			process.once("SIGINT", interrupt);
+			process.once("SIGTERM", terminate);
+		},
+		close,
+	};
+}
+
 export function promptUploadManager(
 	repositories: UploadRepository[],
 	state: UploadManagerState,
 	scan?: UploadRepositoryScan,
 	operation?: (signal: AbortSignal) => Promise<void>,
+	screen?: ReturnType<typeof createUploadScreen>,
 ): Promise<"save" | "cancel"> {
 	return new Promise((resolve, reject) => {
 		const input = process.stdin;
 		const output = process.stdout;
+		const terminal = screen ?? createUploadScreen();
 		const wasRaw = input.isRaw;
 		const togglePositions = new Map<string, number>();
 		const animations = new Map<string, ReturnType<typeof setTimeout>[]>();
@@ -55,7 +97,7 @@ export function promptUploadManager(
 		emitKeypressEvents(input);
 		input.setRawMode(true);
 		input.resume();
-		output.write("\u001b[?1049h\u001b[?25l");
+		terminal.open();
 		const render = () => {
 			if (finished) return;
 			const enableMouse =
@@ -90,7 +132,9 @@ export function promptUploadManager(
 			input.setRawMode(wasRaw);
 			input.pause();
 			if (mouseEnabled) output.write("\u001b[?1000l\u001b[?1006l");
-			output.write("\u001b[?25h\u001b[?1049l");
+			if (screen && result === "save" && error === undefined)
+				terminal.handoff();
+			else terminal.close();
 			if (error !== undefined) reject(error);
 			else resolve(result);
 		};
