@@ -94,13 +94,24 @@ export const SCREENS: Screen[] = [
 		group: "Auto upload",
 		command: "opaline upload",
 		description:
-			"Existing sessions upload in this table. Counts update per repository; completed rows keep their totals.",
+			"Active sessions show their date, ID and transferred bytes below each repository. Overall transfer speed appears at the top.",
 		manager: true,
 		loading: true,
 		copy: [
 			{ key: "saveProgress", label: "While saving" },
 			{ key: "uploadProgress", label: "While uploading" },
 		],
+	},
+	{
+		id: "upload-failures",
+		label: "Failed sessions",
+		group: "Auto upload",
+		command: "opaline upload",
+		description:
+			"Failed sessions remain under their repositories with their full error. Page through the details, retry with Enter or go back with Escape.",
+		manager: true,
+		loading: false,
+		copy: [],
 	},
 	{
 		id: "saved-new",

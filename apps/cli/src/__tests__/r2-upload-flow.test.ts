@@ -21,6 +21,7 @@ import {
 	hasAdvertisedR2UploadCapability,
 	rememberR2UploadCapability,
 } from "../lib/r2-upload-capability.js";
+import type { UploadTransferProgress } from "../lib/types.js";
 import { type UploadConfig, uploadSession } from "../lib/uploader.js";
 
 const TOKEN = "r2-flow-test-token";
@@ -164,6 +165,8 @@ describe("capability-gated R2 upload flow", () => {
 		expect(warmup.success).toBe(true);
 
 		const canary = `AKIA${"A".repeat(16)}`;
+		const progress: UploadTransferProgress[] = [];
+		config.onTransferProgress = (update) => progress.push(update);
 		const dirtyContent = JSON.stringify({
 			content: `Use ${canary}`,
 			padding: "x".repeat(200),
@@ -193,6 +196,20 @@ describe("capability-gated R2 upload flow", () => {
 		expect(uploadedContentLength).toBe(
 			Buffer.byteLength(uploadedBody).toString(),
 		);
+		expect(progress[0]).toEqual({
+			phase: "uploading",
+			uploadedBytes: 0,
+			totalBytes: Buffer.byteLength(uploadedBody),
+		});
+		expect(progress.at(-1)).toEqual({
+			phase: "processing",
+			uploadedBytes: Buffer.byteLength(uploadedBody),
+			totalBytes: Buffer.byteLength(uploadedBody),
+		});
+		for (const update of progress) {
+			expect(update.totalBytes).toBe(Buffer.byteLength(uploadedBody));
+			expect(update.uploadedBytes).toBeLessThanOrEqual(update.totalBytes);
+		}
 
 		const initInput = getRequiredMapValue(rpcInputs, "/rpc/ingest/init");
 		const main = getMainObject(initInput);

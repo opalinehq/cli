@@ -20,6 +20,12 @@ export const SESSION_TAGS: readonly SessionTag[] = [
 	"other",
 ] as const;
 
+export interface UploadTransferProgress {
+	phase: "uploading" | "processing";
+	uploadedBytes: number | undefined;
+	totalBytes: number;
+}
+
 export interface UploadResult {
 	success: boolean;
 	status?: number;

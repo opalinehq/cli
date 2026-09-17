@@ -403,7 +403,7 @@ async function refreshPreview() {
 	button("save-demo").disabled = next.scanning || next.uploading;
 	button("save-demo").textContent = next.uploading
 		? "Uploading…"
-		: state.error
+		: state.error || state.uploadFailed
 			? "Retry upload"
 			: next.scanning
 				? "Review after scan"
@@ -478,6 +478,7 @@ function redrawTerminal(replay = false) {
 		action.disabled =
 			preview.scanning ||
 			preview.uploading ||
+			state.uploadFailed === true ||
 			!!(state.stage && repo.index === 0);
 		action.addEventListener("click", () => {
 			if (isScanning()) return;

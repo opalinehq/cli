@@ -1,6 +1,9 @@
 import { sanitizeForTerminalDisplay } from "../contracts/index.js";
 import type { UploadCompletion } from "./upload-completion.js";
-import type { UploadRepository } from "./upload-manager-repositories.js";
+import type {
+	ScanProgress,
+	UploadRepository,
+} from "./upload-manager-repositories.js";
 
 export interface ReviewControl {
 	action: "confirm" | "back" | "previous" | "next";
@@ -26,9 +29,13 @@ export interface UploadManagerState {
 	desired: Map<string, boolean>;
 	message: string;
 	error?: { message: string; page: number; pageCount?: number };
-	scan?: { frame: number };
+	scan?: { frame: number; progress?: ScanProgress };
 	operation?: { label: string; frame: number };
 	completion?: UploadCompletion;
+	uploadFailed?: boolean;
+	uploadPage?: number;
+	uploadPageCount?: number;
+	followUpload?: boolean;
 	viewportStart?: number;
 	followScan?: boolean;
 }
@@ -69,8 +76,10 @@ export function applyUploadKey(
 		}
 		return "ignored";
 	}
-	if (state.singleRun && state.stage === "upload" && !state.operation)
-		return cancel || key.name === "return" ? "cancel" : "ignored";
+	if (state.singleRun && state.stage === "upload" && !state.operation) {
+		if (cancel || key.name === "return") return "cancel";
+		if (!state.uploadFailed) return "ignored";
+	}
 	if (cancel) {
 		if (
 			key.name === "escape" &&
@@ -84,6 +93,23 @@ export function applyUploadKey(
 		return "cancel";
 	}
 	if (state.scan) return "ignored";
+	if (state.stage === "upload" && (state.operation || state.uploadFailed)) {
+		if (["up", "down", "pageup", "pagedown"].includes(key.name)) {
+			state.followUpload = false;
+			state.uploadPage = Math.max(
+				0,
+				Math.min(
+					(state.uploadPage ?? 0) +
+						(["down", "pagedown"].includes(key.name) ? 1 : -1),
+					(state.uploadPageCount ?? 1) - 1,
+				),
+			);
+			return "changed";
+		}
+		return !state.operation && state.uploadFailed && key.name === "return"
+			? "save"
+			: "ignored";
+	}
 	if (state.operation && key.name !== "up" && key.name !== "down")
 		return "ignored";
 	if (state.stage === "review") {
@@ -292,6 +318,7 @@ export function reviewUploadSelection(state: UploadManagerState): void {
 
 export function editUploadSelection(state: UploadManagerState): void {
 	state.error = undefined;
+	state.uploadFailed = false;
 	state.stage = undefined;
 	state.completion = undefined;
 	state.query = "";

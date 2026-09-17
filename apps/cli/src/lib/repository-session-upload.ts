@@ -10,6 +10,10 @@ import { type BatchUploadSummary, batchUpload } from "./batch-upload.js";
 import { getGitInfo } from "./git-info.js";
 import { getProjectOrgId } from "./project-config.js";
 import type { UploadRepository } from "./upload-manager-repositories.js";
+import {
+	recordUploadBytes,
+	type SessionUploadDetail,
+} from "./upload-progress.js";
 import { type UploadConfig, uploadSession } from "./uploader.js";
 
 export async function checkRepositoryUploads(
@@ -137,6 +141,8 @@ export async function uploadRepositorySessions(
 			return true;
 		});
 		repository.uploadError = undefined;
+		repository.sessionUploads = [];
+		repository.uploadSpeed = { startedAt: performance.now(), samples: [] };
 		repository.upload = {
 			completed: repository.uploadedCount ?? 0,
 			total: repository.sessionCount,
@@ -160,6 +166,17 @@ export async function uploadRepositorySessions(
 		upload: async (item, onRetry) => {
 			signal.throwIfAborted();
 			const { repository } = item;
+			const detail: SessionUploadDetail = {
+				sessionId: item.sessionId,
+				source: item.source,
+				sessionDate: item.sessionDate,
+				status: "preparing",
+				uploadedBytes: undefined,
+				totalBytes: undefined,
+			};
+			repository.sessionUploads?.push(detail);
+			let previousBytes = 0;
+			let transferStage: "preparing" | "uploading" | "processing" = "preparing";
 			active.set(repository.key, (active.get(repository.key) ?? 0) + 1);
 			if (repository.upload) repository.upload.active = true;
 			onUpdate();
@@ -178,20 +195,57 @@ export async function uploadRepositorySessions(
 				const result = await uploadSession(request, {
 					...config,
 					signal,
-					onRetry,
+					onRetry: (attempt, maxAttempts, error) => {
+						onRetry(attempt, maxAttempts, error);
+						detail.status = "retrying";
+						detail.attempt = attempt + 1;
+						detail.maxAttempts = maxAttempts;
+						detail.error = error;
+						onUpdate();
+					},
+					onTransferProgress: (progress) => {
+						config.onTransferProgress?.(progress);
+						detail.status = progress.phase;
+						transferStage = progress.phase;
+						detail.error = undefined;
+						detail.uploadedBytes = progress.uploadedBytes;
+						detail.totalBytes = progress.totalBytes;
+						if (
+							progress.uploadedBytes !== undefined &&
+							repository.uploadSpeed
+						) {
+							recordUploadBytes(
+								repository.uploadSpeed,
+								Math.max(0, progress.uploadedBytes - previousBytes),
+								performance.now(),
+							);
+							previousBytes = progress.uploadedBytes;
+						}
+						onUpdate();
+					},
 				});
 				if (result.success) {
+					repository.sessionUploads = repository.sessionUploads?.filter(
+						(session) => session !== detail,
+					);
 					repository.uploadedSessionIds?.add(item.sessionId);
 					repository.uploadedCount = (repository.uploadedCount ?? 0) + 1;
 					if (repository.upload)
 						repository.upload.completed = repository.uploadedCount;
 				} else {
+					detail.status = "failed";
+					detail.failureStage = transferStage;
+					detail.error =
+						result.error ?? "Upload failed without an error message.";
 					if (repository.upload) repository.upload.failed++;
 					repository.uploadError = result.error;
 				}
 				return result;
 			} catch (error) {
 				if (!signal.aborted) {
+					detail.status = "failed";
+					detail.failureStage = transferStage;
+					detail.error = error instanceof Error ? error.message : String(error);
 					if (repository.upload) repository.upload.failed++;
 					repository.uploadError =
 						error instanceof Error ? error.message : String(error);
@@ -216,6 +270,26 @@ export async function uploadRepositorySessions(
 		if (remaining.length && !repository.uploadError)
 			repository.uploadError =
 				"Upload paused after the rate limit. Press Enter to retry remaining sessions.";
+		for (const item of remaining) {
+			if (
+				repository.sessionUploads?.some(
+					(detail) =>
+						detail.sessionId === item.sessionId &&
+						detail.source === item.source,
+				)
+			)
+				continue;
+			repository.sessionUploads?.push({
+				sessionId: item.sessionId,
+				source: item.source,
+				sessionDate: item.sessionDate,
+				status: "failed",
+				uploadedBytes: undefined,
+				totalBytes: undefined,
+				error:
+					"Not attempted: upload paused after the server rate limit. Retry later.",
+			});
+		}
 	}
 	onUpdate();
 	return summary;

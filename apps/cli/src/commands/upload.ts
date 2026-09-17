@@ -64,18 +64,20 @@ export async function runUpload(
 			signal,
 		) => {
 			const rows = await discoverUploadRepositories(
-				(_progress, discovered) => onRepositories(discovered),
+				(progress, discovered) => onRepositories(discovered, progress),
 				{ signal, adapters, cwd: env.cwd },
 			);
 			const config = guided ? undefined : getManagerUploadConfig();
 			if (config) {
+				const updateHistory = () =>
+					onRepositories(rows, {
+						phase: "history",
+						sessions: rows.reduce((sum, row) => sum + row.sessionCount, 0),
+						repositories: rows.length,
+					});
+				updateHistory();
 				try {
-					await checkRepositoryUploads(
-						rows,
-						config,
-						() => onRepositories(rows),
-						signal,
-					);
+					await checkRepositoryUploads(rows, config, updateHistory, signal);
 				} catch (error) {
 					signal.throwIfAborted();
 					state.message = `Upload history unavailable: ${error instanceof Error ? error.message : String(error)}`;
@@ -157,6 +159,10 @@ export async function runUpload(
 					hasPreviousUploads = setup.hasUploadedSessions === true;
 				}
 				state.stage = "upload";
+				state.message = "";
+				state.uploadFailed = false;
+				state.uploadPage = 0;
+				state.followUpload = true;
 				state.completion = undefined;
 				operation = async (signal) => {
 					try {
@@ -210,17 +216,12 @@ export async function runUpload(
 								} else state.completion = completion;
 								state.selectionVisible = false;
 							} else {
-								state.error = {
-									message: [
-										state.message,
-										...targets
-											.filter((repo) => repo.uploadError)
-											.map((repo) => `${repo.name}: ${repo.uploadError}`),
-										"Already uploaded sessions are kept. Retry to upload the remaining sessions.",
-									].join("\n\n"),
-									page: 0,
-								};
-								if (guided) throw new Error(state.error.message);
+								state.uploadFailed = true;
+								state.uploadPage = 0;
+								if (guided) {
+									operationError = new Error(state.message);
+									await guided.close(operationError);
+								}
 							}
 						} else
 							state.message = cliMessage("saveSummary", {

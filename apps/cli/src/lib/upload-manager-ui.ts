@@ -14,6 +14,7 @@ import {
 	UPLOAD_MANAGER_THEME,
 	type UploadManagerTheme,
 } from "./upload-manager-theme.js";
+import { formatUploadBytes, uploadBytesPerSecond } from "./upload-progress.js";
 
 const TEXT_STYLES = {
 	regular: "0",
@@ -138,31 +139,48 @@ export function renderUploadManager(
 		theme.separators === "none"
 			? ""
 			: `${margin}${paint((theme.separators === "dots" ? "·" : "─").repeat(contentWidth), "muted")}`;
+	const hasTransferProgress = repositories.some(
+		(repo) =>
+			repo.uploadSpeed?.samples.length ||
+			repo.sessionUploads?.some(
+				(session) => session.uploadedBytes !== undefined,
+			),
+	);
 	const badge =
-		reviewing || state.operation || scanning
-			? ""
-			: pending.length
-				? ` ${pending.length} UNSAVED `
-				: "✓ Saved";
+		state.operation && state.stage === "upload"
+			? `↑ ${formatUploadBytes(hasTransferProgress ? repositories.reduce((sum, repo) => sum + (repo.uploadSpeed ? uploadBytesPerSecond(repo.uploadSpeed, performance.now()) : 0), 0) : undefined)}/s`
+			: reviewing || state.stage === "upload" || state.operation || scanning
+				? ""
+				: pending.length
+					? ` ${pending.length} UNSAVED `
+					: "✓ Saved";
 	const title = clipLine(
 		cliMessage("managerTitle", {}, theme),
 		contentWidth - badge.length,
 	);
-	const sessionCount = summaryRepositories.reduce(
-		(count, repo) => count + repo.sessionCount,
-		0,
-	);
+	const sessionCount =
+		state.scan?.progress?.sessions ??
+		summaryRepositories.reduce((count, repo) => count + repo.sessionCount, 0);
 	const repoCount =
-		theme.showSummary || scanning
-			? ` (${number.format(tableRepositories.length)})`
-			: "";
+		state.scan?.progress?.phase === "sessions"
+			? ""
+			: theme.showSummary || scanning
+				? ` (${number.format(tableRepositories.length)})`
+				: "";
 	const spinner =
 		SCAN_FRAMES[(state.scan?.frame ?? 0) % SCAN_FRAMES.length] ?? "⠋";
-	const fullHeading = `${cliMessage(scanning ? "scanHeading" : "repositoryHeading", {}, theme)}${repoCount}`;
+	const scanPhase = state.scan?.progress?.phase;
+	const scanHeading =
+		scanPhase === "sessions"
+			? "Reading sessions"
+			: scanPhase === "history"
+				? "Checking uploads"
+				: cliMessage("scanHeading", {}, theme);
+	const fullHeading = `${scanning ? scanHeading : cliMessage("repositoryHeading", {}, theme)}${repoCount}`;
 	const heading =
 		fullHeading.length + (scanning ? 2 : 0) <= nameWidth
 			? fullHeading
-			: `${scanning ? "Scan" : "Repos"}${repoCount}`;
+			: `${scanning ? (scanPhase === "sessions" ? "Reading" : scanPhase === "history" ? "Checking" : "Scan") : "Repos"}${repoCount}`;
 	const lines = [
 		`${margin}${paint(title, scanning ? "muted" : "brand")}${badge ? `\u001b[${width - inset - badge.length + 1}G${paint(badge, pending.length ? "pending" : "muted")}` : ""}`,
 		state.query ? textLine(`Search: ${state.query}`, "strong") : "",
@@ -231,7 +249,7 @@ export function renderUploadManager(
 		const highlight = selected
 			? `${rowPaint(" ".repeat(contentWidth), "regular")}\u001b[${inset + 1}G`
 			: "";
-		return `${margin}${highlight}${rowPaint(selected ? "› " : "  ", "regular")}${rowPaint(clipLine(name, nameWidth), "regular")}${metadataColumn}${rowPaint(track, color)}${rowPaint(desired === "mixed" ? "MIX" : desired === "on" ? "ON " : "OFF", color)}\u001b[${sessionsColumn + 1}G${rowPaint(displayCount.padStart(sessionsWidth), aggregate ? "regular" : "muted")}\u001b[${uploadedColumn + 1}G${rowPaint(uploadText.padStart(countWidth), upload?.failed ? "danger" : upload?.active ? "accent" : uploaded ? "success" : "muted")}`;
+		return `${margin}${highlight}${rowPaint(selected ? "› " : "  ", "regular")}${rowPaint(clipLine(name, nameWidth), "regular")}${metadataColumn}${rowPaint(track, color)}${rowPaint(desired === "mixed" ? "MIX" : desired === "on" ? "ON " : "OFF", color)}\u001b[${sessionsColumn + 1}G${rowPaint(displayCount.padStart(sessionsWidth), aggregate ? "regular" : "muted")}\u001b[${uploadedColumn + 1}G${rowPaint(uploadText.padStart(countWidth), upload?.active ? "accent" : upload?.failed ? "danger" : uploaded ? "success" : "muted")}`;
 	};
 	lines.push(
 		rowLine(
@@ -269,6 +287,117 @@ export function renderUploadManager(
 		),
 		divider,
 	);
+	if (
+		state.stage === "upload" &&
+		(state.operation || state.uploadFailed) &&
+		!completion
+	) {
+		// Pages count physical lines, so a long session ID or error can never
+		// push a failure off-screen. Repeat the repository on continued pages.
+		const capacity = Math.max(2, height - lines.length - 4);
+		const pages: string[][] = [[]];
+		let page = pages[0] ?? [];
+		let activePage: number | undefined;
+		const append = (line: string, header: string, active = false) => {
+			if (page.length === capacity) {
+				page = [];
+				pages.push(page);
+				if (line !== header) page.push(header);
+			}
+			if (active && activePage === undefined) activePage = pages.length - 1;
+			page.push(line);
+		};
+		for (const repository of filtered) {
+			const header = rowLine(
+				`${repository.name}${repository.current ? " (current)" : ""}`,
+				repository.key,
+				getDesiredUploadState(repository, state) ? "on" : "off",
+				repository.sessionCount,
+				false,
+				false,
+				repository.uploadedCount,
+				repository.upload,
+			);
+			append(header, header);
+			const details = [...(repository.sessionUploads ?? [])].sort(
+				(a, b) => Number(a.status === "failed") - Number(b.status === "failed"),
+			);
+			for (const detail of details) {
+				const active = detail.status !== "failed";
+				const date =
+					detail.sessionDate === undefined
+						? "Unknown date"
+						: new Date(detail.sessionDate).toISOString().slice(0, 10);
+				const identity = `${date} · ${sanitizeForTerminalDisplay(detail.sessionId)}`;
+				const bytes = `${formatUploadBytes(detail.uploadedBytes)} / ${formatUploadBytes(detail.totalBytes)}`;
+				const available = contentWidth - 4;
+				if (identity.length + bytes.length + 2 <= available) {
+					append(
+						`${margin}    ${paint(identity, "muted")}${" ".repeat(available - identity.length - bytes.length)}${paint(bytes, "regular")}`,
+						header,
+						active,
+					);
+				} else {
+					for (const line of wrapErrorMessage(identity, available))
+						append(`${margin}    ${paint(line, "muted")}`, header, active);
+					append(
+						`${margin}    ${paint(bytes.padStart(available), "regular")}`,
+						header,
+						active,
+					);
+				}
+				const label =
+					detail.status === "failed"
+						? detail.failureStage === "processing"
+							? "✗ Processing failed"
+							: detail.failureStage === "preparing"
+								? "✗ Preparation failed"
+								: "✗ Failed"
+						: detail.status === "retrying"
+							? `↻ Retrying ${detail.attempt}/${detail.maxAttempts}`
+							: `${SCAN_FRAMES[(state.operation?.frame ?? 0) % SCAN_FRAMES.length]} ${detail.status === "preparing" ? "Preparing" : detail.status === "processing" ? "Processing on server" : "Uploading"}`;
+				append(
+					`${margin}    ${paint(label, detail.status === "failed" ? "danger" : "accent")}`,
+					header,
+					active,
+				);
+				if (detail.error)
+					for (const line of wrapErrorMessage(detail.error, available))
+						append(
+							`${margin}    ${paint(line, detail.status === "failed" ? "danger" : "regular")}`,
+							header,
+						);
+			}
+		}
+		state.uploadPageCount = pages.length;
+		state.uploadPage = Math.max(
+			0,
+			Math.min(
+				state.operation && state.followUpload !== false
+					? (activePage ?? 0)
+					: (state.uploadPage ?? 0),
+				pages.length - 1,
+			),
+		);
+		lines.push(...(pages[state.uploadPage] ?? []));
+		while (lines.length < height - 4) lines.push("");
+		lines.push(
+			divider,
+			pages.length > 1
+				? textLine(`‹ Page ${state.uploadPage + 1} of ${pages.length} ›`)
+				: "",
+			textLine(state.message, state.uploadFailed ? "danger" : "muted"),
+			state.uploadFailed && !state.operation
+				? textLine(
+						state.singleRun
+							? "Close [Enter / Esc]"
+							: "Retry [Enter]   Go back [Esc]",
+						"strong",
+					)
+				: "",
+		);
+		return lines.join("\n");
+	}
 	const splitFooter = compact || (!!state.stage && contentWidth < 68);
 	const focusedWorkspace =
 		filtered[state.cursor - 1]?.uploadedOrganizationId ??

@@ -54,6 +54,7 @@ describe("R2 multipart file handling", () => {
 		const receivedLengths: string[] = [];
 		const receivedBodies: string[] = [];
 		const retries: number[] = [];
+		const uploadedSnapshots: number[] = [];
 		const fetchMock: typeof fetch = async (input, init) => {
 			const request = new Request(input, init);
 			receivedLengths.push(request.headers.get("content-length") ?? "");
@@ -69,10 +70,19 @@ describe("R2 multipart file handling", () => {
 			baseDelayMs: 0,
 			fetch: fetchMock,
 			maxAttempts: 3,
-			onProgress: undefined,
+			onProgress: (progress) =>
+				uploadedSnapshots.push(progress.objectBytesUploaded),
 			onRetry: (retry) => retries.push(retry.attempt),
 			sources: [{ path, upload }],
 		});
+		expect(uploadedSnapshots.filter((bytes) => bytes === 0)).toHaveLength(2);
+		expect(
+			uploadedSnapshots.reduce(
+				(sum, bytes, index) =>
+					sum + Math.max(0, bytes - (uploadedSnapshots[index - 1] ?? 0)),
+				0,
+			),
+		).toBe(content.length * 2);
 
 		expect(receivedBodies).toEqual([content, content]);
 		expect(receivedLengths).toEqual(

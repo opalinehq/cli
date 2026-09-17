@@ -1,6 +1,9 @@
 import { emitKeypressEvents, type Key } from "node:readline";
 import { cliMessage } from "./cli-messages.js";
-import type { UploadRepository } from "./upload-manager-repositories.js";
+import type {
+	ScanProgress,
+	UploadRepository,
+} from "./upload-manager-repositories.js";
 import {
 	activateUploadReview,
 	applyUploadKey,
@@ -18,7 +21,10 @@ const SCAN_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "�
 const SCAN_FRAME_MS = 80;
 
 export type UploadRepositoryScan = (
-	onRepositories: (repositories: UploadRepository[]) => void,
+	onRepositories: (
+		repositories: UploadRepository[],
+		progress?: ScanProgress,
+	) => void,
 	signal: AbortSignal,
 ) => Promise<UploadRepository[]>;
 
@@ -237,8 +243,10 @@ export function promptUploadManager(
 			}, SCAN_FRAME_MS);
 			void Promise.resolve()
 				.then(() =>
-					scan((rows) => {
-						if (!finished) repositories.splice(0, repositories.length, ...rows);
+					scan((rows, progress) => {
+						if (finished) return;
+						repositories.splice(0, repositories.length, ...rows);
+						if (state.scan) state.scan.progress = progress;
 					}, controller.signal),
 				)
 				.then((rows) => {

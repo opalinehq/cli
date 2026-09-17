@@ -42,7 +42,7 @@ import {
 	isR2InitUnsupported,
 	uploadSessionViaR2,
 } from "./r2-upload-flow.js";
-import type { UploadResult } from "./types.js";
+import type { UploadResult, UploadTransferProgress } from "./types.js";
 import { describeUploadEndpointRejection } from "./upload-endpoint.js";
 
 export interface UploadConfig {
@@ -53,6 +53,7 @@ export interface UploadConfig {
 	maxAggregateBytes?: number;
 	onRetry?: (attempt: number, maxAttempts: number, error: string) => void;
 	onProgress?: (progress: R2MultipartProgress) => void;
+	onTransferProgress?: (progress: UploadTransferProgress) => void;
 	signal?: AbortSignal;
 	r2MultipartBaseDelayMs?: number;
 	r2StatusPollIntervalMs?: number;
@@ -382,6 +383,7 @@ export async function uploadSession(
 				maxAggregateBytes,
 				multipartBaseDelayMs: config.r2MultipartBaseDelayMs,
 				onProgress: config.onProgress,
+				onTransferProgress: config.onTransferProgress,
 				onRetry: config.onRetry,
 				statusPollIntervalMs: config.r2StatusPollIntervalMs,
 				token: config.token,
@@ -474,6 +476,18 @@ export async function uploadSession(
 		};
 	}
 	const { filteredRequest, filteredText } = legacy;
+	// Legacy RPC uploads do not expose transport byte progress. Keep it unknown
+	// rather than reporting a fabricated percentage while awaiting the response.
+	config.onTransferProgress?.({
+		phase: "uploading",
+		uploadedBytes: undefined,
+		totalBytes:
+			Buffer.byteLength(filteredRequest.content, "utf8") +
+			(filteredRequest.subagents ?? []).reduce(
+				(sum, item) => sum + Buffer.byteLength(item.content, "utf8"),
+				0,
+			),
+	});
 
 	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
 		config.signal?.throwIfAborted();

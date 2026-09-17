@@ -8,6 +8,7 @@ export interface SessionFile {
 	gitSha?: string;
 	gitRemote?: string;
 	lastActivityAt?: number;
+	sessionDate?: number;
 }
 
 export interface ScannedProject {
