@@ -4,15 +4,18 @@ on:
   pull_request_target:
     types:
       - opened
+      - reopened
       - edited
       - synchronize
+      - ready_for_review
 
 permissions:
   pull-requests: read
 
 jobs:
   lint-pr-title:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
     steps:
       - name: Enforce conventional commit format
         uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
