@@ -1,10 +1,10 @@
-<h1 align="center">Opaline CLI</h1>
+<h1 align="center">Opaline</h1>
 
-<p align="center"><strong>Your Claude Code and Codex sessions, in one place.</strong></p>
+<p align="center"><strong>Clarity for your team's coding sessions.</strong></p>
 
 <p align="center">
-  Connect your coding sessions to Opaline for team analytics.<br>
-  Choose your repositories. Upload existing sessions. Keep future sessions syncing.
+  Explore your team's Claude Code and Codex sessions.<br>
+  Understand what happened, how agents worked, and where the effort went.
 </p>
 
 <p align="center">
@@ -14,14 +14,19 @@
 
 <p align="center">
   <a href="https://opaline.so">Open Opaline</a> ·
+  <a href="#see-opaline-in-action">The product</a> ·
   <a href="#get-started">Get started</a> ·
   <a href="docs/usage.md">CLI guide</a>
 </p>
 
-<p align="center">
-  <img src="docs/assets/repository-picker.png" alt="Opaline repository picker showing per-repository upload switches, local session counts, and uploaded session counts." width="880">
-  <br><sub>Choose which repositories sync. Sample data shown.</sub>
-</p>
+## See Opaline in action
+
+Opaline brings your team's coding sessions into a shared workspace. Browse sessions across repositories, follow conversations and tool calls, and see model usage, tokens, and costs in context.
+
+<!-- PRODUCT RECORDING: Replace the placeholder image below with your Opaline app screen recording. Keep this product section above CLI setup. -->
+![Opaline product walkthrough — screen recording coming soon.](docs/assets/product-demo-placeholder.svg)
+
+This repository contains the **open-source CLI** that connects your local sessions to [the Opaline app](https://opaline.so).
 
 ## Get started
 
@@ -38,6 +43,16 @@ npx opaline@latest
 Already started in the browser? Run the command Opaline gives you, including its `--code` value, and approve sign-in in that same browser. This keeps your terminal connected to your setup page.
 
 ## How it works
+
+<details>
+<summary>Preview the CLI repository picker</summary>
+
+<p align="center">
+  <img src="docs/assets/repository-picker.png" alt="Opaline repository picker showing per-repository upload switches, local session counts, and uploaded session counts." width="880">
+  <br><sub>Choose which repositories sync. Sample data shown.</sub>
+</p>
+
+</details>
 
 - **One view across both agents.** The picker groups sessions by repository, including sessions from Git worktrees, and shows local and uploaded counts.
 - **Automatic uploads for your selections.** Opaline sets up Claude Code and Codex hooks for enabled repositories. Sessions already uploaded to the destination are skipped.
@@ -78,5 +93,6 @@ Prefer a shorter command? [Install globally](docs/usage.md#optional-global-insta
 - [Data handling](docs/data-handling.md) — transcript uploads, secret filtering, and usage analytics.
 - [Contributing](CONTRIBUTING.md) — local development and the CLI playground.
 - [Report a bug](https://github.com/opalinehq/cli/issues) · [Report a security issue privately](SECURITY.md).
+- [Contact Evren](mailto:evren@opaline.so).
 
 Licensed under [MIT](LICENSE).
