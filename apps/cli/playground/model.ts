@@ -150,6 +150,7 @@ export function createPreview(value: unknown): PreviewResponse {
 				? "review"
 				: screen.id === "saving" ||
 						screen.id.startsWith("upload-partial") ||
+						screen.id.startsWith("upload-skipped") ||
 						screen.id === "upload-failures" ||
 						isUploadCompleteScreen(screen.id)
 					? "upload"
@@ -260,22 +261,24 @@ export function createPreview(value: unknown): PreviewResponse {
 	}
 	if (
 		screen.id === "upload-failures" ||
-		screen.id.startsWith("upload-partial")
+		screen.id.startsWith("upload-partial") ||
+		screen.id.startsWith("upload-skipped")
 	) {
 		state.uploadFailed = true;
+		const onlySkipped = screen.id.startsWith("upload-skipped");
 		const failedRepositories = repositories
 			.filter(
 				(row) => row.enabled && row.sessionCount > (row.uploadedCount ?? 0),
 			)
-			.slice(0, 2);
-		const failedCount = failedRepositories.length ? 1 : 0;
-		const skippedCount = failedRepositories.length > 1 ? 3 : 0;
+			.slice(0, onlySkipped ? 1 : 2);
+		const failedCount = !onlySkipped && failedRepositories.length ? 1 : 0;
+		const skippedCount = onlySkipped || failedRepositories.length > 1 ? 3 : 0;
 		state.message = `${failedCount} failed · ${skippedCount} skipped`;
-		if (screen.id.startsWith("upload-partial")) {
-			state.message = `12 uploaded · ${failedCount} failed · ${skippedCount} skipped`;
+		if (screen.id.startsWith("upload-partial") || onlySkipped) {
+			state.message = `12 uploaded${failedCount ? ` · ${failedCount} failed` : ""} · ${skippedCount} skipped`;
 			state.completion = getUploadCompletion(
 				"https://opaline.so/rpc",
-				screen.id !== "upload-partial-new",
+				!screen.id.endsWith("-new"),
 				[{ id: "sample-workspace", slug: "acme" }],
 			);
 		}
@@ -284,7 +287,7 @@ export function createPreview(value: unknown): PreviewResponse {
 				active: false,
 				completed: repo.uploadedCount ?? 0,
 				total: repo.sessionCount,
-				failed: index === 0 ? 1 : 3,
+				failed: !onlySkipped && index === 0 ? 1 : 0,
 			};
 			repo.sessionUploads = [
 				{
@@ -299,7 +302,7 @@ export function createPreview(value: unknown): PreviewResponse {
 						"503 Service unavailable: the server could not finish processing this session. Retry when the service is available.",
 				},
 			];
-			if (index > 0)
+			if (onlySkipped || index > 0)
 				repo.sessionUploads = Array.from({ length: 3 }, (_, sessionIndex) => ({
 					sessionId: `019cb958-d947-7901-916f-ac59e2d3732${sessionIndex}`,
 					source: "codex",
@@ -310,8 +313,14 @@ export function createPreview(value: unknown): PreviewResponse {
 					maxBytes: 128 * 1024 * 1024,
 				}));
 		}
+		for (const repo of repositories)
+			uploaded[repo.key] = repo.uploadedCount ?? 0;
 	}
-	if (isUploadCompleteScreen(screen.id) && uploadSucceeded)
+	if (
+		isUploadCompleteScreen(screen.id) &&
+		uploadSucceeded &&
+		!Object.keys(uploaded).length
+	)
 		for (const repo of repositories.filter((repo) => repo.enabled)) {
 			repo.uploadedCount = repo.sessionCount;
 			uploaded[repo.key] = repo.sessionCount;

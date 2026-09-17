@@ -181,9 +181,19 @@ test("size-limit skips across repositories share one explanation and retain ever
 			expect(screen.split("\n").length).toBeLessThan(rows);
 			for (const line of screen.split("\n"))
 				expect(line.length).toBeLessThan(columns);
-			body += screen
-				.split("\n")
-				.slice(6, -4)
+			const lines = screen.split("\n");
+			const footer = lines.findIndex((line) => line.includes("6 skipped:"));
+			expect(footer).toBeGreaterThan(6);
+			const boundary = lines.findLastIndex(
+				(line) => line.includes("Page") || line.includes("────"),
+			);
+			expect(boundary).toBeLessThan(footer);
+			expect(
+				screen.replace(/\s/g, "").match(/Nouploadattempted\./g),
+			).toHaveLength(1);
+			expect(screen).not.toContain("Retry");
+			body += lines
+				.slice(6, boundary)
 				.filter(
 					(line) =>
 						!line.includes("Skipped · size limit") && !line.includes("[──●]"),
@@ -191,12 +201,88 @@ test("size-limit skips across repositories share one explanation and retain ever
 				.join("");
 		}
 		const compactBody = body.replace(/\s/g, "");
-		expect(compactBody.match(/Nouploadattempted\./g)).toHaveLength(1);
+		expect(compactBody).not.toContain("Nouploadattempted.");
 		expect(compactBody.match(/Couldnotsavediagnostics\./g)).toHaveLength(1);
 		expect(body).not.toContain("Duplicated individual size explanation");
 		for (const repo of repositories)
 			for (const detail of repo.sessionUploads ?? [])
 				expect(compactBody).toContain(detail.sessionId);
+	}
+});
+
+test("size-only skips offer Continue to the existing success screen, never Retry", () => {
+	for (const singleRun of [true, false]) {
+		for (const uploadedCount of [0, 2]) {
+			for (const columns of [38, 80, 120]) {
+				const repo = uploadFixture();
+				repo.uploadedCount = uploadedCount;
+				repo.upload = {
+					active: false,
+					completed: uploadedCount,
+					total: 10,
+					failed: 0,
+				};
+				repo.sessionUploads = [
+					{
+						sessionId: "too-large",
+						source: "codex",
+						sessionDate: Date.parse("2026-09-17"),
+						status: "skipped",
+						uploadedBytes: 0,
+						totalBytes: 150 * 1024 * 1024,
+					},
+				];
+				const state: UploadManagerState = {
+					query: "",
+					cursor: 0,
+					desired: new Map(),
+					stage: "upload",
+					uploadFailed: true,
+					singleRun,
+					message: `${uploadedCount} uploaded · 1 skipped`,
+					completion: singleRun
+						? { kind: "setup", url: "https://opaline.so/welcome?connect=test" }
+						: {
+								kind: "sessions",
+								dashboards: [
+									{
+										organizationId: "acme",
+										url: "https://opaline.so/acme/sessions",
+									},
+								],
+							},
+				};
+				const results = stripVTControlCharacters(
+					renderUploadManager([repo], state, columns, 13),
+				);
+				expect(results).not.toContain("Retry");
+				expect(results).toContain("Continue [Enter]");
+				expect(results.indexOf("Continue [Enter]")).toBeGreaterThan(
+					results.indexOf("No upload attempted."),
+				);
+				expect(results.split("\n").length).toBeLessThan(13);
+				expect(applyUploadKey([repo], state, { name: "r" })).toBe("ignored");
+				expect(applyUploadKey([repo], state, { name: "return" })).toBe(
+					"changed",
+				);
+				const success = renderUploadManager([repo], state, columns, 13);
+				expect(success).toContain(
+					uploadedCount
+						? "Successfully uploaded sessions"
+						: "Auto upload enabled",
+				);
+				expect(success).toContain(
+					singleRun
+						? "https://opaline.so/welcome?connect=test"
+						: "https://opaline.so/acme/sessions",
+				);
+				expect(success).not.toMatch(/Retry|Continue \[Enter\]/u);
+				expect(success.split("\n").length).toBeLessThan(13);
+				expect(applyUploadKey([repo], state, { name: "return" })).toBe(
+					"cancel",
+				);
+			}
+		}
 	}
 });
 
@@ -290,7 +376,7 @@ test("scan distinguishes local discovery from upload-history checks", () => {
 	).toContain("Checking uploads (1)");
 });
 
-test("partial success keeps failure pages, continuation links and explicit retry without row selection", () => {
+test("partial success keeps failure pages and retries, then Continue opens completion", () => {
 	for (const singleRun of [true, false]) {
 		for (const completion of [
 			{ kind: "setup", url: "https://opaline.so/welcome?connect=test" },
@@ -323,11 +409,6 @@ test("partial success keeps failure pages, continuation links and explicit retry
 				const screen = renderUploadManager([repo], state, width, height);
 				expect(screen).toContain("Continue [Enter]");
 				expect(screen).toContain("Retry failed [R]");
-				expect(screen).toContain(
-					completion.kind === "setup"
-						? completion.url
-						: (completion.dashboards[0]?.url ?? "missing"),
-				);
 				expect(screen.split("\n").length).toBeLessThan(height);
 				expect(screen).not.toMatch(/Space|toggle|move/);
 			}
@@ -336,8 +417,16 @@ test("partial success keeps failure pages, continuation links and explicit retry
 			expect(state.followUpload).toBe(false);
 			expect(applyUploadKey([repo], state, { name: "space" })).toBe("ignored");
 			expect(applyUploadKey([repo], state, { name: "r" })).toBe("save");
+			expect(applyUploadKey([repo], state, { name: "return" })).toBe("changed");
+			const completed = renderUploadManager([repo], state, 120, 30);
+			expect(completed).toContain("Successfully uploaded sessions");
+			expect(completed).toContain(
+				completion.kind === "setup"
+					? completion.url
+					: (completion.dashboards[0]?.url ?? "missing"),
+			);
+			expect(completed).not.toContain("Retry");
 			expect(applyUploadKey([repo], state, { name: "return" })).toBe("cancel");
-			expect(applyUploadKey([repo], state, { name: "escape" })).toBe("cancel");
 		}
 	}
 });

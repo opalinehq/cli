@@ -77,13 +77,13 @@ export function applyUploadKey(
 		return "ignored";
 	}
 	if (
-		state.singleRun &&
+		(state.singleRun || state.completion) &&
 		state.stage === "upload" &&
 		!state.operation &&
 		!state.uploadFailed
 	) {
 		if (cancel || key.name === "return") return "cancel";
-		return "ignored";
+		if (state.singleRun) return "ignored";
 	}
 	if (cancel) {
 		if (state.singleRun && state.stage === "upload" && !state.operation)
@@ -103,9 +103,15 @@ export function applyUploadKey(
 	}
 	if (state.scan) return "ignored";
 	if (state.stage === "upload" && (state.operation || state.uploadFailed)) {
+		const canRetry = hasFailedUploadSessions(repositories);
 		if (!state.operation && state.completion) {
-			if (key.name === "return") return "cancel";
-			if (key.name === "r") return "save";
+			if (key.name === "return") {
+				state.uploadFailed = false;
+				state.viewportStart = 0;
+				state.cursor = 0;
+				return "changed";
+			}
+			if (key.name === "r" && canRetry) return "save";
 		}
 		if (["up", "down", "pageup", "pagedown"].includes(key.name)) {
 			state.followUpload = false;
@@ -119,7 +125,7 @@ export function applyUploadKey(
 			);
 			return "changed";
 		}
-		return !state.operation && state.uploadFailed && key.name === "return"
+		return !state.operation && canRetry && key.name === "return"
 			? "save"
 			: "ignored";
 	}
@@ -189,6 +195,14 @@ export function applyUploadKey(
 		state.cursor = 0;
 	} else return "ignored";
 	return "changed";
+}
+
+export function hasFailedUploadSessions(
+	repositories: UploadRepository[],
+): boolean {
+	return repositories.some((repo) =>
+		repo.sessionUploads?.some((session) => session.status === "failed"),
+	);
 }
 
 export function activateUploadReview(

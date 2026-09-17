@@ -210,7 +210,7 @@ export async function runUpload(
 											.join(" · ")
 									: cliMessage("uploadSummary", { count: uploadedThisRun });
 							state.uploadFailed = summary.failed + summary.skipped > 0;
-							if (uploadedThisRun > 0 || !state.uploadFailed) {
+							if (uploadedThisRun > 0 || summary.failed === 0) {
 								operationError = undefined;
 								for (const repo of targets)
 									uploadedWorkspaces.add(
@@ -227,7 +227,9 @@ export async function runUpload(
 									await guided.complete({
 										uploaded: uploadedThisRun,
 										skipped: skippedBeforeRun,
-										failed: summary.failed + summary.skipped,
+										// Size skips were never attempted. Keep them out of
+										// uploaded/already-present totals and actual failures.
+										failed: summary.failed,
 									});
 									state.completion = guided.completionLink(completion);
 								} else state.completion = completion;

@@ -294,8 +294,10 @@ export async function uploadRepositorySessions(
 					detail.failureStage = transferStage;
 					detail.error =
 						result.error ?? "Upload failed without an error message.";
-					if (repository.upload) repository.upload.failed++;
-					repository.uploadError = result.error;
+					if (detail.status === "failed") {
+						if (repository.upload) repository.upload.failed++;
+						repository.uploadError = result.error;
+					}
 				}
 				return result;
 			} catch (error) {
@@ -353,6 +355,7 @@ export async function uploadRepositorySessions(
 		const remaining = items.filter(
 			(item) =>
 				item.repository === repository &&
+				item.detail.status !== "skipped" &&
 				!repository.uploadedSessionIds?.has(item.sessionId),
 		);
 		if (repository.upload) repository.upload.failed = remaining.length;

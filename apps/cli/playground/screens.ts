@@ -13,6 +13,17 @@ interface Screen {
 
 export const SCREENS: Screen[] = [
 	...(["new", "returning"] as const).map((user) => ({
+		id: `upload-skipped-${user}`,
+		label: `Size skips · ${user === "new" ? "New" : "Returning"} user`,
+		group: "Auto upload",
+		command: "opaline upload",
+		description:
+			"Oversized sessions stay grouped in the table. The explanation appears below; Enter continues to the completion screen without retrying them.",
+		manager: true,
+		loading: false,
+		copy: [],
+	})),
+	...(["new", "returning"] as const).map((user) => ({
 		id: `upload-partial-${user}`,
 		label: `Partial upload · ${user === "new" ? "New" : "Returning"} user`,
 		group: "Auto upload",

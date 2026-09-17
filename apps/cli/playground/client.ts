@@ -1,6 +1,7 @@
 import {
 	activateUploadReview,
 	applyUploadKey,
+	hasFailedUploadSessions,
 	toggleUploadRepository,
 	type UploadKey,
 	type UploadManagerState,
@@ -414,18 +415,23 @@ async function refreshPreview() {
 	button("save-demo").disabled = next.scanning || next.uploading;
 	button("save-demo").textContent = next.uploading
 		? "Uploading…"
-		: state.error || state.uploadFailed
-			? "Retry upload"
-			: next.scanning
-				? "Review after scan"
-				: currentScreen === "review"
-					? "Confirm upload"
-					: "Review selection";
+		: state.uploadFailed && !hasFailedUploadSessions(next.selectionRepositories)
+			? "Continue"
+			: state.error || state.uploadFailed
+				? "Retry upload"
+				: next.scanning
+					? "Review after scan"
+					: currentScreen === "review"
+						? "Confirm upload"
+						: "Review selection";
 	button("save-demo").hidden =
-		!screenById(currentScreen).manager || state.stage === "review";
+		!screenById(currentScreen).manager ||
+		state.stage === "review" ||
+		isUploadCompleteScreen(currentScreen);
 	button("edit-repos").hidden =
 		!state.stage ||
 		state.stage === "review" ||
+		isUploadCompleteScreen(currentScreen) ||
 		next.uploading ||
 		state.uploadFailed === true;
 	// The saved confirmation is derived from the current theme on every preview.
@@ -591,6 +597,19 @@ function updateManager(
 		closed = true;
 	} else if (result === "save") startDemoUpload();
 	else {
+		if (
+			manager.completion &&
+			!manager.uploadFailed &&
+			manager.stage === "upload"
+		) {
+			state.uploadSucceeded = true;
+			changeScreen(
+				manager.completion.kind === "setup" ? "saved-new" : "saved",
+				false,
+			);
+			showSavedConfirmation = false;
+			return;
+		}
 		if (manager.stage === "review" && currentScreen !== "review")
 			changeScreen("review", false);
 		else if (
@@ -632,7 +651,12 @@ function activateReview(action: "confirm" | "back" | "previous" | "next") {
 
 function saveDemo() {
 	handleManagerKey({
-		name: state.completion && state.uploadFailed ? "r" : "return",
+		name:
+			state.completion &&
+			state.uploadFailed &&
+			hasFailedUploadSessions(preview?.selectionRepositories ?? [])
+				? "r"
+				: "return",
 	});
 }
 
@@ -748,6 +772,8 @@ function syncScreen() {
 		screen.id === "error" ||
 		screen.id === "scan" ||
 		screen.id === "saving" ||
+		screen.id.startsWith("upload-skipped") ||
+		screen.id.startsWith("upload-partial") ||
 		isUploadCompleteScreen(screen.id);
 	element("terminal-help", HTMLParagraphElement).textContent =
 		screen.id === "scan"

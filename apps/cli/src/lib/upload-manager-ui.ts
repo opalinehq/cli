@@ -10,6 +10,7 @@ import {
 	getDesiredUploadState,
 	getPendingRepositories,
 	getTableRepositories,
+	hasFailedUploadSessions,
 	type UploadManagerState,
 } from "./upload-manager-state.js";
 import {
@@ -301,7 +302,49 @@ export function renderUploadManager(
 	if (state.stage === "upload" && (state.operation || state.uploadFailed)) {
 		// Pages count physical lines, so a long session ID or error can never
 		// push a failure off-screen. Repeat the repository on continued pages.
-		const capacity = Math.max(2, height - lines.length - 4);
+		const skipped = filtered.flatMap((repository) =>
+			(repository.sessionUploads ?? [])
+				.filter((detail) => detail.status === "skipped")
+				.map((detail) => ({ repository, detail })),
+		);
+		const limits = [
+			...new Set(
+				skipped.map(({ detail }) =>
+					number.format(
+						(detail.maxBytes ?? INGEST_AGGREGATE_CONTENT_MAX_BYTES) /
+							1024 /
+							1024,
+					),
+				),
+			),
+		].join(" / ");
+		const skipNotice = skipped.length
+			? wrapErrorMessage(
+					`${number.format(skipped.length)} skipped: above the ${limits} MiB limit. No upload attempted.`,
+					contentWidth - 1,
+				).map((line) => textLine(line))
+			: [];
+		const canRetry = hasFailedUploadSessions(filtered);
+		const actions = state.operation
+			? ""
+			: completion
+				? `Continue [Enter]${canRetry ? "  Retry failed [R]" : ""}`
+				: canRetry
+					? `Retry [Enter]   ${state.singleRun ? "Close" : "Go back"} [Esc]`
+					: "Close [Esc]";
+		const footer = [...skipNotice, textLine(actions, "strong")];
+		// Keep the explanation and actions outside the paged table. On short
+		// terminals, leave room for at least a repo header and a detail line.
+		if (height - lines.length - footer.length >= 4)
+			footer.unshift(
+				textLine(
+					state.message,
+					completion ? "success" : canRetry ? "danger" : "muted",
+				),
+			);
+		while (footer.length < 3) footer.unshift("");
+		if (height - lines.length - footer.length < 3) lines.splice(4, 2);
+		const capacity = Math.max(2, height - lines.length - footer.length - 1);
 		const pages: string[][] = [[]];
 		let page = pages[0] ?? [];
 		let activePage: number | undefined;
@@ -314,20 +357,6 @@ export function renderUploadManager(
 			if (active && activePage === undefined) activePage = pages.length - 1;
 			page.push(line);
 		};
-		if (completion?.kind === "sessions" && completion.dashboards.length > 1) {
-			const heading = textLine("Uploaded sessions", "strong");
-			append(heading, heading);
-			for (const dashboard of completion.dashboards) {
-				const label = clipLine(
-					dashboard.url.replace(/^https?:\/\//u, ""),
-					contentWidth,
-				);
-				append(
-					`${margin}\u001b]8;;${dashboard.url}\u0007${paint(label, "link")}\u001b]8;;\u0007`,
-					heading,
-				);
-			}
-		}
 		const repositoryHeader = (repository: UploadRepository) =>
 			rowLine(
 				`${repository.name}${repository.current ? " (current)" : ""}`,
@@ -403,11 +432,6 @@ export function renderUploadManager(
 				))
 					append(`${margin}    ${paint(line, "danger")}`, header);
 		};
-		const skipped = filtered.flatMap((repository) =>
-			(repository.sessionUploads ?? [])
-				.filter((detail) => detail.status === "skipped")
-				.map((detail) => ({ repository, detail })),
-		);
 		for (const repository of filtered) {
 			const details = repository.sessionUploads ?? [];
 			if (
@@ -426,18 +450,6 @@ export function renderUploadManager(
 				"strong",
 			);
 			append(heading, heading);
-			const limits = [
-				...new Set(
-					skipped.map(({ detail }) =>
-						number.format(
-							(detail.maxBytes ?? INGEST_AGGREGATE_CONTENT_MAX_BYTES) /
-								1024 /
-								1024,
-						),
-					),
-				),
-			].join(" / ");
-			const message = `Above the ${limits} MiB per-session limit. No upload attempted.`;
 			const reportErrors = [
 				...new Set(
 					skipped.flatMap(({ detail }) =>
@@ -445,11 +457,12 @@ export function renderUploadManager(
 					),
 				),
 			];
-			for (const line of wrapErrorMessage(
-				[message, ...reportErrors].join(" "),
-				contentWidth,
-			))
-				append(textLine(line), heading);
+			if (reportErrors.length)
+				for (const line of wrapErrorMessage(
+					reportErrors.join(" "),
+					contentWidth,
+				))
+					append(textLine(line), heading);
 			let previousRepository: UploadRepository | undefined;
 			for (const { repository, detail } of skipped) {
 				const header = repositoryHeader(repository);
@@ -469,45 +482,13 @@ export function renderUploadManager(
 			),
 		);
 		lines.push(...(pages[state.uploadPage] ?? []));
-		while (lines.length < height - 4) lines.push("");
-		const pageLabel =
+		while (lines.length < height - footer.length - 1) lines.push("");
+		lines.push(
 			pages.length > 1
 				? textLine(`‹ Page ${state.uploadPage + 1} of ${pages.length} ›`)
-				: divider;
-		if (completion) {
-			const url =
-				completion.kind === "setup"
-					? completion.url
-					: completion.dashboards[0]?.url;
-			const label =
-				completion.kind === "setup"
-					? cliMessage("continueSetup", {}, theme)
-					: url?.replace(/^https?:\/\//u, "");
-			lines.push(
-				pageLabel,
-				textLine(
-					`${state.message.length + 2 <= contentWidth ? "✓ " : ""}${state.message}`,
-					"success",
-				),
-				url && label
-					? `${margin}\u001b]8;;${url}\u0007${paint(clipLine(label, contentWidth), "link")}\u001b]8;;\u0007`
-					: "",
-				textLine("Continue [Enter]  Retry failed [R]", "strong"),
-			);
-		} else
-			lines.push(
-				divider,
-				pages.length > 1 ? pageLabel : "",
-				textLine(state.message, state.uploadFailed ? "danger" : "muted"),
-				state.uploadFailed && !state.operation
-					? textLine(
-							state.singleRun
-								? "Retry [Enter]   Close [Esc]"
-								: "Retry [Enter]   Go back [Esc]",
-							"strong",
-						)
-					: "",
-			);
+				: divider,
+			...footer,
+		);
 		return lines.join("\n");
 	}
 	const splitFooter = compact || (!!state.stage && contentWidth < 68);
@@ -735,7 +716,10 @@ export function renderUploadManager(
 		if (footerHeight >= 7) lines.push(textLine(identity), "");
 		if (footerHeight >= 9) lines.push("");
 		lines.push(
-			textLine(`✓ ${cliMessage("uploadSuccess", {}, theme)}`, "success"),
+			textLine(
+				`✓ ${repositories.some((repo) => (repo.uploadedCount ?? 0) > 0) ? cliMessage("uploadSuccess", {}, theme) : "Auto upload enabled"}`,
+				"success",
+			),
 		);
 		const links =
 			completion.kind === "setup"
