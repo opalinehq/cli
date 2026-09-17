@@ -12,6 +12,17 @@ interface Screen {
 }
 
 export const SCREENS: Screen[] = [
+	...(["new", "returning"] as const).map((user) => ({
+		id: `upload-partial-${user}`,
+		label: `Partial upload · ${user === "new" ? "New" : "Returning"} user`,
+		group: "Auto upload",
+		command: "opaline upload",
+		description:
+			"Uploaded sessions are ready. Continue with Enter, retry failures with R, or scroll through failure details.",
+		manager: true,
+		loading: false,
+		copy: [],
+	})),
 	{
 		id: "error",
 		label: "Upload error",

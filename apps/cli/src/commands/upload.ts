@@ -88,6 +88,9 @@ export async function runUpload(
 		let operation: ((signal: AbortSignal) => Promise<void>) | undefined;
 		let operationError: Error | undefined;
 		let hasPreviousUploads: boolean | undefined;
+		let uploadedThisRun = 0;
+		let skippedBeforeRun: number | undefined;
+		const uploadedWorkspaces = new Set<string | undefined>();
 		while (
 			(await promptUploadManager(repositories, state, scan, operation)) ===
 			"save"
@@ -184,17 +187,21 @@ export async function runUpload(
 								() => {},
 								signal,
 							);
+							uploadedThisRun += summary.succeeded;
+							skippedBeforeRun ??=
+								targets.reduce((count, repo) => count + repo.sessionCount, 0) -
+								summary.total;
 							state.message =
 								summary.failed + summary.skipped
-									? `${summary.succeeded} uploaded · ${summary.failed + summary.skipped} need attention.`
-									: cliMessage("uploadSummary", { count: summary.succeeded });
-							if (!summary.failed && !summary.skipped) {
-								const uploadedWorkspaces = new Set(
-									targets.map(
-										(repo) =>
-											repo.uploadedOrganizationId ?? repo.organizationId,
-									),
-								);
+									? `${uploadedThisRun} uploaded · ${summary.failed + summary.skipped} failed`
+									: cliMessage("uploadSummary", { count: uploadedThisRun });
+							state.uploadFailed = summary.failed + summary.skipped > 0;
+							if (uploadedThisRun > 0 || !state.uploadFailed) {
+								operationError = undefined;
+								for (const repo of targets)
+									uploadedWorkspaces.add(
+										repo.uploadedOrganizationId ?? repo.organizationId,
+									);
 								const completion = getUploadCompletion(
 									config.endpoint,
 									hasPreviousUploads ?? false,
@@ -204,13 +211,9 @@ export async function runUpload(
 								);
 								if (guided) {
 									await guided.complete({
-										uploaded: summary.succeeded,
-										skipped:
-											targets.reduce(
-												(count, repo) => count + repo.sessionCount,
-												0,
-											) - summary.total,
-										failed: 0,
+										uploaded: uploadedThisRun,
+										skipped: skippedBeforeRun,
+										failed: summary.failed + summary.skipped,
 									});
 									state.completion = guided.completionLink(completion);
 								} else state.completion = completion;
@@ -220,7 +223,6 @@ export async function runUpload(
 								state.uploadPage = 0;
 								if (guided) {
 									operationError = new Error(state.message);
-									await guided.close(operationError);
 								}
 							}
 						} else
@@ -245,6 +247,14 @@ export async function runUpload(
 			}
 		}
 		if (operationError) return operationError;
+		if (state.completion) {
+			p.log.success(state.message);
+			for (const url of state.completion.kind === "setup"
+				? [state.completion.url]
+				: state.completion.dashboards.map((dashboard) => dashboard.url))
+				p.log.info(url);
+			return;
+		}
 		p.outro(
 			getPendingRepositories(repositories, state).length
 				? cliMessage("discarded")
@@ -258,7 +268,7 @@ export async function runUpload(
 function getManagerUploadConfig(
 	guided?: GuidedUpload,
 ): UploadConfig | undefined {
-	const credentials = loadCredentials();
+	const credentials = guided?.credentials ?? loadCredentials();
 	if (!credentials) return undefined;
 	return {
 		endpoint: `${guided?.apiBase ?? getApiBaseOverride() ?? credentials.apiBaseUrl}/rpc`,

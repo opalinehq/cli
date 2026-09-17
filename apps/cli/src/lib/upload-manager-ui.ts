@@ -287,11 +287,7 @@ export function renderUploadManager(
 		),
 		divider,
 	);
-	if (
-		state.stage === "upload" &&
-		(state.operation || state.uploadFailed) &&
-		!completion
-	) {
+	if (state.stage === "upload" && (state.operation || state.uploadFailed)) {
 		// Pages count physical lines, so a long session ID or error can never
 		// push a failure off-screen. Repeat the repository on continued pages.
 		const capacity = Math.max(2, height - lines.length - 4);
@@ -307,6 +303,20 @@ export function renderUploadManager(
 			if (active && activePage === undefined) activePage = pages.length - 1;
 			page.push(line);
 		};
+		if (completion?.kind === "sessions" && completion.dashboards.length > 1) {
+			const heading = textLine("Uploaded sessions", "strong");
+			append(heading, heading);
+			for (const dashboard of completion.dashboards) {
+				const label = clipLine(
+					dashboard.url.replace(/^https?:\/\//u, ""),
+					contentWidth,
+				);
+				append(
+					`${margin}\u001b]8;;${dashboard.url}\u0007${paint(label, "link")}\u001b]8;;\u0007`,
+					heading,
+				);
+			}
+		}
 		for (const repository of filtered) {
 			const header = rowLine(
 				`${repository.name}${repository.current ? " (current)" : ""}`,
@@ -361,8 +371,11 @@ export function renderUploadManager(
 					header,
 					active,
 				);
-				if (detail.error)
-					for (const line of wrapErrorMessage(detail.error, available))
+				if (detail.error || detail.reportError)
+					for (const line of wrapErrorMessage(
+						[detail.error, detail.reportError].filter(Boolean).join(" "),
+						available,
+					))
 						append(
 							`${margin}    ${paint(line, detail.status === "failed" ? "danger" : "regular")}`,
 							header,
@@ -381,21 +394,41 @@ export function renderUploadManager(
 		);
 		lines.push(...(pages[state.uploadPage] ?? []));
 		while (lines.length < height - 4) lines.push("");
-		lines.push(
-			divider,
+		const pageLabel =
 			pages.length > 1
 				? textLine(`‹ Page ${state.uploadPage + 1} of ${pages.length} ›`)
-				: "",
-			textLine(state.message, state.uploadFailed ? "danger" : "muted"),
-			state.uploadFailed && !state.operation
-				? textLine(
-						state.singleRun
-							? "Close [Enter / Esc]"
-							: "Retry [Enter]   Go back [Esc]",
-						"strong",
-					)
-				: "",
-		);
+				: divider;
+		if (completion) {
+			const url =
+				completion.kind === "setup"
+					? completion.url
+					: completion.dashboards[0]?.url;
+			const label =
+				completion.kind === "setup"
+					? cliMessage("continueSetup", {}, theme)
+					: url?.replace(/^https?:\/\//u, "");
+			lines.push(
+				pageLabel,
+				textLine(`✓ ${state.message}`, "success"),
+				url && label
+					? `${margin}\u001b]8;;${url}\u0007${paint(clipLine(label, contentWidth), "link")}\u001b]8;;\u0007`
+					: "",
+				textLine("Continue [Enter]  Retry failed [R]", "strong"),
+			);
+		} else
+			lines.push(
+				divider,
+				pages.length > 1 ? pageLabel : "",
+				textLine(state.message, state.uploadFailed ? "danger" : "muted"),
+				state.uploadFailed && !state.operation
+					? textLine(
+							state.singleRun
+								? "Retry [Enter]   Close [Esc]"
+								: "Retry [Enter]   Go back [Esc]",
+							"strong",
+						)
+					: "",
+			);
 		return lines.join("\n");
 	}
 	const splitFooter = compact || (!!state.stage && contentWidth < 68);

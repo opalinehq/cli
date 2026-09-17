@@ -1,7 +1,7 @@
 import { runLogin } from "../commands/login.js";
 import type { connectBrowser } from "./cli-connection.js";
 import { getConnectionSelection } from "./cli-connection-selection.js";
-import { loadCredentials } from "./credentials.js";
+import { type Credentials, loadCredentials } from "./credentials.js";
 import type { UploadCompletion } from "./upload-completion.js";
 import {
 	getUploadAdapters,
@@ -20,8 +20,19 @@ export function createGuidedUpload(
 	},
 ) {
 	let finished = false;
+	let started = false;
+	let authorization:
+		| {
+				organizationId: string;
+				organizations: NonNullable<Credentials["organizations"]>;
+				credentials: Credentials;
+		  }
+		| undefined;
 	let hasPreviousUploads = false;
 	return {
+		get credentials() {
+			return authorization?.credentials;
+		},
 		get hasPreviousUploads() {
 			return hasPreviousUploads;
 		},
@@ -31,6 +42,7 @@ export function createGuidedUpload(
 			repositories: UploadRepository[],
 			state: UploadManagerState,
 		) {
+			if (authorization) return authorization;
 			await connection.update({
 				kind: "selection",
 				repositories: getConnectionSelection(
@@ -68,16 +80,21 @@ export function createGuidedUpload(
 					"The workspace approved in your browser is unavailable. Start setup again.",
 				);
 			await connection.update({ kind: "bind", organizationId }, credentials);
-			return { organizationId, organizations, credentials };
+			authorization = { organizationId, organizations, credentials };
+			return authorization;
 		},
 		async start() {
+			if (started || finished) return;
 			await connection.update({ kind: "status", state: "uploading" });
+			started = true;
 		},
 		async complete(totals: {
 			uploaded: number;
 			skipped: number;
 			failed: number;
 		}) {
+			// A retry uses the same approved workspace; the original pairing is terminal.
+			if (finished) return;
 			await connection.update({
 				kind: "status",
 				state: "completed",

@@ -367,7 +367,7 @@ describe("built CLI against an old-API ingest stub", () => {
 			expect(result.stderr).toContain(
 				"Network error while contacting Opaline API",
 			);
-			expect(result.stderr).toContain("opaline upload --retry");
+			expect(result.stderr).toContain("opaline upload");
 			expect(containsAnyCanary(result.stderr, CLAUDE_SECRETS)).toBe(false);
 			// The 1s + 2s backoff between the three attempts puts a hard floor on
 			// the wall clock; a non-retrying run fails in well under a second.

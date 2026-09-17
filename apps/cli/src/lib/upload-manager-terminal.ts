@@ -59,8 +59,7 @@ export function promptUploadManager(
 		const render = () => {
 			if (finished) return;
 			const enableMouse =
-				state.stage === "review" &&
-				!state.operation &&
+				(state.stage === "review" || state.stage === "upload") &&
 				!state.scan &&
 				!state.error;
 			if (enableMouse !== mouseEnabled) {
@@ -122,7 +121,16 @@ export function promptUploadManager(
 				);
 				if (!match) break;
 				mouseInput = mouseInput.slice(start + 3 + match[0].length);
-				if (match[1] === "0" && match[4] === "M") {
+				if ((match[1] === "64" || match[1] === "65") && match[4] === "M") {
+					applyUploadKey(repositories, state, {
+						name: match[1] === "64" ? "pageup" : "pagedown",
+					});
+					render();
+				} else if (
+					match[1] === "0" &&
+					match[4] === "M" &&
+					state.stage === "review"
+				) {
 					const column = Number(match[2]) - 1;
 					const line = Number(match[3]) - 1;
 					const control = state.reviewControls?.find(

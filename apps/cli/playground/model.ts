@@ -40,6 +40,7 @@ export interface DemoState {
 	uploadPage?: number;
 	uploadPageCount?: number;
 	uploadFailed?: boolean;
+	completion?: UploadManagerState["completion"];
 	followUpload?: boolean;
 }
 
@@ -148,6 +149,7 @@ export function createPreview(value: unknown): PreviewResponse {
 			screen.id === "review"
 				? "review"
 				: screen.id === "saving" ||
+						screen.id.startsWith("upload-partial") ||
 						screen.id === "upload-failures" ||
 						isUploadCompleteScreen(screen.id)
 					? "upload"
@@ -246,7 +248,10 @@ export function createPreview(value: unknown): PreviewResponse {
 		}
 		uploadSucceeded = progress === 100 && targets.length > 0;
 	}
-	if (screen.id === "upload-failures") {
+	if (
+		screen.id === "upload-failures" ||
+		screen.id.startsWith("upload-partial")
+	) {
 		state.uploadFailed = true;
 		const failedRepositories = repositories
 			.filter(
@@ -254,6 +259,14 @@ export function createPreview(value: unknown): PreviewResponse {
 			)
 			.slice(0, 2);
 		state.message = `${failedRepositories.length} sessions need attention.`;
+		if (screen.id.startsWith("upload-partial")) {
+			state.message = `12 uploaded · ${failedRepositories.length} failed`;
+			state.completion = getUploadCompletion(
+				"https://opaline.so/rpc",
+				screen.id !== "upload-partial-new",
+				[{ id: "sample-workspace", slug: "acme" }],
+			);
+		}
 		for (const [index, repo] of failedRepositories.entries()) {
 			repo.upload = {
 				active: false,
@@ -364,6 +377,7 @@ export function createPreview(value: unknown): PreviewResponse {
 			uploadPage: state.uploadPage,
 			uploadPageCount: state.uploadPageCount,
 			uploadFailed: state.uploadFailed,
+			completion: state.completion,
 			followUpload: state.followUpload,
 			uploaded,
 			uploadStart,

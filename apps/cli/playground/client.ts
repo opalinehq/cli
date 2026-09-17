@@ -226,6 +226,17 @@ function bindControls() {
 			})
 			.catch(showError);
 	});
+	terminal.addEventListener(
+		"wheel",
+		(event) => {
+			if (closed || state.stage !== "upload") return;
+			event.preventDefault();
+			interact(() =>
+				handleManagerKey({ name: event.deltaY > 0 ? "pagedown" : "pageup" }),
+			);
+		},
+		{ passive: false },
+	);
 	terminal.addEventListener("keydown", (event) => {
 		if (closed) return;
 		if (["Shift", "Control", "Alt", "Meta"].includes(event.key)) return;
@@ -413,7 +424,10 @@ async function refreshPreview() {
 	button("save-demo").hidden =
 		!screenById(currentScreen).manager || state.stage === "review";
 	button("edit-repos").hidden =
-		!state.stage || state.stage === "review" || next.uploading;
+		!state.stage ||
+		state.stage === "review" ||
+		next.uploading ||
+		state.uploadFailed === true;
 	// The saved confirmation is derived from the current theme on every preview.
 	if (isUploadCompleteScreen(currentScreen) && showSavedConfirmation)
 		state.message = "";
@@ -617,7 +631,9 @@ function activateReview(action: "confirm" | "back" | "previous" | "next") {
 }
 
 function saveDemo() {
-	handleManagerKey({ name: "return" });
+	handleManagerKey({
+		name: state.completion && state.uploadFailed ? "r" : "return",
+	});
 }
 
 function editSelection() {
@@ -741,7 +757,9 @@ function syncScreen() {
 					? "Upload counts update in the table."
 					: screen.id === "review"
 						? "Review your selection, then confirm or go back to edit. ←→ or Tab selects an action; ↑↓ or Page Up/Down changes pages when needed."
-						: "Click a repo to toggle. Enter reviews selected repos before saving or uploading."
+						: state.stage === "upload"
+							? "Scroll or use arrow keys to page through session details."
+							: "Click a repo to toggle. Enter reviews selected repos before saving or uploading."
 				: screen.id === "destination"
 					? "↑↓ select an organization · Enter continue · Esc back."
 					: "Enter continues the sample flow. Use the screen menu to jump anywhere.";

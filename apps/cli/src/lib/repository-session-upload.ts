@@ -4,7 +4,12 @@ import {
 	CliSessionUploadStatusOutputSchema,
 	parseSafeApiEndpoint,
 } from "../contracts/index.js";
+import {
+	type UploadFailure,
+	UploadFailureSchema,
+} from "../contracts/upload-failure.js";
 import { type GitInfo, getAdapter } from "../internal/agent-adapters/index.js";
+import { filterKnownSecrets } from "../internal/secret-filter/index.js";
 import { createApiClient } from "./api-client.js";
 import { type BatchUploadSummary, batchUpload } from "./batch-upload.js";
 import { getGitInfo } from "./git-info.js";
@@ -156,6 +161,11 @@ export async function uploadRepositorySessions(
 			repository,
 		}));
 	});
+	const reports: Array<{
+		organizationId: string;
+		failure: UploadFailure;
+		detail: SessionUploadDetail;
+	}> = [];
 	const active = new Map<string, number>();
 	const git = new Map<string, Promise<GitInfo>>();
 	onUpdate();
@@ -175,6 +185,7 @@ export async function uploadRepositorySessions(
 				totalBytes: undefined,
 			};
 			repository.sessionUploads?.push(detail);
+			let failureMetadata: Partial<UploadFailure> = {};
 			let previousBytes = 0;
 			let transferStage: "preparing" | "uploading" | "processing" = "preparing";
 			active.set(repository.key, (active.get(repository.key) ?? 0) + 1);
@@ -191,6 +202,14 @@ export async function uploadRepositorySessions(
 					gitInfo: await gitInfo,
 					uploadMode: "manual",
 				});
+				const metadata = request.metadata;
+				failureMetadata = {
+					gitRemote: metadata.gitRemote,
+					gitBranch: metadata.gitBranch,
+					gitSha: metadata.gitSha,
+					packageName: metadata.packageName,
+					cliVersion: metadata.cli_version,
+				};
 				signal.throwIfAborted();
 				const result = await uploadSession(request, {
 					...config,
@@ -234,6 +253,14 @@ export async function uploadRepositorySessions(
 						repository.upload.completed = repository.uploadedCount;
 				} else {
 					detail.status = "failed";
+					detail.totalBytes ??= result.totalBytes;
+					if (result.attempts === 0) detail.uploadedBytes ??= 0;
+					failureMetadata = {
+						...failureMetadata,
+						maxBytes: result.maxBytes,
+						attempts: result.attempts ?? 0,
+						retryable: result.retryable ?? true,
+					};
 					detail.failureStage = transferStage;
 					detail.error =
 						result.error ?? "Upload failed without an error message.";
@@ -252,6 +279,38 @@ export async function uploadRepositorySessions(
 				}
 				throw error;
 			} finally {
+				if (
+					detail.status === "failed" &&
+					item.organizationId &&
+					!signal.aborted
+				) {
+					const failure = UploadFailureSchema.safeParse({
+						repository: repository.name.slice(0, 200),
+						projectPath: item.projectPath.slice(0, 200),
+						sessionId: item.sessionId,
+						source: item.source,
+						sessionDate:
+							item.sessionDate === undefined
+								? null
+								: new Date(item.sessionDate).toISOString(),
+						totalBytes: detail.totalBytes ?? null,
+						uploadedBytes: detail.uploadedBytes ?? null,
+						stage: transferStage,
+						error: detail.error?.slice(0, 4000),
+						attempts: 0,
+						retryable: true,
+						...failureMetadata,
+					});
+					if (failure.success)
+						reports.push({
+							organizationId: item.organizationId,
+							failure: failure.data,
+							detail,
+						});
+					else
+						detail.reportError =
+							"Failure details could not be saved to the dashboard.";
+				}
 				active.set(repository.key, (active.get(repository.key) ?? 1) - 1);
 				if (repository.upload)
 					repository.upload.active = (active.get(repository.key) ?? 0) > 0;
@@ -269,7 +328,7 @@ export async function uploadRepositorySessions(
 		if (repository.upload) repository.upload.failed = remaining.length;
 		if (remaining.length && !repository.uploadError)
 			repository.uploadError =
-				"Upload paused after the rate limit. Press Enter to retry remaining sessions.";
+				"Upload paused after the rate limit. Retry remaining sessions when the limit resets.";
 		for (const item of remaining) {
 			if (
 				repository.sessionUploads?.some(
@@ -279,7 +338,7 @@ export async function uploadRepositorySessions(
 				)
 			)
 				continue;
-			repository.sessionUploads?.push({
+			const detail: SessionUploadDetail = {
 				sessionId: item.sessionId,
 				source: item.source,
 				sessionDate: item.sessionDate,
@@ -288,9 +347,76 @@ export async function uploadRepositorySessions(
 				totalBytes: undefined,
 				error:
 					"Not attempted: upload paused after the server rate limit. Retry later.",
-			});
+			};
+			repository.sessionUploads?.push(detail);
+			if (item.organizationId)
+				reports.push({
+					organizationId: item.organizationId,
+					detail,
+					failure: {
+						sessionId: item.sessionId,
+						source: item.source,
+						repository: repository.name.slice(0, 200),
+						projectPath: item.projectPath.slice(0, 200),
+						sessionDate:
+							item.sessionDate === undefined
+								? null
+								: new Date(item.sessionDate).toISOString(),
+						totalBytes: null,
+						uploadedBytes: 0,
+						stage: "preparing",
+						error: detail.error ?? "Upload deferred",
+						attempts: 0,
+						retryable: true,
+					},
+				});
 		}
 	}
+	await reportFailures(reports, config, signal);
 	onUpdate();
 	return summary;
+}
+
+async function reportFailures(
+	reports: Array<{
+		organizationId: string;
+		failure: UploadFailure;
+		detail: SessionUploadDetail;
+	}>,
+	config: UploadConfig,
+	signal: AbortSignal,
+): Promise<void> {
+	const client = createApiClient({
+		apiBaseUrl: config.endpoint.replace(/\/rpc\/?$/u, ""),
+		token: config.token,
+		authType: config.authType,
+	});
+	for (const organizationId of new Set(
+		reports.map((report) => report.organizationId),
+	)) {
+		const group = reports.filter(
+			(report) => report.organizationId === organizationId,
+		);
+		for (let offset = 0; offset < group.length; offset += 64) {
+			signal.throwIfAborted();
+			const batch = group.slice(offset, offset + 64);
+			try {
+				const failures = batch.map((report) =>
+					UploadFailureSchema.parse(
+						JSON.parse(filterKnownSecrets(JSON.stringify(report.failure)).text),
+					),
+				);
+				await client.cli.reportUploadFailures(
+					{ organizationId, failures },
+					{ signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]) },
+				);
+			} catch {
+				signal.throwIfAborted();
+				for (const report of reports)
+					report.detail.reportError =
+						"Failure details could not be saved to the dashboard. They remain available in this terminal.";
+				return;
+			}
+		}
+	}
 }

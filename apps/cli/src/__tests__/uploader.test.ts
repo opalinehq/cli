@@ -50,7 +50,7 @@ describe("formatUploadError", () => {
 		});
 
 		expect(formatUploadError(error)).toBe(
-			"Rate limit reached (500 sessions per 60 min). Wait and retry with: opaline upload --retry",
+			"Rate limit reached (500 sessions per 60 min). Wait and retry with: opaline upload",
 		);
 	});
 
@@ -64,7 +64,7 @@ describe("formatUploadError", () => {
 		});
 
 		expect(formatUploadError(error)).toBe(
-			"Ingest request limit reached (15000 requests per 60 min). Wait and retry with: opaline upload --retry",
+			"Ingest request limit reached (15000 requests per 60 min). Wait and retry with: opaline upload",
 		);
 	});
 
@@ -78,7 +78,7 @@ describe("formatUploadError", () => {
 		});
 
 		expect(formatUploadError(error)).toBe(
-			"Ingest byte limit reached (10240.00 MiB per 60 min). Wait and retry with: opaline upload --retry",
+			"Ingest byte limit reached (10240.00 MiB per 60 min). Wait and retry with: opaline upload",
 		);
 	});
 
@@ -136,7 +136,7 @@ describe("formatUploadError", () => {
 		});
 
 		expect(formatUploadError(error)).toBe(
-			"Upload request is too large (413 Payload Too Large). Request body too large. Maximum size is 500 MB. This is a request-size limit, not an auth or proxy issue. This session will keep failing until its transcript/subagent payload is smaller; other failed sessions can still be retried with: opaline upload --retry",
+			"Upload request is too large (413 Payload Too Large). Request body too large. Maximum size is 500 MB. This is a request-size limit, not an auth or proxy issue. This session will keep failing until its transcript/subagent payload is smaller; other failed sessions can still be retried with: opaline upload",
 		);
 	});
 
@@ -158,7 +158,7 @@ describe("formatUploadError", () => {
 		const error = new ORPCError("BAD_GATEWAY");
 
 		expect(formatUploadError(error)).toBe(
-			"Temporary Opaline server/proxy error (502 Bad Gateway). The CLI retries these automatically; retry remaining failed uploads with: opaline upload --retry",
+			"Temporary Opaline server/proxy error (502 Bad Gateway). The CLI retries these automatically; retry remaining failed uploads with: opaline upload",
 		);
 	});
 
@@ -166,7 +166,7 @@ describe("formatUploadError", () => {
 		const error = new ORPCError("INTERNAL_SERVER_ERROR");
 
 		expect(formatUploadError(error)).toBe(
-			"Opaline server error (500 Internal Server Error). This is not an auth problem. Retry later with: opaline upload --retry; if it repeats, share this status with the Opaline team.",
+			"Opaline server error (500 Internal Server Error). This is not an auth problem. Retry later with: opaline upload; if it repeats, share this status with the Opaline team.",
 		);
 	});
 
@@ -174,7 +174,7 @@ describe("formatUploadError", () => {
 		const error = new TypeError("fetch failed");
 
 		expect(formatUploadError(error)).toBe(
-			"Network error while contacting Opaline API: fetch failed. Check your connection and retry with: opaline upload --retry",
+			"Network error while contacting Opaline API: fetch failed. Check your connection and retry with: opaline upload",
 		);
 	});
 });
@@ -226,6 +226,8 @@ describe("uploadSession aggregate size guard", () => {
 		);
 
 		expect(result).toEqual({
+			totalBytes: 2 * 1024 * 1024,
+			maxBytes: 1024 * 1024,
 			success: false,
 			error:
 				"Session transcript payload is 2.00 MiB, above the 1.00 MiB per-session limit. Reduce the transcript/subagent payload before retrying.",

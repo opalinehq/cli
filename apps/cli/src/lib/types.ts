@@ -28,6 +28,8 @@ export interface UploadTransferProgress {
 
 export interface UploadResult {
 	success: boolean;
+	totalBytes?: number;
+	maxBytes?: number;
 	status?: number;
 	error?: string;
 	attempts?: number;

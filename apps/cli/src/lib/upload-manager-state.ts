@@ -15,7 +15,7 @@ export interface ReviewControl {
 }
 
 export interface UploadManagerState {
-	// A browser pairing has one immutable confirmed selection and upload run.
+	// Browser pairing locks the confirmed selection, including retries.
 	singleRun?: boolean;
 	query: string;
 	// Zero selects the pinned All repos row; repository indices start at one.
@@ -76,11 +76,20 @@ export function applyUploadKey(
 		}
 		return "ignored";
 	}
-	if (state.singleRun && state.stage === "upload" && !state.operation) {
+	if (
+		state.singleRun &&
+		state.stage === "upload" &&
+		!state.operation &&
+		!state.uploadFailed
+	) {
 		if (cancel || key.name === "return") return "cancel";
-		if (!state.uploadFailed) return "ignored";
+		return "ignored";
 	}
 	if (cancel) {
+		if (state.singleRun && state.stage === "upload" && !state.operation)
+			return "cancel";
+		if (state.stage === "upload" && state.completion && !state.operation)
+			return "cancel";
 		if (
 			key.name === "escape" &&
 			state.stage &&
@@ -94,6 +103,10 @@ export function applyUploadKey(
 	}
 	if (state.scan) return "ignored";
 	if (state.stage === "upload" && (state.operation || state.uploadFailed)) {
+		if (!state.operation && state.completion) {
+			if (key.name === "return") return "cancel";
+			if (key.name === "r") return "save";
+		}
 		if (["up", "down", "pageup", "pagedown"].includes(key.name)) {
 			state.followUpload = false;
 			state.uploadPage = Math.max(

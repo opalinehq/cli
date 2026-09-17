@@ -100,7 +100,8 @@ test("failed session IDs and full reasons remain accessible on small terminal pa
 	expect(applyUploadKey([repo], state, { name: "up" })).toBe("changed");
 	expect(applyUploadKey([repo], state, { name: "return" })).toBe("save");
 	state.singleRun = true;
-	expect(applyUploadKey([repo], state, { name: "return" })).toBe("cancel");
+	expect(applyUploadKey([repo], state, { name: "return" })).toBe("save");
+	expect(applyUploadKey([repo], state, { name: "escape" })).toBe("cancel");
 });
 
 test("scan distinguishes local discovery from upload-history checks", () => {
@@ -128,6 +129,58 @@ test("scan distinguishes local discovery from upload-history checks", () => {
 			renderUploadManager([uploadFixture()], state, 120, 24),
 		),
 	).toContain("Checking uploads (1)");
+});
+
+test("partial success keeps failure pages, continuation links and explicit retry without row selection", () => {
+	for (const singleRun of [true, false]) {
+		for (const completion of [
+			{ kind: "setup", url: "https://opaline.so/welcome?connect=test" },
+			{
+				kind: "sessions",
+				dashboards: [
+					{ organizationId: "acme", url: "https://opaline.so/acme/sessions" },
+				],
+			},
+		] satisfies NonNullable<UploadManagerState["completion"]>[]) {
+			const repo = uploadFixture();
+			repo.upload = { active: false, completed: 2, total: 10, failed: 1 };
+			repo.sessionUploads = repo.sessionUploads?.filter(
+				(detail) => detail.status === "failed",
+			);
+			const state: UploadManagerState = {
+				singleRun,
+				completion,
+				query: "",
+				cursor: 0,
+				desired: new Map(),
+				message: "2 uploaded · 1 failed",
+				stage: "upload",
+				uploadFailed: true,
+			};
+			for (const [width, height] of [
+				[38, 13],
+				[120, 30],
+			]) {
+				const screen = renderUploadManager([repo], state, width, height);
+				expect(screen).toContain("Continue [Enter]");
+				expect(screen).toContain("Retry failed [R]");
+				expect(screen).toContain(
+					completion.kind === "setup"
+						? completion.url
+						: (completion.dashboards[0]?.url ?? "missing"),
+				);
+				expect(screen.split("\n").length).toBeLessThan(height);
+				expect(screen).not.toMatch(/Space|toggle|move/);
+			}
+			expect(applyUploadKey([repo], state, { name: "down" })).toBe("changed");
+			expect(state.cursor).toBe(0);
+			expect(state.followUpload).toBe(false);
+			expect(applyUploadKey([repo], state, { name: "space" })).toBe("ignored");
+			expect(applyUploadKey([repo], state, { name: "r" })).toBe("save");
+			expect(applyUploadKey([repo], state, { name: "return" })).toBe("cancel");
+			expect(applyUploadKey([repo], state, { name: "escape" })).toBe("cancel");
+		}
+	}
 });
 
 function uploadFixture(): UploadRepository {

@@ -9,6 +9,7 @@ export interface SessionUploadDetail {
 	uploadedBytes: number | undefined;
 	totalBytes: number | undefined;
 	error?: string;
+	reportError?: string;
 	failureStage?: "preparing" | "uploading" | "processing";
 	attempt?: number;
 	maxAttempts?: number;

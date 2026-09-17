@@ -190,13 +190,13 @@ export function formatUploadError(error: unknown): string {
 					? ` (${limit} per ${Math.round(data.windowSeconds / 60)} min)`
 					: "";
 			const kind = isRequestLimit ? "request" : "byte";
-			return `Ingest ${kind} limit reached${detail}. Wait and retry with: opaline upload --retry`;
+			return `Ingest ${kind} limit reached${detail}. Wait and retry with: opaline upload`;
 		}
 		const windowMin = data?.windowSeconds
 			? Math.round(data.windowSeconds / 60)
 			: 60;
 		const limit = data?.limit ?? "unknown";
-		return `Rate limit reached (${limit} sessions per ${windowMin} min). Wait and retry with: opaline upload --retry`;
+		return `Rate limit reached (${limit} sessions per ${windowMin} min). Wait and retry with: opaline upload`;
 	}
 	if (
 		error instanceof ORPCError &&
@@ -245,23 +245,23 @@ export function formatUploadError(error: unknown): string {
 		return `${error.status} ${error.message}`;
 	}
 	const message = error instanceof Error ? error.message : "connection failed";
-	return `Network error while contacting Opaline API: ${message}. Check your connection and retry with: opaline upload --retry`;
+	return `Network error while contacting Opaline API: ${message}. Check your connection and retry with: opaline upload`;
 }
 
 function formatPayloadTooLargeError(error: ORPCError<string, unknown>): string {
 	const status = `${error.status} ${error.message}`;
 	const detail = getPayloadTooLargeDetail(error);
 	const detailText = detail ? ` ${detail}` : "";
-	return `Upload request is too large (${status}).${detailText} This is a request-size limit, not an auth or proxy issue. This session will keep failing until its transcript/subagent payload is smaller; other failed sessions can still be retried with: opaline upload --retry`;
+	return `Upload request is too large (${status}).${detailText} This is a request-size limit, not an auth or proxy issue. This session will keep failing until its transcript/subagent payload is smaller; other failed sessions can still be retried with: opaline upload`;
 }
 
 function formatServerUploadError(error: ORPCError<string, unknown>): string {
 	const status = `${error.status} ${error.message}`;
 	if (RETRYABLE_STATUS_CODES.has(error.status)) {
-		return `Temporary Opaline server/proxy error (${status}). The CLI retries these automatically; retry remaining failed uploads with: opaline upload --retry`;
+		return `Temporary Opaline server/proxy error (${status}). The CLI retries these automatically; retry remaining failed uploads with: opaline upload`;
 	}
 
-	return `Opaline server error (${status}). This is not an auth problem. Retry later with: opaline upload --retry; if it repeats, share this status with the Opaline team.`;
+	return `Opaline server error (${status}). This is not an auth problem. Retry later with: opaline upload; if it repeats, share this status with the Opaline team.`;
 }
 
 function getPayloadTooLargeDetail(
@@ -402,6 +402,8 @@ export async function uploadSession(
 			}
 			if (r2Result.status === "too-large") {
 				return {
+					totalBytes: r2Result.actualBytes,
+					maxBytes: r2Result.maxBytes,
 					success: false,
 					error: formatTranscriptTooLargeError(
 						r2Result.actualBytes,
@@ -458,6 +460,8 @@ export async function uploadSession(
 	}
 	if (legacy.status === "legacy-too-large") {
 		return {
+			totalBytes: legacy.actualBytes,
+			maxBytes: legacy.maxBytes,
 			success: false,
 			error: formatLegacyServerTooLargeError(
 				legacy.actualBytes,
@@ -469,6 +473,8 @@ export async function uploadSession(
 	}
 	if (legacy.status === "too-large") {
 		return {
+			totalBytes: legacy.actualBytes,
+			maxBytes: legacy.maxBytes,
 			success: false,
 			error: formatTranscriptTooLargeError(legacy.actualBytes, legacy.maxBytes),
 			attempts: 0,
@@ -772,7 +778,7 @@ function isIngestSessionResponse(
 }
 
 function formatUnrecognizedResponseError(): string {
-	return "Opaline API returned an unrecognized response instead of an ingest confirmation, so this upload cannot be verified and was treated as failed. This usually means a proxy, SSO gateway, or wrong endpoint URL answered instead of the Opaline API. Check the endpoint and retry with: opaline upload --retry";
+	return "Opaline API returned an unrecognized response instead of an ingest confirmation, so this upload cannot be verified and was treated as failed. This usually means a proxy, SSO gateway, or wrong endpoint URL answered instead of the Opaline API. Check the endpoint and retry with: opaline upload";
 }
 
 function getUploadAggregateBytes(request: IngestSessionInput): number {
