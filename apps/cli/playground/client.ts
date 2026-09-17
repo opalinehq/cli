@@ -30,7 +30,7 @@ const PLAYBACK = {
 	screen: 1800,
 	scan: 2400,
 	login: 2600,
-	saving: 1200,
+	saving: 30_000,
 };
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 const terminal = element("terminal", HTMLDivElement);
