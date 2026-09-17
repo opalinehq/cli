@@ -484,7 +484,7 @@ function redrawTerminal(replay = false) {
 		const row = lines[repo.line];
 		if (!row) continue;
 		row.dataset.repository = repo.key;
-		if (state.stage === "review") continue;
+		if (state.stage) continue;
 		const action = document.createElement("button");
 		action.type = "button";
 		action.tabIndex = -1;
@@ -757,7 +757,9 @@ function syncScreen() {
 					? "Upload counts update in the table."
 					: screen.id === "review"
 						? "Review your selection, then confirm or go back to edit. ←→ or Tab selects an action; ↑↓ or Page Up/Down changes pages when needed."
-						: state.stage === "upload"
+						: screen.id.startsWith("upload-partial") ||
+								screen.id === "upload-failures" ||
+								isUploadCompleteScreen(screen.id)
 							? "Scroll or use arrow keys to page through session details."
 							: "Click a repo to toggle. Enter reviews selected repos before saving or uploading."
 				: screen.id === "destination"

@@ -21,6 +21,10 @@ test("upload playback advances existing counts, preserves OFF repositories and k
 	const active = "github.com/team/ios-app";
 	const start = createPreview({ ...fixture, screen: "saving", progress: 0 });
 	expect(start.uploading).toBe(true);
+	expect(stripVTControlCharacters(start.ansi).replace(/\s+/g, " ")).toContain(
+		"0 B / —",
+	);
+	expect(stripVTControlCharacters(start.ansi)).toContain("Queued");
 	expect(start.state.uploadKeys).toContain(active);
 	expect(start.state.uploadKeys).not.toContain(off);
 	const partial = createPreview({

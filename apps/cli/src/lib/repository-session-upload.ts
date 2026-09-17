@@ -159,12 +159,24 @@ export async function uploadRepositorySessions(
 			active: false,
 			failed: 0,
 		};
-		return sessions.map((session) => ({
-			...session,
-			organizationId: repository.uploadedOrganizationId,
-			label: `${repository.name}/${session.sessionId}`,
-			repository,
-		}));
+		return sessions.map((session) => {
+			const detail: SessionUploadDetail = {
+				sessionId: session.sessionId,
+				source: session.source,
+				sessionDate: session.sessionDate,
+				status: "queued",
+				uploadedBytes: 0,
+				totalBytes: undefined,
+			};
+			repository.sessionUploads?.push(detail);
+			return {
+				...session,
+				organizationId: repository.uploadedOrganizationId,
+				label: `${repository.name}/${session.sessionId}`,
+				repository,
+				detail,
+			};
+		});
 	});
 	const reports: Array<{
 		organizationId: string;
@@ -180,16 +192,8 @@ export async function uploadRepositorySessions(
 		signal,
 		upload: async (item, onRetry) => {
 			signal.throwIfAborted();
-			const { repository } = item;
-			const detail: SessionUploadDetail = {
-				sessionId: item.sessionId,
-				source: item.source,
-				sessionDate: item.sessionDate,
-				status: "preparing",
-				uploadedBytes: undefined,
-				totalBytes: undefined,
-			};
-			repository.sessionUploads?.push(detail);
+			const { repository, detail } = item;
+			detail.status = "preparing";
 			let failureMetadata: Partial<UploadFailure> = {};
 			let previousBytes = 0;
 			let transferStage: "preparing" | "uploading" | "processing" = "preparing";
@@ -266,9 +270,9 @@ export async function uploadRepositorySessions(
 					});
 				}
 				if (result.success) {
-					repository.sessionUploads = repository.sessionUploads?.filter(
-						(session) => session !== detail,
-					);
+					detail.status = "uploaded";
+					detail.error = undefined;
+					detail.uploadedBytes = detail.totalBytes;
 					repository.uploadedSessionIds?.add(item.sessionId);
 					repository.uploadedCount = (repository.uploadedCount ?? 0) + 1;
 					if (repository.upload)
@@ -279,6 +283,7 @@ export async function uploadRepositorySessions(
 							? "skipped"
 							: "failed";
 					detail.totalBytes ??= result.totalBytes;
+					detail.maxBytes = result.maxBytes;
 					if (result.attempts === 0) detail.uploadedBytes ??= 0;
 					failureMetadata = {
 						...failureMetadata,
@@ -355,25 +360,11 @@ export async function uploadRepositorySessions(
 			repository.uploadError =
 				"Upload paused after the rate limit. Retry remaining sessions when the limit resets.";
 		for (const item of remaining) {
-			if (
-				repository.sessionUploads?.some(
-					(detail) =>
-						detail.sessionId === item.sessionId &&
-						detail.source === item.source,
-				)
-			)
-				continue;
-			const detail: SessionUploadDetail = {
-				sessionId: item.sessionId,
-				source: item.source,
-				sessionDate: item.sessionDate,
-				status: "failed",
-				uploadedBytes: undefined,
-				totalBytes: undefined,
-				error:
-					"Not attempted: upload paused after the server rate limit. Retry later.",
-			};
-			repository.sessionUploads?.push(detail);
+			const { detail } = item;
+			if (detail.status !== "queued") continue;
+			detail.status = "failed";
+			detail.error =
+				"Not attempted: upload paused after the server rate limit. Retry later.";
 			if (item.organizationId)
 				reports.push({
 					organizationId: item.organizationId,

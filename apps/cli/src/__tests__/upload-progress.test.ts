@@ -9,6 +9,7 @@ import { renderUploadManager } from "../lib/upload-manager-ui.js";
 import {
 	formatUploadBytes,
 	recordUploadBytes,
+	type SessionUploadDetail,
 	type UploadSpeed,
 	uploadBytesPerSecond,
 } from "../lib/upload-progress.js";
@@ -38,7 +39,7 @@ test("active uploads show dated session IDs, bytes and explicit failures without
 	const ansi = renderUploadManager([repo], state, 120, 35);
 	const text = stripVTControlCharacters(ansi);
 	expect(text).toContain("2026-09-17 · session-uploading");
-	expect(text).toContain("1.2 MB / 4.0 MB");
+	expect(text.replace(/\s+/g, " ")).toContain("1.2 MB / 4.0 MB");
 	expect(text).toContain("Processing on server");
 	expect(text).toContain("✗ Failed");
 	expect(text).toContain("503 Service unavailable");
@@ -134,10 +135,132 @@ test("oversized sessions show a skip reason and zero transferred bytes", () => {
 			35,
 		),
 	);
-	expect(text).toContain("— Skipped · size limit");
-	expect(text).toContain("0 B / 157.3 MB");
+	expect(text).toContain("Skipped · size limit (1)");
+	expect(text.replace(/\s+/g, " ")).toContain("0 B / 157.3 MB");
 	expect(text.replace(/\s+/g, " ")).toContain("No upload attempted.");
 	expect(text).not.toContain("Preparation failed");
+});
+
+test("size-limit skips across repositories share one explanation and retain every session", () => {
+	const repositories = [
+		uploadFixture(),
+		{ ...uploadFixture(), key: "second", name: "second" },
+	];
+	for (const [index, repo] of repositories.entries()) {
+		repo.sessionUploads = Array.from({ length: 3 }, (_, session) => ({
+			sessionId: `skipped-${index}-${session}`,
+			source: "codex",
+			sessionDate: Date.parse("2026-09-17"),
+			status: "skipped",
+			uploadedBytes: 0,
+			totalBytes: 150 * 1024 * 1024,
+			maxBytes: 128 * 1024 * 1024,
+			error: "Duplicated individual size explanation",
+			reportError: "Could not save diagnostics.",
+		}));
+	}
+	for (const [columns, rows] of [
+		[38, 13],
+		[120, 45],
+	]) {
+		const state: UploadManagerState = {
+			query: "",
+			cursor: 0,
+			desired: new Map(),
+			message: "",
+			stage: "upload",
+			uploadFailed: true,
+			followUpload: false,
+		};
+		let body = "";
+		for (let page = 0; page < (state.uploadPageCount ?? 1); page++) {
+			state.uploadPage = page;
+			const screen = stripVTControlCharacters(
+				renderUploadManager(repositories, state, columns, rows),
+			);
+			expect(screen.split("\n").length).toBeLessThan(rows);
+			for (const line of screen.split("\n"))
+				expect(line.length).toBeLessThan(columns);
+			body += screen
+				.split("\n")
+				.slice(6, -4)
+				.filter(
+					(line) =>
+						!line.includes("Skipped · size limit") && !line.includes("[──●]"),
+				)
+				.join("");
+		}
+		const compactBody = body.replace(/\s/g, "");
+		expect(compactBody.match(/Nouploadattempted\./g)).toHaveLength(1);
+		expect(compactBody.match(/Couldnotsavediagnostics\./g)).toHaveLength(1);
+		expect(body).not.toContain("Duplicated individual size explanation");
+		for (const repo of repositories)
+			for (const detail of repo.sessionUploads ?? [])
+				expect(compactBody).toContain(detail.sessionId);
+	}
+});
+
+test("session rows and transfer columns stay fixed from queued through completion", () => {
+	for (const columns of [38, 80, 120]) {
+		const repo = uploadFixture();
+		const detail: SessionUploadDetail = {
+			sessionId: "019cb958-d947-7901-916f-ac59e2d37310",
+			source: "codex",
+			sessionDate: Date.parse("2026-09-17"),
+			status: "queued",
+			uploadedBytes: 0,
+			totalBytes: undefined,
+		};
+		repo.sessionUploads = [detail, { ...detail, sessionId: "next-session" }];
+		const state: UploadManagerState = {
+			query: "",
+			cursor: 0,
+			desired: new Map(),
+			message: "",
+			stage: "upload",
+			operation: { label: "Uploading", frame: 0 },
+			followUpload: false,
+		};
+		const positions: Array<{
+			next: number;
+			transfer: number;
+			slash: number;
+			pages: number | undefined;
+		}> = [];
+		for (const status of [
+			"queued",
+			"preparing",
+			"uploading",
+			"retrying",
+			"processing",
+			"uploaded",
+		] as const) {
+			detail.status = status;
+			detail.attempt = 2;
+			detail.maxAttempts = 3;
+			detail.error =
+				status === "retrying" ? "Temporary transport error" : undefined;
+			if (status === "uploading") {
+				detail.totalBytes = 128_000_000;
+				detail.uploadedBytes = 123_000_000;
+			}
+			const screen = stripVTControlCharacters(
+				renderUploadManager([repo], state, columns, 45),
+			);
+			const lines = screen.split("\n");
+			const transfer = lines.findIndex((line) => line.includes(" / "));
+			expect(transfer).toBeGreaterThan(6);
+			expect(screen).not.toContain("Temporary transport error");
+			for (const line of lines) expect(line.length).toBeLessThan(columns);
+			positions.push({
+				next: lines.findIndex((line) => line.includes("next-session")),
+				transfer,
+				slash: lines[transfer]?.indexOf(" / ") ?? -1,
+				pages: state.uploadPageCount,
+			});
+		}
+		for (const position of positions) expect(position).toEqual(positions[0]);
+	}
 });
 
 test("scan distinguishes local discovery from upload-history checks", () => {

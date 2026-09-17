@@ -6,13 +6,16 @@ export interface SessionUploadDetail {
 	source: Source;
 	sessionDate: number | undefined;
 	status:
+		| "queued"
 		| "preparing"
 		| UploadTransferProgress["phase"]
 		| "retrying"
 		| "failed"
+		| "uploaded"
 		| "skipped";
 	uploadedBytes: number | undefined;
 	totalBytes: number | undefined;
+	maxBytes?: number;
 	error?: string;
 	reportError?: string;
 	failureStage?: "preparing" | "uploading" | "processing";

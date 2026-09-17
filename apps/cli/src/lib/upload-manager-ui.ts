@@ -1,4 +1,7 @@
-import { sanitizeForTerminalDisplay } from "../contracts/index.js";
+import {
+	INGEST_AGGREGATE_CONTENT_MAX_BYTES,
+	sanitizeForTerminalDisplay,
+} from "../contracts/index.js";
 import { cliMessage } from "./cli-messages.js";
 import type { UploadRepository } from "./upload-manager-repositories.js";
 import {
@@ -14,7 +17,11 @@ import {
 	UPLOAD_MANAGER_THEME,
 	type UploadManagerTheme,
 } from "./upload-manager-theme.js";
-import { formatUploadBytes, uploadBytesPerSecond } from "./upload-progress.js";
+import {
+	formatUploadBytes,
+	type SessionUploadDetail,
+	uploadBytesPerSecond,
+} from "./upload-progress.js";
 
 const TEXT_STYLES = {
 	regular: "0",
@@ -143,7 +150,11 @@ export function renderUploadManager(
 		(repo) =>
 			repo.uploadSpeed?.samples.length ||
 			repo.sessionUploads?.some(
-				(session) => session.uploadedBytes !== undefined,
+				(session) =>
+					session.uploadedBytes !== undefined &&
+					(session.status === "uploading" ||
+						session.status === "processing" ||
+						session.status === "retrying"),
 			),
 	);
 	const badge =
@@ -317,8 +328,8 @@ export function renderUploadManager(
 				);
 			}
 		}
-		for (const repository of filtered) {
-			const header = rowLine(
+		const repositoryHeader = (repository: UploadRepository) =>
+			rowLine(
 				`${repository.name}${repository.current ? " (current)" : ""}`,
 				repository.key,
 				getDesiredUploadState(repository, state) ? "on" : "off",
@@ -328,63 +339,123 @@ export function renderUploadManager(
 				repository.uploadedCount,
 				repository.upload,
 			);
-			append(header, header);
-			const details = [...(repository.sessionUploads ?? [])].sort(
-				(a, b) =>
-					Number(a.status === "failed" || a.status === "skipped") -
-					Number(b.status === "failed" || b.status === "skipped"),
-			);
-			for (const detail of details) {
-				const active =
-					detail.status !== "failed" && detail.status !== "skipped";
-				const date =
-					detail.sessionDate === undefined
-						? "Unknown date"
-						: new Date(detail.sessionDate).toISOString().slice(0, 10);
-				const identity = `${date} · ${sanitizeForTerminalDisplay(detail.sessionId)}`;
-				const bytes = `${formatUploadBytes(detail.uploadedBytes)} / ${formatUploadBytes(detail.totalBytes)}`;
-				const available = contentWidth - 4;
-				if (identity.length + bytes.length + 2 <= available) {
-					append(
-						`${margin}    ${paint(identity, "muted")}${" ".repeat(available - identity.length - bytes.length)}${paint(bytes, "regular")}`,
-						header,
-						active,
-					);
-				} else {
-					for (const line of wrapErrorMessage(identity, available))
-						append(`${margin}    ${paint(line, "muted")}`, header, active);
-					append(
-						`${margin}    ${paint(bytes.padStart(available), "regular")}`,
-						header,
-						active,
-					);
-				}
-				const label =
-					detail.status === "skipped"
-						? "— Skipped · size limit"
+		const appendSession = (detail: SessionUploadDetail, header: string) => {
+			const active =
+				detail.status === "preparing" ||
+				detail.status === "uploading" ||
+				detail.status === "processing" ||
+				detail.status === "retrying";
+			const date =
+				detail.sessionDate === undefined
+					? "Unknown date"
+					: new Date(detail.sessionDate).toISOString().slice(0, 10);
+			const identity = `${date} · ${sanitizeForTerminalDisplay(detail.sessionId)}`;
+			const available = contentWidth - 4;
+			// The identity and transfer row never share space. Reserve both byte
+			// columns, including while their values are still unknown.
+			for (const line of wrapErrorMessage(identity, available))
+				append(`${margin}    ${paint(line, "muted")}`, header, active);
+			const bytes = `${formatUploadBytes(detail.uploadedBytes).padStart(12)} / ${formatUploadBytes(detail.totalBytes).padStart(12)}`;
+			const label =
+				detail.status === "skipped"
+					? ""
+					: detail.status === "queued"
+						? "Queued"
+						: detail.status === "uploaded"
+							? "✓ Uploaded"
+							: detail.status === "failed"
+								? detail.failureStage === "processing"
+									? "✗ Processing failed"
+									: detail.failureStage === "preparing"
+										? "✗ Preparation failed"
+										: "✗ Failed"
+								: detail.status === "retrying"
+									? `↻ Retrying ${detail.attempt}/${detail.maxAttempts}`
+									: `${SCAN_FRAMES[(state.operation?.frame ?? 0) % SCAN_FRAMES.length]} ${detail.status === "preparing" ? "Preparing" : detail.status === "processing" ? "Processing on server" : "Uploading"}`;
+			const color =
+				detail.status === "uploaded"
+					? "success"
+					: active
+						? "accent"
 						: detail.status === "failed"
-							? detail.failureStage === "processing"
-								? "✗ Processing failed"
-								: detail.failureStage === "preparing"
-									? "✗ Preparation failed"
-									: "✗ Failed"
-							: detail.status === "retrying"
-								? `↻ Retrying ${detail.attempt}/${detail.maxAttempts}`
-								: `${SCAN_FRAMES[(state.operation?.frame ?? 0) % SCAN_FRAMES.length]} ${detail.status === "preparing" ? "Preparing" : detail.status === "processing" ? "Processing on server" : "Uploading"}`;
+							? "danger"
+							: "muted";
+			if (available < 56 && label)
 				append(
-					`${margin}    ${paint(label, active ? "accent" : "danger")}`,
+					`${margin}    ${paint(clipLine(label, available), color)}`,
 					header,
 					active,
 				);
-				if (detail.error || detail.reportError)
-					for (const line of wrapErrorMessage(
-						[detail.error, detail.reportError].filter(Boolean).join(" "),
-						available,
-					))
-						append(
-							`${margin}    ${paint(line, active ? "regular" : "danger")}`,
-							header,
-						);
+			append(
+				`${margin}    ${paint(available >= 56 ? clipLine(label, available - bytes.length - 1).padEnd(available - bytes.length) : " ".repeat(available - bytes.length), color)}${paint(bytes, "regular")}`,
+				header,
+				active,
+			);
+			// A transient retry error must not insert/remove rows during transfer.
+			// Size-limit explanations and reporting errors are shared by the group.
+			if (
+				detail.status !== "skipped" &&
+				(detail.status === "failed" || detail.reportError)
+			)
+				for (const line of wrapErrorMessage(
+					[detail.error, detail.reportError].filter(Boolean).join(" "),
+					available,
+				))
+					append(`${margin}    ${paint(line, "danger")}`, header);
+		};
+		const skipped = filtered.flatMap((repository) =>
+			(repository.sessionUploads ?? [])
+				.filter((detail) => detail.status === "skipped")
+				.map((detail) => ({ repository, detail })),
+		);
+		for (const repository of filtered) {
+			const details = repository.sessionUploads ?? [];
+			if (
+				details.length &&
+				details.every((detail) => detail.status === "skipped")
+			)
+				continue;
+			const header = repositoryHeader(repository);
+			append(header, header);
+			for (const detail of details)
+				if (detail.status !== "skipped") appendSession(detail, header);
+		}
+		if (skipped.length) {
+			const heading = textLine(
+				`Skipped · size limit (${number.format(skipped.length)})`,
+				"strong",
+			);
+			append(heading, heading);
+			const limits = [
+				...new Set(
+					skipped.map(({ detail }) =>
+						number.format(
+							(detail.maxBytes ?? INGEST_AGGREGATE_CONTENT_MAX_BYTES) /
+								1024 /
+								1024,
+						),
+					),
+				),
+			].join(" / ");
+			const message = `Above the ${limits} MiB per-session limit. No upload attempted.`;
+			const reportErrors = [
+				...new Set(
+					skipped.flatMap(({ detail }) =>
+						detail.reportError ? [detail.reportError] : [],
+					),
+				),
+			];
+			for (const line of wrapErrorMessage(
+				[message, ...reportErrors].join(" "),
+				contentWidth,
+			))
+				append(textLine(line), heading);
+			let previousRepository: UploadRepository | undefined;
+			for (const { repository, detail } of skipped) {
+				const header = repositoryHeader(repository);
+				if (repository !== previousRepository) append(header, header);
+				appendSession(detail, header);
+				previousRepository = repository;
 			}
 		}
 		state.uploadPageCount = pages.length;
@@ -392,7 +463,7 @@ export function renderUploadManager(
 			0,
 			Math.min(
 				state.operation && state.followUpload !== false
-					? (activePage ?? 0)
+					? (activePage ?? state.uploadPage ?? 0)
 					: (state.uploadPage ?? 0),
 				pages.length - 1,
 			),
@@ -414,7 +485,10 @@ export function renderUploadManager(
 					: url?.replace(/^https?:\/\//u, "");
 			lines.push(
 				pageLabel,
-				textLine(`✓ ${state.message}`, "success"),
+				textLine(
+					`${state.message.length + 2 <= contentWidth ? "✓ " : ""}${state.message}`,
+					"success",
+				),
 				url && label
 					? `${margin}\u001b]8;;${url}\u0007${paint(clipLine(label, contentWidth), "link")}\u001b]8;;\u0007`
 					: "",

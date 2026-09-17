@@ -193,7 +193,13 @@ export async function runUpload(
 								summary.total;
 							state.message =
 								summary.failed + summary.skipped
-									? `${uploadedThisRun} uploaded · ${summary.failed + summary.skipped} failed`
+									? [
+											`${uploadedThisRun} uploaded`,
+											summary.failed ? `${summary.failed} failed` : "",
+											summary.skipped ? `${summary.skipped} skipped` : "",
+										]
+											.filter(Boolean)
+											.join(" · ")
 									: cliMessage("uploadSummary", { count: uploadedThisRun });
 							state.uploadFailed = summary.failed + summary.skipped > 0;
 							if (uploadedThisRun > 0 || !state.uploadFailed) {

@@ -224,25 +224,35 @@ export function createPreview(value: unknown): PreviewResponse {
 				failed: 0,
 			};
 			uploaded[repo.key] = repo.uploadedCount;
-			if (repo.upload.active) {
-				const sessionFraction = (fraction * 12) % 1;
+			if (repo.sessionCount > start) {
 				repo.sessionUploads = [
 					{
 						sessionId: `019cb958-d947-7901-916f-ac59e2d3731${index}`,
 						source: "codex",
 						sessionDate: Date.parse("2026-09-17T09:00:00Z"),
-						status: sessionFraction > 0.85 ? "processing" : "uploading",
+						status:
+							fraction === 0
+								? "queued"
+								: fraction === 1
+									? "uploaded"
+									: fraction < 0.08
+										? "preparing"
+										: fraction > 0.85
+											? "processing"
+											: "uploading",
 						uploadedBytes:
-							sessionFraction > 0.85
+							fraction >= 0.85
 								? 8_400_000
-								: Math.floor(sessionFraction * 8_400_000),
-						totalBytes: 8_400_000,
+								: fraction < 0.08
+									? 0
+									: Math.floor((fraction / 0.85) * 8_400_000),
+						totalBytes: fraction === 0 ? undefined : 8_400_000,
 					},
 				];
 				const now = performance.now();
 				repo.uploadSpeed = {
 					startedAt: now - 2_000,
-					samples: [{ at: now, bytes: 2_400_000 }],
+					samples: repo.upload.active ? [{ at: now, bytes: 2_400_000 }] : [],
 				};
 			}
 		}
@@ -258,9 +268,11 @@ export function createPreview(value: unknown): PreviewResponse {
 				(row) => row.enabled && row.sessionCount > (row.uploadedCount ?? 0),
 			)
 			.slice(0, 2);
-		state.message = `${failedRepositories.length} sessions need attention.`;
+		const failedCount = failedRepositories.length ? 1 : 0;
+		const skippedCount = failedRepositories.length > 1 ? 3 : 0;
+		state.message = `${failedCount} failed · ${skippedCount} skipped`;
 		if (screen.id.startsWith("upload-partial")) {
-			state.message = `12 uploaded · ${failedRepositories.length} failed`;
+			state.message = `12 uploaded · ${failedCount} failed · ${skippedCount} skipped`;
 			state.completion = getUploadCompletion(
 				"https://opaline.so/rpc",
 				screen.id !== "upload-partial-new",
@@ -272,7 +284,7 @@ export function createPreview(value: unknown): PreviewResponse {
 				active: false,
 				completed: repo.uploadedCount ?? 0,
 				total: repo.sessionCount,
-				failed: 1,
+				failed: index === 0 ? 1 : 3,
 			};
 			repo.sessionUploads = [
 				{
@@ -287,6 +299,16 @@ export function createPreview(value: unknown): PreviewResponse {
 						"503 Service unavailable: the server could not finish processing this session. Retry when the service is available.",
 				},
 			];
+			if (index > 0)
+				repo.sessionUploads = Array.from({ length: 3 }, (_, sessionIndex) => ({
+					sessionId: `019cb958-d947-7901-916f-ac59e2d3732${sessionIndex}`,
+					source: "codex",
+					sessionDate: Date.parse("2026-09-17T09:00:00Z"),
+					status: "skipped",
+					uploadedBytes: 0,
+					totalBytes: (150 + sessionIndex * 25) * 1024 * 1024,
+					maxBytes: 128 * 1024 * 1024,
+				}));
 		}
 	}
 	if (isUploadCompleteScreen(screen.id) && uploadSucceeded)
