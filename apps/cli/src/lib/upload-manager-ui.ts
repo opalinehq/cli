@@ -343,8 +343,8 @@ export function renderUploadManager(
 				),
 			);
 		while (footer.length < 3) footer.unshift("");
-		if (height - lines.length - footer.length < 3) lines.splice(4, 2);
-		const capacity = Math.max(2, height - lines.length - footer.length - 1);
+		if (height - lines.length - footer.length < 4) lines.splice(4, 2);
+		const capacity = Math.max(2, height - lines.length - footer.length - 2);
 		const pages: string[][] = [[]];
 		let page = pages[0] ?? [];
 		let activePage: number | undefined;
@@ -482,11 +482,12 @@ export function renderUploadManager(
 			),
 		);
 		lines.push(...(pages[state.uploadPage] ?? []));
-		while (lines.length < height - footer.length - 1) lines.push("");
+		while (lines.length < height - footer.length - 2) lines.push("");
 		lines.push(
+			divider,
 			pages.length > 1
 				? textLine(`‹ Page ${state.uploadPage + 1} of ${pages.length} ›`)
-				: divider,
+				: "",
 			...footer,
 		);
 		return lines.join("\n");

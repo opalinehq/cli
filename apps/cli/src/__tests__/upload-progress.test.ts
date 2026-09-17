@@ -88,7 +88,7 @@ test("failed session IDs and full reasons remain accessible on small terminal pa
 		.map((page) =>
 			page
 				.split("\n")
-				.slice(6, -4)
+				.slice(4, -5)
 				.filter((line) => !line.includes("[──●]"))
 				.join(""),
 		)
@@ -188,12 +188,14 @@ test("size-limit skips across repositories share one explanation and retain ever
 				(line) => line.includes("Page") || line.includes("────"),
 			);
 			expect(boundary).toBeLessThan(footer);
+			const pager = lines.findIndex((line) => line.includes("‹ Page"));
+			if (pager >= 0) expect(lines[pager - 1]).toContain("────");
 			expect(
 				screen.replace(/\s/g, "").match(/Nouploadattempted\./g),
 			).toHaveLength(1);
 			expect(screen).not.toContain("Retry");
 			body += lines
-				.slice(6, boundary)
+				.slice(4, boundary)
 				.filter(
 					(line) =>
 						!line.includes("Skipped · size limit") && !line.includes("[──●]"),
