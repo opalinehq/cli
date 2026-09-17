@@ -25,6 +25,7 @@ export interface UploadManagerState {
 	reviewControls?: ReviewControl[];
 	desired: Map<string, boolean>;
 	message: string;
+	error?: { message: string; page: number; pageCount?: number };
 	scan?: { frame: number };
 	operation?: { label: string; frame: number };
 	completion?: UploadCompletion;
@@ -48,6 +49,26 @@ export function applyUploadKey(
 ): "save" | "cancel" | "changed" | "ignored" {
 	const cancel =
 		key.name === "escape" || (key.ctrl && ["c", "d"].includes(key.name));
+	if (state.error && !state.operation) {
+		if (cancel || key.name === "return") {
+			if (state.singleRun || key.ctrl) return "cancel";
+			state.error = undefined;
+			if (key.name === "return") return "save";
+			editUploadSelection(state);
+			return "changed";
+		}
+		if (["up", "down", "pageup", "pagedown"].includes(key.name)) {
+			state.error.page = Math.max(
+				0,
+				Math.min(
+					state.error.page + (["down", "pagedown"].includes(key.name) ? 1 : -1),
+					(state.error.pageCount ?? 1) - 1,
+				),
+			);
+			return "changed";
+		}
+		return "ignored";
+	}
 	if (state.singleRun && state.stage === "upload" && !state.operation)
 		return cancel || key.name === "return" ? "cancel" : "ignored";
 	if (cancel) {
@@ -257,6 +278,7 @@ export function getTableRepositories(
 }
 
 export function reviewUploadSelection(state: UploadManagerState): void {
+	state.error = undefined;
 	state.stage = "review";
 	state.reviewPage = 0;
 	state.reviewAction = "confirm";
@@ -269,6 +291,7 @@ export function reviewUploadSelection(state: UploadManagerState): void {
 }
 
 export function editUploadSelection(state: UploadManagerState): void {
+	state.error = undefined;
 	state.stage = undefined;
 	state.completion = undefined;
 	state.query = "";

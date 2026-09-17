@@ -30,6 +30,7 @@ export interface DemoState {
 	enabled: Record<string, boolean>;
 	desired: Record<string, boolean>;
 	message: string;
+	error?: UploadManagerState["error"];
 	viewportStart?: number;
 	followScan?: boolean;
 	uploaded?: Record<string, number>;
@@ -91,6 +92,7 @@ const UPLOADED = [128, 0, 3, 1100, 31, 0, 0, 200, 17, 60, 0, 0, 0, 15, 0];
 export function createPreview(value: unknown): PreviewResponse {
 	if (!isRecord(value) || !isRecord(value.state))
 		throw new Error("Invalid preview request.");
+	const error = isRecord(value.state.error) ? value.state.error : {};
 	const theme = parseUploadManagerTheme(value.theme);
 	const columns = boundedInteger(value.columns, 38, 160);
 	const rows = boundedInteger(value.rows, 13, 45);
@@ -146,6 +148,16 @@ export function createPreview(value: unknown): PreviewResponse {
 					: undefined,
 		desired: new Map(Object.entries(desired)),
 		message: shortText(value.state.message),
+		error:
+			screen.id === "error"
+				? {
+						message:
+							typeof error.message === "string"
+								? error.message
+								: "Couldn't enable Codex auto upload.\nThe global Codex notify setting must be a list of strings (a command and its arguments). This setting applies to all repositories.\nConfig: /Users/you/.codex/config.toml\nFix the notify setting in this file, then retry. Existing notifications were left unchanged.",
+						page: boundedInteger(error.page ?? 0, 0, 100),
+					}
+				: undefined,
 		viewportStart: boundedInteger(value.state.viewportStart ?? 0, 0, 100),
 		followScan: optionalBoolean(value.state.followScan),
 		...(screen.id === "scan" && progress < 100 ? { scan: { frame } } : {}),
@@ -277,6 +289,7 @@ export function createPreview(value: unknown): PreviewResponse {
 			desired,
 			enabled,
 			message: state.message,
+			error: state.error,
 			viewportStart: state.viewportStart,
 			followScan: state.followScan,
 			uploaded,

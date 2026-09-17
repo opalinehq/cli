@@ -52,6 +52,14 @@ Esc returns to editing. Upload progress stays in the same table.
 Existing Rudel hooks are recognized as enabled. Saving migrates owned hooks to
 Opaline, removes duplicate local hooks, and preserves unrelated agent settings.
 
+Codex notification tools can coexist with automatic uploads. Opaline retains
+the existing command and arguments, forwards the notification JSON, and uploads
+independently. Codex Computer Use stays at the front of its notification chain.
+Turning uploads OFF keeps notifications working. Custom scripts are preserved;
+Opaline does not rewrite scripts that invoke older Rudel installations themselves.
+Setup failures show their complete details and a retry/back action, including
+the settings file to fix when a Codex configuration is invalid.
+
 ## Key concepts
 
 - **Sessions:** Claude Code and Codex JSONL transcripts discovered on the local
