@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/opalinehq/cli/compare/opaline-cli@0.8.0...opaline-cli@0.8.1) (2026-09-17)
+
+
+### Bug Fixes
+
+* preserve Codex notifications and show complete upload errors ([#483](https://github.com/opalinehq/cli/issues/483)) ([761d020](https://github.com/opalinehq/cli/commit/761d02026eadf3594dc1136aead8462a92a186e2))
+
 ## [0.8.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.7.0...opaline-cli@0.8.0) (2026-09-15)
 
 
