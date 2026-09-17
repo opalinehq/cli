@@ -14,8 +14,13 @@ npm install --global opaline
 Existing users can keep installing and updating `rudel`. It is released with
 `opaline` and `@opalinehq/cli` and depends on the exact matching CLI version.
 Both `rudel` and `opaline` keep using the same `~/.rudel` state directory.
-Running `rudel upload` installs hooks using the `rudel` executable, so no
-separate global `opaline` installation is required.
+Automatic uploads use a retained CLI bundle under `~/.rudel/runtime` with
+your Node executable, so no separate global `opaline` installation is required.
+
+See the [migration guide](https://github.com/opalinehq/cli/blob/main/docs/usage.md#moving-from-rudel)
+for details. Opaline uploads full session transcripts; known-secret filtering
+is best-effort. Read the [data-handling disclosure](https://github.com/opalinehq/cli/blob/main/docs/data-handling.md)
+for transcript contents, usage analytics, and opt-out settings.
 
 ## License
 

@@ -1,30 +1,36 @@
 # Opaline CLI
 
-Capture Claude Code and OpenAI Codex sessions and upload them to Opaline for
-team analytics. Requires Node.js 20 or newer.
+**Your Claude Code and Codex sessions, in one place.**
+
+Connect your coding sessions to [Opaline](https://opaline.so) for team analytics. Choose your repositories, upload existing sessions, and keep future sessions syncing automatically.
+
+## Get started
+
+Requires Node.js 20 or newer. Run from any directory; no global installation needed.
 
 ```bash
 npx opaline@latest
 ```
 
-Run from any directory, choose repositories, and review the upload before browser login. Opaline uploads the selected Claude Code and Codex sessions and sets up automatic uploads for those repositories.
+1. Choose repositories with ↑↓ and Space.
+2. Press Enter to review, then Enter to confirm. Sign in through your browser when prompted.
+3. Continue in Opaline after upload. New users finish setup; returning users open their workspace's Sessions page.
 
-`opaline` is the recommended install name. It runs the same CLI implementation
-as `@opalinehq/cli`, pinned to the matching release. Both `@opalinehq/cli` and
-the `rudel` compatibility package remain supported.
+Run the command again to change which repositories sync. If you start setup in your browser, use the command it supplies, including the `--code` value.
 
-When switching from a global `@opalinehq/cli` install, run
-`npm uninstall --global @opalinehq/cli` first: both packages provide the
-`opaline` command. Existing credentials, settings, and upload state remain in
-`~/.rudel`; no new login is required. Run `opaline upload` to set up hooks
-using the `opaline` command when migrating from `rudel`.
+## Data and privacy
 
-For commands, configuration, troubleshooting, and the full security/data
-handling disclosure, see the
-[repository README](https://github.com/opalinehq/cli#readme).
+Opaline uploads full session transcripts, which can include prompts, responses, source code, tool output, and metadata. Known-secret filtering is best-effort and cannot guarantee every sensitive value is removed.
 
-Session transcripts are uploaded. Known-pattern secret filtering is best-effort
-and cannot guarantee that every sensitive value is removed.
+Official releases also send limited usage analytics, including repository/session counts, linked to your account after sign-in. Those events exclude transcript content, repository names, and local paths. Set `DO_NOT_TRACK=1` or `POSTHOG_ENABLED=false` in the CLI's environment to opt out of usage analytics.
+
+## Learn more
+
+- [CLI guide](https://github.com/opalinehq/cli/blob/main/docs/usage.md) — commands, global installation, configuration, troubleshooting, and migration from Rudel.
+- [Data handling](https://github.com/opalinehq/cli/blob/main/docs/data-handling.md) — full disclosure and persistent analytics opt-out.
+- [GitHub](https://github.com/opalinehq/cli) — source code and contributions.
+
+`opaline` is the recommended installation name. It uses the `@opalinehq/cli` implementation at the same version. Existing credentials and settings remain in `~/.rudel`.
 
 ## License
 

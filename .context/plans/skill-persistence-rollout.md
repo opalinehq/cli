@@ -1,5 +1,7 @@
 # Skill persistence rollout runbook
 
+> **Historical monorepo runbook.** The paths, branches, and deployment commands below refer to the former combined repository. Do not use this document to operate the public CLI or its releases. See [Releasing](../../RELEASING.md) for the current CLI release process.
+
 Owner: Evren. Execute in order from branch `feat/skill-persistence-backend`. Stop on any failed verification. Production reads use `prd_readonly`; `prd` is reserved for the migration and backfill writes. This PR is backend-only; the skills web UI intentionally ships later from `opaline/main`.
 
 ## 1. CI integration gate

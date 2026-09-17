@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - Node.js 20 or newer
-- Bun 1.3 or newer
+- Bun 1.3.10, matching the `packageManager` version in `package.json`
 
 ## Setup
 
@@ -33,6 +33,16 @@ bun run verify
 ```
 
 `bun run verify` must pass before a pull request is opened.
+
+## CLI playground
+
+```bash
+bun run dev:cli
+```
+
+Open <http://127.0.0.1:4077> to preview repository selection, review, and upload states using the real CLI renderer with sample data. No sessions are uploaded. Pass another port with `bun run dev:cli 4078` if needed.
+
+The README screenshot uses the repository-selection screen with the default theme and sample repositories, a 96-column × 20-row viewport, and 16 px text. When updating it, capture the terminal window from this playground and keep the sample-data caption.
 
 ## Pull requests
 
