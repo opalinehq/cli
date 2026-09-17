@@ -9,6 +9,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/opaline"><img src="https://img.shields.io/npm/v/opaline?color=397568&label=npm" alt="npm version"></a>
+  <a href="https://www.producthunt.com/products/rudel/launches/claude-code-codex-usage-trading-cards-by-rudel" title="Rudel trading cards launch — May 4, 2026"><img src="https://img.shields.io/badge/Product%20Hunt-%235%20of%20the%20day-DA552F" alt="Product Hunt: #5 of the day — May 4, 2026 launch"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-64748b" alt="MIT license"></a>
 </p>
 
