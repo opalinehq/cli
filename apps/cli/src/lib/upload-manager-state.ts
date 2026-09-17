@@ -1,6 +1,9 @@
 import { sanitizeForTerminalDisplay } from "../contracts/index.js";
 import type { UploadCompletion } from "./upload-completion.js";
-import type { UploadRepository } from "./upload-manager-repositories.js";
+import type {
+	ScanProgress,
+	UploadRepository,
+} from "./upload-manager-repositories.js";
 
 export interface ReviewControl {
 	action: "confirm" | "back" | "previous" | "next";
@@ -12,7 +15,7 @@ export interface ReviewControl {
 }
 
 export interface UploadManagerState {
-	// A browser pairing has one immutable confirmed selection and upload run.
+	// Browser pairing locks the confirmed selection, including retries.
 	singleRun?: boolean;
 	query: string;
 	// Zero selects the pinned All repos row; repository indices start at one.
@@ -26,9 +29,13 @@ export interface UploadManagerState {
 	desired: Map<string, boolean>;
 	message: string;
 	error?: { message: string; page: number; pageCount?: number };
-	scan?: { frame: number };
+	scan?: { frame: number; progress?: ScanProgress };
 	operation?: { label: string; frame: number };
 	completion?: UploadCompletion;
+	uploadFailed?: boolean;
+	uploadPage?: number;
+	uploadPageCount?: number;
+	followUpload?: boolean;
 	viewportStart?: number;
 	followScan?: boolean;
 }
@@ -69,9 +76,20 @@ export function applyUploadKey(
 		}
 		return "ignored";
 	}
-	if (state.singleRun && state.stage === "upload" && !state.operation)
-		return cancel || key.name === "return" ? "cancel" : "ignored";
+	if (
+		(state.singleRun || state.completion) &&
+		state.stage === "upload" &&
+		!state.operation &&
+		!state.uploadFailed
+	) {
+		if (cancel || key.name === "return") return "cancel";
+		if (state.singleRun) return "ignored";
+	}
 	if (cancel) {
+		if (state.singleRun && state.stage === "upload" && !state.operation)
+			return "cancel";
+		if (state.stage === "upload" && state.completion && !state.operation)
+			return "cancel";
 		if (
 			key.name === "escape" &&
 			state.stage &&
@@ -84,6 +102,33 @@ export function applyUploadKey(
 		return "cancel";
 	}
 	if (state.scan) return "ignored";
+	if (state.stage === "upload" && (state.operation || state.uploadFailed)) {
+		const canRetry = hasFailedUploadSessions(repositories);
+		if (!state.operation && state.completion) {
+			if (key.name === "return") {
+				state.uploadFailed = false;
+				state.viewportStart = 0;
+				state.cursor = 0;
+				return "changed";
+			}
+			if (key.name === "r" && canRetry) return "save";
+		}
+		if (["up", "down", "pageup", "pagedown"].includes(key.name)) {
+			state.followUpload = false;
+			state.uploadPage = Math.max(
+				0,
+				Math.min(
+					(state.uploadPage ?? 0) +
+						(["down", "pagedown"].includes(key.name) ? 1 : -1),
+					(state.uploadPageCount ?? 1) - 1,
+				),
+			);
+			return "changed";
+		}
+		return !state.operation && canRetry && key.name === "return"
+			? "save"
+			: "ignored";
+	}
 	if (state.operation && key.name !== "up" && key.name !== "down")
 		return "ignored";
 	if (state.stage === "review") {
@@ -150,6 +195,14 @@ export function applyUploadKey(
 		state.cursor = 0;
 	} else return "ignored";
 	return "changed";
+}
+
+export function hasFailedUploadSessions(
+	repositories: UploadRepository[],
+): boolean {
+	return repositories.some((repo) =>
+		repo.sessionUploads?.some((session) => session.status === "failed"),
+	);
 }
 
 export function activateUploadReview(
@@ -292,6 +345,7 @@ export function reviewUploadSelection(state: UploadManagerState): void {
 
 export function editUploadSelection(state: UploadManagerState): void {
 	state.error = undefined;
+	state.uploadFailed = false;
 	state.stage = undefined;
 	state.completion = undefined;
 	state.query = "";

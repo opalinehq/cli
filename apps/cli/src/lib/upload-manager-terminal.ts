@@ -1,6 +1,9 @@
 import { emitKeypressEvents, type Key } from "node:readline";
 import { cliMessage } from "./cli-messages.js";
-import type { UploadRepository } from "./upload-manager-repositories.js";
+import type {
+	ScanProgress,
+	UploadRepository,
+} from "./upload-manager-repositories.js";
 import {
 	activateUploadReview,
 	applyUploadKey,
@@ -18,19 +21,64 @@ const SCAN_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "�
 const SCAN_FRAME_MS = 80;
 
 export type UploadRepositoryScan = (
-	onRepositories: (repositories: UploadRepository[]) => void,
+	onRepositories: (
+		repositories: UploadRepository[],
+		progress?: ScanProgress,
+	) => void,
 	signal: AbortSignal,
 ) => Promise<UploadRepository[]>;
+
+/** Keep the table visible between prompts while account/workspace checks run. */
+export function createUploadScreen() {
+	let visible = false;
+	const interrupt = () => {
+		close();
+		process.exit(130);
+	};
+	const terminate = () => {
+		close();
+		process.exit(143);
+	};
+	const stopHandoff = () => {
+		process.off("SIGINT", interrupt);
+		process.off("SIGTERM", terminate);
+	};
+	function close() {
+		stopHandoff();
+		process.off("exit", close);
+		if (!visible) return;
+		visible = false;
+		process.stdout.write("\u001b[?25h\u001b[?1049l");
+	}
+	return {
+		open() {
+			stopHandoff();
+			if (visible) return;
+			visible = true;
+			process.once("exit", close);
+			process.stdout.write("\u001b[?1049h\u001b[?25l");
+		},
+		handoff() {
+			// The prompt releases its input handlers during these async checks.
+			// Restore the terminal if the user interrupts before the next prompt.
+			process.once("SIGINT", interrupt);
+			process.once("SIGTERM", terminate);
+		},
+		close,
+	};
+}
 
 export function promptUploadManager(
 	repositories: UploadRepository[],
 	state: UploadManagerState,
 	scan?: UploadRepositoryScan,
 	operation?: (signal: AbortSignal) => Promise<void>,
+	screen?: ReturnType<typeof createUploadScreen>,
 ): Promise<"save" | "cancel"> {
 	return new Promise((resolve, reject) => {
 		const input = process.stdin;
 		const output = process.stdout;
+		const terminal = screen ?? createUploadScreen();
 		const wasRaw = input.isRaw;
 		const togglePositions = new Map<string, number>();
 		const animations = new Map<string, ReturnType<typeof setTimeout>[]>();
@@ -49,12 +97,11 @@ export function promptUploadManager(
 		emitKeypressEvents(input);
 		input.setRawMode(true);
 		input.resume();
-		output.write("\u001b[?1049h\u001b[?25l");
+		terminal.open();
 		const render = () => {
 			if (finished) return;
 			const enableMouse =
-				state.stage === "review" &&
-				!state.operation &&
+				(state.stage === "review" || state.stage === "upload") &&
 				!state.scan &&
 				!state.error;
 			if (enableMouse !== mouseEnabled) {
@@ -85,7 +132,9 @@ export function promptUploadManager(
 			input.setRawMode(wasRaw);
 			input.pause();
 			if (mouseEnabled) output.write("\u001b[?1000l\u001b[?1006l");
-			output.write("\u001b[?25h\u001b[?1049l");
+			if (screen && result === "save" && error === undefined)
+				terminal.handoff();
+			else terminal.close();
 			if (error !== undefined) reject(error);
 			else resolve(result);
 		};
@@ -116,7 +165,16 @@ export function promptUploadManager(
 				);
 				if (!match) break;
 				mouseInput = mouseInput.slice(start + 3 + match[0].length);
-				if (match[1] === "0" && match[4] === "M") {
+				if ((match[1] === "64" || match[1] === "65") && match[4] === "M") {
+					applyUploadKey(repositories, state, {
+						name: match[1] === "64" ? "pageup" : "pagedown",
+					});
+					render();
+				} else if (
+					match[1] === "0" &&
+					match[4] === "M" &&
+					state.stage === "review"
+				) {
 					const column = Number(match[2]) - 1;
 					const line = Number(match[3]) - 1;
 					const control = state.reviewControls?.find(
@@ -237,8 +295,10 @@ export function promptUploadManager(
 			}, SCAN_FRAME_MS);
 			void Promise.resolve()
 				.then(() =>
-					scan((rows) => {
-						if (!finished) repositories.splice(0, repositories.length, ...rows);
+					scan((rows, progress) => {
+						if (finished) return;
+						repositories.splice(0, repositories.length, ...rows);
+						if (state.scan) state.scan.progress = progress;
 					}, controller.signal),
 				)
 				.then((rows) => {

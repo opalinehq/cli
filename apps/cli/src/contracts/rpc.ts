@@ -14,6 +14,7 @@ import {
 	SESSION_UPLOAD_SHRINK_REJECTED_CODE,
 	SESSION_UPLOAD_SHRINK_REJECTED_MESSAGE,
 } from "./ingest.js";
+import { ReportUploadFailuresInputSchema } from "./upload-failure.js";
 
 const UserSchema = z.object({
 	id: z.string(),
@@ -55,6 +56,9 @@ const OrganizationSchema = z.object({
 export const contract = {
 	me: oc.output(UserSchema),
 	cli: {
+		reportUploadFailures: oc
+			.input(ReportUploadFailuresInputSchema)
+			.output(z.object({ success: z.literal(true) })),
 		authStatus: oc.output(CliUserSchema),
 		setupStatus: oc.output(
 			z.object({

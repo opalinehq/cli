@@ -3,7 +3,11 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import pMap from "p-map";
 import { type RepoIdentity, resolveRepoIdentity } from "../contracts/index.js";
 import { exec } from "./exec.js";
-import { type GitInfo, getGitInfo, normalizeRemoteUrl } from "./git-info.js";
+import {
+	type GitInfo,
+	getRepositoryInfo,
+	normalizeRemoteUrl,
+} from "./git-info.js";
 import { getCachedRemote, getRemoteCache } from "./remote-cache.js";
 
 export function resolveUploadRepositoryIdentity(
@@ -41,14 +45,22 @@ export function getLegacyRepositoryKey(
 export async function discoverProjectRepositories(
 	projectPaths: readonly string[],
 	recordedRemotes: ReadonlyMap<string, string> = new Map(),
+	options: {
+		signal?: AbortSignal;
+		onRepository?: (path: string, info: GitInfo) => void;
+	} = {},
 ): Promise<Map<string, GitInfo>> {
+	options.signal?.throwIfAborted();
 	const entries = await pMap(
 		[...new Set(projectPaths)],
 		async (path) => {
-			const info = await getGitInfo(path);
+			options.signal?.throwIfAborted();
+			const info = await getRepositoryInfo(path);
+			options.signal?.throwIfAborted();
 			const recordedRemote = recordedRemotes.get(path);
 			if (!info.gitRemote && !info.repositoryRoot && recordedRemote)
 				info.gitRemote = normalizeRemoteUrl(recordedRemote);
+			if (info.repositoryRoot) options.onRepository?.(path, info);
 			return [path, info] as const;
 		},
 		{ concurrency: 8 },
@@ -61,6 +73,7 @@ export async function discoverProjectRepositories(
 	await pMap(
 		[...roots],
 		async ([root, info]) => {
+			options.signal?.throwIfAborted();
 			knownPaths.set(await normalizeProjectPath(root), info);
 			const result = await exec("git", [
 				"-C",
@@ -99,6 +112,7 @@ export async function discoverProjectRepositories(
 	const cache = await getRemoteCache();
 	const ancestors = [...knownPaths].sort(([a], [b]) => b.length - a.length);
 	for (const [path, info] of entries) {
+		options.signal?.throwIfAborted();
 		if (info.repositoryRoot) continue;
 		const normalized = await normalizeProjectPath(path);
 		const parent = ancestors.find(
@@ -110,10 +124,11 @@ export async function discoverProjectRepositories(
 				branch: undefined,
 				sha: undefined,
 			});
-			continue;
+		} else {
+			const remote = getCachedRemote(cache, path.replaceAll("/", "-"));
+			if (remote) repositories.set(path, { ...info, gitRemote: remote });
 		}
-		const remote = getCachedRemote(cache, path.replaceAll("/", "-"));
-		if (remote) repositories.set(path, { ...info, gitRemote: remote });
+		options.onRepository?.(path, repositories.get(path) ?? info);
 	}
 	return repositories;
 }

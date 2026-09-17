@@ -240,6 +240,9 @@ async function putFilePart(input: {
 			totalPartBytes: input.part.byteLength,
 		});
 	};
+	// Reset this part before a retry so callers can count retransmitted bytes
+	// and show progress for the current attempt rather than the failed one.
+	reportChunk(0);
 	const body = await createFilePartBody(
 		input.path,
 		input.start,

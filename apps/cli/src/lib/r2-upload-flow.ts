@@ -29,6 +29,7 @@ import {
 	R2MultipartUploadError,
 	uploadR2MultipartObjects,
 } from "./r2-multipart-upload.js";
+import type { UploadTransferProgress } from "./types.js";
 
 const RPC_MAX_ATTEMPTS = 3;
 const RPC_BASE_DELAY_MS = 500;
@@ -48,6 +49,7 @@ export interface R2UploadFlowConfig {
 	readonly maxAggregateBytes: number;
 	readonly multipartBaseDelayMs: number | undefined;
 	readonly onProgress: ((progress: R2MultipartProgress) => void) | undefined;
+	readonly onTransferProgress?: (progress: UploadTransferProgress) => void;
 	readonly onRetry:
 		| ((attempt: number, maxAttempts: number, error: string) => void)
 		| undefined;
@@ -153,6 +155,13 @@ async function uploadStagedSession(
 	staged: StagedFilteredUpload,
 	config: R2UploadFlowConfig,
 ): Promise<Extract<R2UploadFlowResult, { readonly status: "success" }>> {
+	const transferred = new Map<string, number>();
+	const totalBytes = staged.aggregateBytes;
+	config.onTransferProgress?.({
+		phase: "uploading",
+		uploadedBytes: 0,
+		totalBytes,
+	});
 	const client = createR2IngestRpcClient(config);
 	let initCall: Awaited<ReturnType<typeof callRpcWithRetry>>;
 	try {
@@ -174,12 +183,28 @@ async function uploadStagedSession(
 		baseDelayMs: config.multipartBaseDelayMs,
 		fetch: undefined,
 		maxAttempts: RPC_MAX_ATTEMPTS,
-		onProgress: config.onProgress,
+		onProgress: (progress) => {
+			config.onProgress?.(progress);
+			transferred.set(progress.objectKey, progress.objectBytesUploaded);
+			config.onTransferProgress?.({
+				phase: "uploading",
+				uploadedBytes: [...transferred.values()].reduce(
+					(sum, bytes) => sum + bytes,
+					0,
+				),
+				totalBytes,
+			});
+		},
 		onRetry: config.onRetry
 			? (retry) =>
 					config.onRetry?.(retry.attempt, retry.maxAttempts, retry.error)
 			: undefined,
 		sources,
+	});
+	config.onTransferProgress?.({
+		phase: "processing",
+		uploadedBytes: totalBytes,
+		totalBytes,
 	});
 	const commitInput: R2IngestCommitInput = {
 		jobId: initCall.value.jobId,

@@ -90,7 +90,7 @@ export async function batchUpload<T extends BatchUploadItem>(
 			if (rateLimited) {
 				deferred++;
 				const error =
-					"Skipped — rate limit reached. Run `opaline upload --retry` to upload remaining sessions.";
+					"Skipped — rate limit reached. Run `opaline upload` to upload remaining sessions.";
 				await recordFailure(item, { error, status: "retryable" });
 				completed++;
 				onItemComplete?.(completed, total);
@@ -169,7 +169,7 @@ export async function batchUpload<T extends BatchUploadItem>(
 	if (rateLimited && deferred > 0) {
 		errors.push({
 			label: "Rate limit",
-			error: `${deferred} session(s) skipped. Run \`opaline upload --retry\` later to upload them.`,
+			error: `${deferred} session(s) skipped. Run \`opaline upload\` later to upload them.`,
 		});
 		failed += deferred;
 	}
