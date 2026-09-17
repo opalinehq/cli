@@ -330,10 +330,13 @@ export function renderUploadManager(
 			);
 			append(header, header);
 			const details = [...(repository.sessionUploads ?? [])].sort(
-				(a, b) => Number(a.status === "failed") - Number(b.status === "failed"),
+				(a, b) =>
+					Number(a.status === "failed" || a.status === "skipped") -
+					Number(b.status === "failed" || b.status === "skipped"),
 			);
 			for (const detail of details) {
-				const active = detail.status !== "failed";
+				const active =
+					detail.status !== "failed" && detail.status !== "skipped";
 				const date =
 					detail.sessionDate === undefined
 						? "Unknown date"
@@ -357,17 +360,19 @@ export function renderUploadManager(
 					);
 				}
 				const label =
-					detail.status === "failed"
-						? detail.failureStage === "processing"
-							? "✗ Processing failed"
-							: detail.failureStage === "preparing"
-								? "✗ Preparation failed"
-								: "✗ Failed"
-						: detail.status === "retrying"
-							? `↻ Retrying ${detail.attempt}/${detail.maxAttempts}`
-							: `${SCAN_FRAMES[(state.operation?.frame ?? 0) % SCAN_FRAMES.length]} ${detail.status === "preparing" ? "Preparing" : detail.status === "processing" ? "Processing on server" : "Uploading"}`;
+					detail.status === "skipped"
+						? "— Skipped · size limit"
+						: detail.status === "failed"
+							? detail.failureStage === "processing"
+								? "✗ Processing failed"
+								: detail.failureStage === "preparing"
+									? "✗ Preparation failed"
+									: "✗ Failed"
+							: detail.status === "retrying"
+								? `↻ Retrying ${detail.attempt}/${detail.maxAttempts}`
+								: `${SCAN_FRAMES[(state.operation?.frame ?? 0) % SCAN_FRAMES.length]} ${detail.status === "preparing" ? "Preparing" : detail.status === "processing" ? "Processing on server" : "Uploading"}`;
 				append(
-					`${margin}    ${paint(label, detail.status === "failed" ? "danger" : "accent")}`,
+					`${margin}    ${paint(label, active ? "accent" : "danger")}`,
 					header,
 					active,
 				);
@@ -377,7 +382,7 @@ export function renderUploadManager(
 						available,
 					))
 						append(
-							`${margin}    ${paint(line, detail.status === "failed" ? "danger" : "regular")}`,
+							`${margin}    ${paint(line, active ? "regular" : "danger")}`,
 							header,
 						);
 			}

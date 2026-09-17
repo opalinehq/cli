@@ -360,6 +360,14 @@ export async function uploadSession(
 		};
 	}
 
+	// Stat file-backed transcripts before reading, filtering or staging them.
+	const sourceBytes = isFileBackedUploadRequest(request)
+		? await getFileBackedAggregateBytes(request)
+		: getUploadAggregateBytes(request);
+	const sizeFailure = getUploadSizeFailure(sourceBytes, maxAggregateBytes);
+	if (sizeFailure) return sizeFailure;
+	config.signal?.throwIfAborted();
+
 	const link = new RPCLink({
 		url: endpoint.url,
 		headers:
@@ -374,7 +382,8 @@ export async function uploadSession(
 	const shouldProbeR2 =
 		authType === "api-key" &&
 		(hasAdvertisedR2UploadCapability(endpointUrl, authType, config.token) ||
-			(await exceedsLegacyMaterializationLimit(request)));
+			(isFileBackedUploadRequest(request) &&
+				sourceBytes > LEGACY_MATERIALIZATION_MAX_BYTES));
 	if (authType === "api-key" && shouldProbeR2) {
 		try {
 			const r2Result = await uploadSessionViaR2(request, {
@@ -664,14 +673,19 @@ async function getFileBackedAggregateBytes(
 	return files.reduce((total, file) => total + file.size, 0);
 }
 
-async function exceedsLegacyMaterializationLimit(
-	request: UploadSessionRequest,
-): Promise<boolean> {
-	if (!isFileBackedUploadRequest(request)) return false;
-	return (
-		(await getFileBackedAggregateBytes(request)) >
-		LEGACY_MATERIALIZATION_MAX_BYTES
-	);
+export function getUploadSizeFailure(
+	totalBytes: number,
+	maxBytes = INGEST_AGGREGATE_CONTENT_MAX_BYTES,
+): UploadResult | undefined {
+	if (totalBytes <= maxBytes) return undefined;
+	return {
+		success: false,
+		totalBytes,
+		maxBytes,
+		error: `Skipped: session files total ${formatMebibytes(totalBytes)} MiB, above the ${formatMebibytes(maxBytes)} MiB per-session limit. No upload attempted.`,
+		attempts: 0,
+		retryable: false,
+	};
 }
 
 async function materializeLegacyUploadRequest(

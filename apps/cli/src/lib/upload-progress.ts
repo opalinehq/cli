@@ -5,7 +5,12 @@ export interface SessionUploadDetail {
 	sessionId: string;
 	source: Source;
 	sessionDate: number | undefined;
-	status: "preparing" | UploadTransferProgress["phase"] | "retrying" | "failed";
+	status:
+		| "preparing"
+		| UploadTransferProgress["phase"]
+		| "retrying"
+		| "failed"
+		| "skipped";
 	uploadedBytes: number | undefined;
 	totalBytes: number | undefined;
 	error?: string;

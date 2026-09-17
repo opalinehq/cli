@@ -104,6 +104,42 @@ test("failed session IDs and full reasons remain accessible on small terminal pa
 	expect(applyUploadKey([repo], state, { name: "escape" })).toBe("cancel");
 });
 
+test("oversized sessions show a skip reason and zero transferred bytes", () => {
+	const repo = uploadFixture();
+	repo.upload = { active: false, completed: 2, total: 10, failed: 1 };
+	repo.sessionUploads = [
+		{
+			sessionId: "oversized-session",
+			source: "codex",
+			sessionDate: Date.parse("2026-09-17T00:00:00Z"),
+			status: "skipped",
+			uploadedBytes: 0,
+			totalBytes: 150 * 1024 * 1024,
+			error:
+				"Skipped: session files total 150 MiB, above the 128 MiB per-session limit. No upload attempted.",
+		},
+	];
+	const text = stripVTControlCharacters(
+		renderUploadManager(
+			[repo],
+			{
+				query: "",
+				cursor: 0,
+				desired: new Map(),
+				message: "",
+				stage: "upload",
+				uploadFailed: true,
+			},
+			120,
+			35,
+		),
+	);
+	expect(text).toContain("— Skipped · size limit");
+	expect(text).toContain("0 B / 157.3 MB");
+	expect(text.replace(/\s+/g, " ")).toContain("No upload attempted.");
+	expect(text).not.toContain("Preparation failed");
+});
+
 test("scan distinguishes local discovery from upload-history checks", () => {
 	const state: UploadManagerState = {
 		query: "",

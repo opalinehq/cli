@@ -1,3 +1,4 @@
+import { stat } from "node:fs/promises";
 import pMap from "p-map";
 import {
 	CLI_SESSION_UPLOAD_STATUS_MAX_IDS,
@@ -19,7 +20,11 @@ import {
 	recordUploadBytes,
 	type SessionUploadDetail,
 } from "./upload-progress.js";
-import { type UploadConfig, uploadSession } from "./uploader.js";
+import {
+	getUploadSizeFailure,
+	type UploadConfig,
+	uploadSession,
+} from "./uploader.js";
 
 export async function checkRepositoryUploads(
 	repositories: UploadRepository[],
@@ -197,52 +202,69 @@ export async function uploadRepositorySessions(
 					gitInfo = getGitInfo(item.projectPath);
 					git.set(item.projectPath, gitInfo);
 				}
-				const request = await getAdapter(item.source).buildUploadRequest(item, {
-					organizationId: item.organizationId,
-					gitInfo: await gitInfo,
-					uploadMode: "manual",
-				});
-				const metadata = request.metadata;
+				const info = await gitInfo;
 				failureMetadata = {
-					gitRemote: metadata.gitRemote,
-					gitBranch: metadata.gitBranch,
-					gitSha: metadata.gitSha,
-					packageName: metadata.packageName,
-					cliVersion: metadata.cli_version,
+					gitRemote: item.gitRemote ?? info.gitRemote,
+					gitBranch: item.gitBranch ?? info.branch,
+					gitSha: item.gitSha ?? info.sha,
+					packageName: info.packageName,
 				};
-				signal.throwIfAborted();
-				const result = await uploadSession(request, {
-					...config,
-					signal,
-					onRetry: (attempt, maxAttempts, error) => {
-						onRetry(attempt, maxAttempts, error);
-						detail.status = "retrying";
-						detail.attempt = attempt + 1;
-						detail.maxAttempts = maxAttempts;
-						detail.error = error;
-						onUpdate();
-					},
-					onTransferProgress: (progress) => {
-						config.onTransferProgress?.(progress);
-						detail.status = progress.phase;
-						transferStage = progress.phase;
-						detail.error = undefined;
-						detail.uploadedBytes = progress.uploadedBytes;
-						detail.totalBytes = progress.totalBytes;
-						if (
-							progress.uploadedBytes !== undefined &&
-							repository.uploadSpeed
-						) {
-							recordUploadBytes(
-								repository.uploadSpeed,
-								Math.max(0, progress.uploadedBytes - previousBytes),
-								performance.now(),
-							);
-							previousBytes = progress.uploadedBytes;
-						}
-						onUpdate();
-					},
-				});
+				// A large main file needs no transcript scan or subagent discovery.
+				let result = getUploadSizeFailure(
+					(await stat(item.transcriptPath)).size,
+					config.maxAggregateBytes,
+				);
+				if (!result) {
+					const request = await getAdapter(item.source).buildUploadRequest(
+						item,
+						{
+							organizationId: item.organizationId,
+							gitInfo: info,
+							uploadMode: "manual",
+						},
+					);
+					const metadata = request.metadata;
+					failureMetadata = {
+						gitRemote: metadata.gitRemote,
+						gitBranch: metadata.gitBranch,
+						gitSha: metadata.gitSha,
+						packageName: metadata.packageName,
+						cliVersion: metadata.cli_version,
+					};
+					signal.throwIfAborted();
+					result = await uploadSession(request, {
+						...config,
+						signal,
+						onRetry: (attempt, maxAttempts, error) => {
+							onRetry(attempt, maxAttempts, error);
+							detail.status = "retrying";
+							detail.attempt = attempt + 1;
+							detail.maxAttempts = maxAttempts;
+							detail.error = error;
+							onUpdate();
+						},
+						onTransferProgress: (progress) => {
+							config.onTransferProgress?.(progress);
+							detail.status = progress.phase;
+							transferStage = progress.phase;
+							detail.error = undefined;
+							detail.uploadedBytes = progress.uploadedBytes;
+							detail.totalBytes = progress.totalBytes;
+							if (
+								progress.uploadedBytes !== undefined &&
+								repository.uploadSpeed
+							) {
+								recordUploadBytes(
+									repository.uploadSpeed,
+									Math.max(0, progress.uploadedBytes - previousBytes),
+									performance.now(),
+								);
+								previousBytes = progress.uploadedBytes;
+							}
+							onUpdate();
+						},
+					});
+				}
 				if (result.success) {
 					repository.sessionUploads = repository.sessionUploads?.filter(
 						(session) => session !== detail,
@@ -252,7 +274,10 @@ export async function uploadRepositorySessions(
 					if (repository.upload)
 						repository.upload.completed = repository.uploadedCount;
 				} else {
-					detail.status = "failed";
+					detail.status =
+						result.attempts === 0 && result.maxBytes !== undefined
+							? "skipped"
+							: "failed";
 					detail.totalBytes ??= result.totalBytes;
 					if (result.attempts === 0) detail.uploadedBytes ??= 0;
 					failureMetadata = {
@@ -280,7 +305,7 @@ export async function uploadRepositorySessions(
 				throw error;
 			} finally {
 				if (
-					detail.status === "failed" &&
+					(detail.status === "failed" || detail.status === "skipped") &&
 					item.organizationId &&
 					!signal.aborted
 				) {
