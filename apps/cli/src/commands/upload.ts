@@ -15,6 +15,7 @@ import {
 	checkRepositoryUploads,
 	uploadRepositorySessions,
 } from "../lib/repository-session-upload.js";
+import { syncRepositorySettings } from "../lib/repository-settings-sync.js";
 import {
 	type RepositoryChange,
 	saveRepositoryChanges,
@@ -71,6 +72,7 @@ export async function runUpload(
 			);
 			const config = guided ? undefined : getManagerUploadConfig();
 			if (config) {
+				const settingsSync = syncRepositorySettings(rows, config, signal);
 				const updateHistory = () =>
 					onRepositories(rows, {
 						phase: "history",
@@ -83,6 +85,9 @@ export async function runUpload(
 				} catch (error) {
 					signal.throwIfAborted();
 					state.message = `Upload history unavailable: ${error instanceof Error ? error.message : String(error)}`;
+				} finally {
+					const warning = await settingsSync;
+					if (warning) state.message = `${state.message} ${warning}`.trim();
 				}
 			}
 			return rows;
@@ -176,6 +181,7 @@ export async function runUpload(
 				state.followUpload = true;
 				state.completion = undefined;
 				operation = async (signal) => {
+					let settingsWarning: string | undefined;
 					try {
 						signal.throwIfAborted();
 						if (changes.length)
@@ -184,6 +190,12 @@ export async function runUpload(
 							});
 						state.desired.clear();
 						state.message = "";
+						if (config)
+							settingsWarning = await syncRepositorySettings(
+								repositories,
+								config,
+								signal,
+							);
 						signal.throwIfAborted();
 						if (targets.length && config) {
 							await guided?.start();
@@ -245,6 +257,8 @@ export async function runUpload(
 							state.message = cliMessage("saveSummary", {
 								changes: `${changes.length} change${changes.length === 1 ? "" : "s"}`,
 							});
+						if (settingsWarning)
+							state.message = `${state.message} ${settingsWarning}`.trim();
 					} catch (error) {
 						if (guided && !signal.aborted) {
 							operationError =
