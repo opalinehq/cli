@@ -8,6 +8,7 @@ import { importCommand } from "./commands/import.js";
 import { loginCommand } from "./commands/login.js";
 import { logoutCommand } from "./commands/logout.js";
 import { setOrgCommand } from "./commands/set-org.js";
+import { updateCommand } from "./commands/update.js";
 import { uploadCommand } from "./commands/upload.js";
 import { whoamiCommand } from "./commands/whoami.js";
 
@@ -18,6 +19,7 @@ const routes = buildRouteMap({
 		logout: logoutCommand,
 		whoami: whoamiCommand,
 		upload: uploadCommand,
+		update: updateCommand,
 		import: importCommand,
 		enable: uploadCommand,
 		disable: uploadCommand,

@@ -13,6 +13,13 @@ Run from any directory, choose repositories, and review the upload before browse
 as `@opalinehq/cli`, pinned to the matching release. Both `@opalinehq/cli` and
 the `rudel` compatibility package remain supported.
 
+Interactive calls offer one **Update / Skip** prompt with a link to the exact
+open-source GitHub release. Accepting updates supported existing global installs
+and automatic-upload runtimes without changing repository selections. Run
+`npx opaline@latest update` to check explicitly. Updates pin the reviewed version
+and respect your package-manager safeguards; unsupported or blocked installations
+receive instructions. A global installation is never added for npx-only users.
+
 When switching from a global `@opalinehq/cli` install, run
 `npm uninstall --global @opalinehq/cli` first: both packages provide the
 `opaline` command. Existing credentials, settings, and upload state remain in

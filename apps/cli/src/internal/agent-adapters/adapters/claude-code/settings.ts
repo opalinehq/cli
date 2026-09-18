@@ -128,6 +128,17 @@ export function isHookEnabled(path: string = getClaudeSettingsPath()): boolean {
 	);
 }
 
+export function hasLegacyClaudeHook(path: string): boolean {
+	return (
+		readClaudeSettings(path).hooks?.SessionEnd?.some((entry) =>
+			entry.hooks?.some(
+				(hook) =>
+					hook.command === HOOK_COMMAND || hook.command === LEGACY_HOOK_COMMAND,
+			),
+		) ?? false
+	);
+}
+
 export function addHook(path: string = getClaudeSettingsPath()): void {
 	const settings = readClaudeSettings(path);
 	if (!settings.hooks) {

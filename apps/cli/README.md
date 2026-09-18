@@ -21,6 +21,23 @@ users open their workspace Sessions page.
 Automatic uploads retain the bundled CLI under `~/.rudel/runtime` and use your
 Node executable, so hooks keep working after the temporary runner cache is gone.
 
+Interactive `opaline` / `opaline upload` calls check for updates before opening
+the upload manager. One **Update / Skip** prompt links to the exact GitHub release
+so you can review its notes and source first. Update refreshes an identifiable npm
+or pnpm global installation and the existing automatic-upload runtime; it does
+not enable repositories, install missing hooks, or change login/workspace settings.
+You can also run `npx opaline@latest update` explicitly.
+
+Updates pin the reviewed version and respect package-manager policy wrappers.
+If policy, ambiguous installations, or permissions prevent an update, the CLI
+reports which part needs attention. Windows global installs require their original
+package-manager command. Legacy hooks using a custom configuration profile require
+setup for that profile. Skip applies to the current invocation. Help/version, CI,
+background hooks, file imports, and browser pairing do not show update prompts.
+An npx invocation has already launched its selected version before this prompt;
+the confirmation controls changes to persistent installations. Older pinned
+invocations keep running their selected version.
+
 `opaline upload` groups discovered worktrees by repository, saves the selected
 repositories for automatic upload, and sends only sessions the server does not
 already have. Press Space to toggle, Enter to review, then Enter to confirm.
