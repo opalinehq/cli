@@ -1,14 +1,18 @@
 import { randomUUID } from "node:crypto";
 import {
-	copyFileSync,
 	existsSync,
 	mkdirSync,
+	readFileSync,
 	renameSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	compareCliVersions,
+	readCliBundleVersion,
+} from "../../lib/cli-release.js";
 import { getConfigDir } from "../../lib/local-state.js";
 import { getCliCommand } from "./cli-command.js";
 
@@ -21,7 +25,36 @@ export function getPersistentHookCommand(args: readonly string[]): string[] {
 	if (!existsSync(source))
 		throw new Error("Could not find the CLI bundle for automatic uploads.");
 	const target = getPersistentCliPath();
+	writePersistentCli(source, target);
+	return [process.execPath, target, ...args];
+}
+
+// Callers reconciling existing installations hold the configuration lock. Keep
+// the historical path so released hook installers still recognize ownership.
+export function writePersistentCli(
+	source: string,
+	target = getPersistentCliPath(),
+): void {
 	if (source !== target) {
+		const content = readFileSync(source, "utf8");
+		const candidate = readCliBundleVersion(content);
+		if (!candidate)
+			throw new Error(
+				"Could not verify the candidate Opaline runtime version.",
+			);
+		if (existsSync(target)) {
+			const installedContent = readFileSync(target, "utf8");
+			const installed = readCliBundleVersion(installedContent);
+			if (!installed)
+				throw new Error(
+					"Could not verify the existing automatic-upload runtime. It was left unchanged.",
+				);
+			if (
+				compareCliVersions(installed, candidate) > 0 ||
+				installedContent === content
+			)
+				return;
+		}
 		mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
 		writeFileSync(
 			join(dirname(target), "package.json"),
@@ -30,13 +63,12 @@ export function getPersistentHookCommand(args: readonly string[]): string[] {
 		);
 		const temporary = `${target}.${randomUUID()}.tmp`;
 		try {
-			copyFileSync(source, temporary);
+			writeFileSync(temporary, content, { mode: 0o600, flag: "wx" });
 			renameSync(temporary, target);
 		} finally {
 			rmSync(temporary, { force: true });
 		}
 	}
-	return [process.execPath, target, ...args];
 }
 
 export function isPersistentHookCommand(

@@ -63,6 +63,21 @@ export function isHookInstalled(configPath: string = CONFIG_PATH): boolean {
 	return installed;
 }
 
+export function hasLegacyCodexHook(configPath: string): boolean {
+	const { notify } = readConfig(configPath);
+	if (!isNotifyCommand(notify)) return false;
+	let legacy = false;
+	updateNotifyCommand(notify, (command) => {
+		legacy =
+			getManagedCommand(command) !== undefined &&
+			["opaline", "rudel", MALFORMED_LEGACY_HOOK_COMMAND].includes(
+				command[0] ?? "",
+			);
+		return command;
+	});
+	return legacy;
+}
+
 export function parsePreviousNotify(raw: string): string[] {
 	let value: unknown;
 	try {
