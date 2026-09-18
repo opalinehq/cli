@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.9.0...opaline-cli@0.10.0) (2026-09-18)
+
+
+### Features
+
+* review and update installed CLI and automatic uploads ([#490](https://github.com/opalinehq/cli/issues/490)) ([72aeed6](https://github.com/opalinehq/cli/commit/72aeed6305f693c8a21bff72445d1a4ee7f97b97))
+
 ## [0.9.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.8.1...opaline-cli@0.9.0) (2026-09-18)
 
 
