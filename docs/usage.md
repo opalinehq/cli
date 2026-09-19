@@ -60,9 +60,25 @@ npm install --global opaline
 opaline
 ```
 
-After installation, you can replace `npx opaline@latest` with `opaline` in the examples below. To update a global installation, run the install command again.
+After installation, you can replace `npx opaline@latest` with `opaline` in the examples below. To update a global installation, run the install command again or use the guided update flow below.
 
 If you already installed `@opalinehq/cli` globally, run `npm uninstall --global @opalinehq/cli` before installing `opaline`: both packages provide the same executable. Your existing credentials and settings are retained.
+
+## Review and install updates
+
+In an interactive terminal, bare `opaline`, `upload`, `login`, `whoami`, `enable`, and `disable` commands check for a newer release before continuing. When Opaline can safely update an existing installation, it shows one **Update / Skip** prompt with a link to that exact GitHub release so you can review its notes and source first. Update installs the reviewed version; it never falls back to an unreviewed `latest` version.
+
+An accepted update can refresh one identifiable npm or pnpm global installation and the retained automatic-upload runtime under `~/.rudel/runtime`. It does not enable repositories, install missing hooks, or change login or workspace settings. An npx-only user does not gain a global installation.
+
+Run the check directly with:
+
+```bash
+npx opaline@latest update
+```
+
+Update prompts do not appear for help or version output, CI, background hooks, file imports, or browser pairing. Skip affects only the current invocation. A pinned npx invocation has already selected the version running that command, so the update applies to supported persistent installations and future automatic uploads rather than replacing the current npx process.
+
+Opaline does not guess when more than one global installation is present. Windows global installations, package-manager policy or permission failures, and legacy hooks using a custom configuration directory receive manual instructions instead. Existing repository selections and credentials remain unchanged.
 
 ## Command reference
 
@@ -75,6 +91,7 @@ If you already installed `@opalinehq/cli` globally, run `npm uninstall --global 
 | `npx opaline@latest logout` | Revoke the current credential and log out locally. |
 | `npx opaline@latest whoami` | Show the authenticated user and local upload failures. |
 | `npx opaline@latest doctor` | Run read-only authentication, API, configuration, version, and hook diagnostics. |
+| `npx opaline@latest update` | Review the latest release and update supported persistent installations. |
 | `npx opaline@latest --help` | Show command help. |
 | `npx opaline@latest --version` | Print the CLI version. |
 

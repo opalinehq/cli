@@ -42,7 +42,7 @@ import {
 	isR2InitUnsupported,
 	uploadSessionViaR2,
 } from "./r2-upload-flow.js";
-import type { UploadResult } from "./types.js";
+import type { UploadResult, UploadTransferProgress } from "./types.js";
 import { describeUploadEndpointRejection } from "./upload-endpoint.js";
 
 export interface UploadConfig {
@@ -53,6 +53,7 @@ export interface UploadConfig {
 	maxAggregateBytes?: number;
 	onRetry?: (attempt: number, maxAttempts: number, error: string) => void;
 	onProgress?: (progress: R2MultipartProgress) => void;
+	onTransferProgress?: (progress: UploadTransferProgress) => void;
 	signal?: AbortSignal;
 	r2MultipartBaseDelayMs?: number;
 	r2StatusPollIntervalMs?: number;
@@ -189,13 +190,13 @@ export function formatUploadError(error: unknown): string {
 					? ` (${limit} per ${Math.round(data.windowSeconds / 60)} min)`
 					: "";
 			const kind = isRequestLimit ? "request" : "byte";
-			return `Ingest ${kind} limit reached${detail}. Wait and retry with: opaline upload --retry`;
+			return `Ingest ${kind} limit reached${detail}. Wait and retry with: opaline upload`;
 		}
 		const windowMin = data?.windowSeconds
 			? Math.round(data.windowSeconds / 60)
 			: 60;
 		const limit = data?.limit ?? "unknown";
-		return `Rate limit reached (${limit} sessions per ${windowMin} min). Wait and retry with: opaline upload --retry`;
+		return `Rate limit reached (${limit} sessions per ${windowMin} min). Wait and retry with: opaline upload`;
 	}
 	if (
 		error instanceof ORPCError &&
@@ -244,23 +245,23 @@ export function formatUploadError(error: unknown): string {
 		return `${error.status} ${error.message}`;
 	}
 	const message = error instanceof Error ? error.message : "connection failed";
-	return `Network error while contacting Opaline API: ${message}. Check your connection and retry with: opaline upload --retry`;
+	return `Network error while contacting Opaline API: ${message}. Check your connection and retry with: opaline upload`;
 }
 
 function formatPayloadTooLargeError(error: ORPCError<string, unknown>): string {
 	const status = `${error.status} ${error.message}`;
 	const detail = getPayloadTooLargeDetail(error);
 	const detailText = detail ? ` ${detail}` : "";
-	return `Upload request is too large (${status}).${detailText} This is a request-size limit, not an auth or proxy issue. This session will keep failing until its transcript/subagent payload is smaller; other failed sessions can still be retried with: opaline upload --retry`;
+	return `Upload request is too large (${status}).${detailText} This is a request-size limit, not an auth or proxy issue. This session will keep failing until its transcript/subagent payload is smaller; other failed sessions can still be retried with: opaline upload`;
 }
 
 function formatServerUploadError(error: ORPCError<string, unknown>): string {
 	const status = `${error.status} ${error.message}`;
 	if (RETRYABLE_STATUS_CODES.has(error.status)) {
-		return `Temporary Opaline server/proxy error (${status}). The CLI retries these automatically; retry remaining failed uploads with: opaline upload --retry`;
+		return `Temporary Opaline server/proxy error (${status}). The CLI retries these automatically; retry remaining failed uploads with: opaline upload`;
 	}
 
-	return `Opaline server error (${status}). This is not an auth problem. Retry later with: opaline upload --retry; if it repeats, share this status with the Opaline team.`;
+	return `Opaline server error (${status}). This is not an auth problem. Retry later with: opaline upload; if it repeats, share this status with the Opaline team.`;
 }
 
 function getPayloadTooLargeDetail(
@@ -359,6 +360,14 @@ export async function uploadSession(
 		};
 	}
 
+	// Stat file-backed transcripts before reading, filtering or staging them.
+	const sourceBytes = isFileBackedUploadRequest(request)
+		? await getFileBackedAggregateBytes(request)
+		: getUploadAggregateBytes(request);
+	const sizeFailure = getUploadSizeFailure(sourceBytes, maxAggregateBytes);
+	if (sizeFailure) return sizeFailure;
+	config.signal?.throwIfAborted();
+
 	const link = new RPCLink({
 		url: endpoint.url,
 		headers:
@@ -373,7 +382,8 @@ export async function uploadSession(
 	const shouldProbeR2 =
 		authType === "api-key" &&
 		(hasAdvertisedR2UploadCapability(endpointUrl, authType, config.token) ||
-			(await exceedsLegacyMaterializationLimit(request)));
+			(isFileBackedUploadRequest(request) &&
+				sourceBytes > LEGACY_MATERIALIZATION_MAX_BYTES));
 	if (authType === "api-key" && shouldProbeR2) {
 		try {
 			const r2Result = await uploadSessionViaR2(request, {
@@ -382,6 +392,7 @@ export async function uploadSession(
 				maxAggregateBytes,
 				multipartBaseDelayMs: config.r2MultipartBaseDelayMs,
 				onProgress: config.onProgress,
+				onTransferProgress: config.onTransferProgress,
 				onRetry: config.onRetry,
 				statusPollIntervalMs: config.r2StatusPollIntervalMs,
 				token: config.token,
@@ -400,6 +411,8 @@ export async function uploadSession(
 			}
 			if (r2Result.status === "too-large") {
 				return {
+					totalBytes: r2Result.actualBytes,
+					maxBytes: r2Result.maxBytes,
 					success: false,
 					error: formatTranscriptTooLargeError(
 						r2Result.actualBytes,
@@ -456,6 +469,8 @@ export async function uploadSession(
 	}
 	if (legacy.status === "legacy-too-large") {
 		return {
+			totalBytes: legacy.actualBytes,
+			maxBytes: legacy.maxBytes,
 			success: false,
 			error: formatLegacyServerTooLargeError(
 				legacy.actualBytes,
@@ -467,6 +482,8 @@ export async function uploadSession(
 	}
 	if (legacy.status === "too-large") {
 		return {
+			totalBytes: legacy.actualBytes,
+			maxBytes: legacy.maxBytes,
 			success: false,
 			error: formatTranscriptTooLargeError(legacy.actualBytes, legacy.maxBytes),
 			attempts: 0,
@@ -474,6 +491,18 @@ export async function uploadSession(
 		};
 	}
 	const { filteredRequest, filteredText } = legacy;
+	// Legacy RPC uploads do not expose transport byte progress. Keep it unknown
+	// rather than reporting a fabricated percentage while awaiting the response.
+	config.onTransferProgress?.({
+		phase: "uploading",
+		uploadedBytes: undefined,
+		totalBytes:
+			Buffer.byteLength(filteredRequest.content, "utf8") +
+			(filteredRequest.subagents ?? []).reduce(
+				(sum, item) => sum + Buffer.byteLength(item.content, "utf8"),
+				0,
+			),
+	});
 
 	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
 		config.signal?.throwIfAborted();
@@ -644,14 +673,19 @@ async function getFileBackedAggregateBytes(
 	return files.reduce((total, file) => total + file.size, 0);
 }
 
-async function exceedsLegacyMaterializationLimit(
-	request: UploadSessionRequest,
-): Promise<boolean> {
-	if (!isFileBackedUploadRequest(request)) return false;
-	return (
-		(await getFileBackedAggregateBytes(request)) >
-		LEGACY_MATERIALIZATION_MAX_BYTES
-	);
+export function getUploadSizeFailure(
+	totalBytes: number,
+	maxBytes = INGEST_AGGREGATE_CONTENT_MAX_BYTES,
+): UploadResult | undefined {
+	if (totalBytes <= maxBytes) return undefined;
+	return {
+		success: false,
+		totalBytes,
+		maxBytes,
+		error: `Skipped: session files total ${formatMebibytes(totalBytes)} MiB, above the ${formatMebibytes(maxBytes)} MiB per-session limit. No upload attempted.`,
+		attempts: 0,
+		retryable: false,
+	};
 }
 
 async function materializeLegacyUploadRequest(
@@ -758,7 +792,7 @@ function isIngestSessionResponse(
 }
 
 function formatUnrecognizedResponseError(): string {
-	return "Opaline API returned an unrecognized response instead of an ingest confirmation, so this upload cannot be verified and was treated as failed. This usually means a proxy, SSO gateway, or wrong endpoint URL answered instead of the Opaline API. Check the endpoint and retry with: opaline upload --retry";
+	return "Opaline API returned an unrecognized response instead of an ingest confirmation, so this upload cannot be verified and was treated as failed. This usually means a proxy, SSO gateway, or wrong endpoint URL answered instead of the Opaline API. Check the endpoint and retry with: opaline upload";
 }
 
 function getUploadAggregateBytes(request: IngestSessionInput): number {

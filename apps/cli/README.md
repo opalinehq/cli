@@ -18,6 +18,12 @@ After upload, new users finish setup in the browser; returning users open their 
 
 Run the command again to change which repositories sync. Existing Rudel credentials and settings remain in `~/.rudel`.
 
+## Updates
+
+Eligible interactive commands may offer one **Update / Skip** prompt with a link to the exact open-source release. Accepting updates a supported existing npm or pnpm global installation and the retained automatic-upload runtime; it does not add a global installation for npx-only users or change repository selections, login, or workspace settings.
+
+Run `npx opaline@latest update` to check explicitly. Ambiguous and Windows global installations stay unchanged; update failures report a manual command or corrective action when available. See [review and install updates](https://github.com/opalinehq/cli/blob/main/docs/usage.md#review-and-install-updates) for the complete behavior.
+
 ## Data and privacy
 
 Opaline uploads full session transcripts, which can include prompts, responses, source code, tool output, and metadata. Known-secret filtering is best-effort and cannot guarantee every sensitive value is removed.

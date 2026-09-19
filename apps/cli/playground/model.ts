@@ -37,6 +37,11 @@ export interface DemoState {
 	uploadStart?: Record<string, number>;
 	uploadKeys?: string[];
 	uploadSucceeded?: boolean;
+	uploadPage?: number;
+	uploadPageCount?: number;
+	uploadFailed?: boolean;
+	completion?: UploadManagerState["completion"];
+	followUpload?: boolean;
 }
 
 export interface PreviewRequest {
@@ -143,7 +148,11 @@ export function createPreview(value: unknown): PreviewResponse {
 		stage:
 			screen.id === "review"
 				? "review"
-				: screen.id === "saving" || isUploadCompleteScreen(screen.id)
+				: screen.id === "saving" ||
+						screen.id.startsWith("upload-partial") ||
+						screen.id.startsWith("upload-skipped") ||
+						screen.id === "upload-failures" ||
+						isUploadCompleteScreen(screen.id)
 					? "upload"
 					: undefined,
 		desired: new Map(Object.entries(desired)),
@@ -160,12 +169,24 @@ export function createPreview(value: unknown): PreviewResponse {
 				: undefined,
 		viewportStart: boundedInteger(value.state.viewportStart ?? 0, 0, 100),
 		followScan: optionalBoolean(value.state.followScan),
+		uploadPage: boundedInteger(value.state.uploadPage ?? 0, 0, 1000),
+		followUpload: optionalBoolean(value.state.followUpload),
 		...(screen.id === "scan" && progress < 100 ? { scan: { frame } } : {}),
 	};
 	const repositories =
 		screen.id === "scan"
 			? scanRepositories(allRepositories, progress)
 			: allRepositories;
+	if (state.scan)
+		state.scan.progress = {
+			phase:
+				progress < 15 ? "sessions" : progress < 90 ? "repositories" : "history",
+			sessions: allRepositories.reduce(
+				(sum, repo) => sum + repo.sessionCount,
+				0,
+			),
+			repositories: repositories.length,
+		};
 	for (const repository of repositories)
 		repository.enabled = enabled[repository.key] ?? repository.enabled;
 	if (screen.id === "saving") {
@@ -204,10 +225,102 @@ export function createPreview(value: unknown): PreviewResponse {
 				failed: 0,
 			};
 			uploaded[repo.key] = repo.uploadedCount;
+			if (repo.sessionCount > start) {
+				repo.sessionUploads = [
+					{
+						sessionId: `019cb958-d947-7901-916f-ac59e2d3731${index}`,
+						source: "codex",
+						sessionDate: Date.parse("2026-09-17T09:00:00Z"),
+						status:
+							fraction === 0
+								? "queued"
+								: fraction === 1
+									? "uploaded"
+									: fraction < 0.08
+										? "preparing"
+										: fraction > 0.85
+											? "processing"
+											: "uploading",
+						uploadedBytes:
+							fraction >= 0.85
+								? 8_400_000
+								: fraction < 0.08
+									? 0
+									: Math.floor((fraction / 0.85) * 8_400_000),
+						totalBytes: fraction === 0 ? undefined : 8_400_000,
+					},
+				];
+				const now = performance.now();
+				repo.uploadSpeed = {
+					startedAt: now - 2_000,
+					samples: repo.upload.active ? [{ at: now, bytes: 2_400_000 }] : [],
+				};
+			}
 		}
 		uploadSucceeded = progress === 100 && targets.length > 0;
 	}
-	if (isUploadCompleteScreen(screen.id) && uploadSucceeded)
+	if (
+		screen.id === "upload-failures" ||
+		screen.id.startsWith("upload-partial") ||
+		screen.id.startsWith("upload-skipped")
+	) {
+		state.uploadFailed = true;
+		const onlySkipped = screen.id.startsWith("upload-skipped");
+		const failedRepositories = repositories
+			.filter(
+				(row) => row.enabled && row.sessionCount > (row.uploadedCount ?? 0),
+			)
+			.slice(0, onlySkipped ? 1 : 2);
+		const failedCount = !onlySkipped && failedRepositories.length ? 1 : 0;
+		const skippedCount = onlySkipped || failedRepositories.length > 1 ? 3 : 0;
+		state.message = `${failedCount} failed · ${skippedCount} skipped`;
+		if (screen.id.startsWith("upload-partial") || onlySkipped) {
+			state.message = `12 uploaded${failedCount ? ` · ${failedCount} failed` : ""} · ${skippedCount} skipped`;
+			state.completion = getUploadCompletion(
+				"https://opaline.so/rpc",
+				!screen.id.endsWith("-new"),
+				[{ id: "sample-workspace", slug: "acme" }],
+			);
+		}
+		for (const [index, repo] of failedRepositories.entries()) {
+			repo.upload = {
+				active: false,
+				completed: repo.uploadedCount ?? 0,
+				total: repo.sessionCount,
+				failed: !onlySkipped && index === 0 ? 1 : 0,
+			};
+			repo.sessionUploads = [
+				{
+					sessionId: `019cb958-d947-7901-916f-ac59e2d3731${index}`,
+					source: "codex",
+					sessionDate: Date.parse("2026-09-17T09:00:00Z"),
+					status: "failed",
+					failureStage: "processing",
+					uploadedBytes: 8_400_000,
+					totalBytes: 8_400_000,
+					error:
+						"503 Service unavailable: the server could not finish processing this session. Retry when the service is available.",
+				},
+			];
+			if (onlySkipped || index > 0)
+				repo.sessionUploads = Array.from({ length: 3 }, (_, sessionIndex) => ({
+					sessionId: `019cb958-d947-7901-916f-ac59e2d3732${sessionIndex}`,
+					source: "codex",
+					sessionDate: Date.parse("2026-09-17T09:00:00Z"),
+					status: "skipped",
+					uploadedBytes: 0,
+					totalBytes: (150 + sessionIndex * 25) * 1024 * 1024,
+					maxBytes: 128 * 1024 * 1024,
+				}));
+		}
+		for (const repo of repositories)
+			uploaded[repo.key] = repo.uploadedCount ?? 0;
+	}
+	if (
+		isUploadCompleteScreen(screen.id) &&
+		uploadSucceeded &&
+		!Object.keys(uploaded).length
+	)
 		for (const repo of repositories.filter((repo) => repo.enabled)) {
 			repo.uploadedCount = repo.sessionCount;
 			uploaded[repo.key] = repo.sessionCount;
@@ -292,6 +405,11 @@ export function createPreview(value: unknown): PreviewResponse {
 			error: state.error,
 			viewportStart: state.viewportStart,
 			followScan: state.followScan,
+			uploadPage: state.uploadPage,
+			uploadPageCount: state.uploadPageCount,
+			uploadFailed: state.uploadFailed,
+			completion: state.completion,
+			followUpload: state.followUpload,
 			uploaded,
 			uploadStart,
 			uploadKeys: selectedKeys,

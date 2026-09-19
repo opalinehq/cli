@@ -13,7 +13,7 @@
     },
     "apps/cli": {
       "name": "@opalinehq/cli",
-      "version": "0.8.1",
+      "version": "0.10.0",
       "bin": {
         "opaline": "./dist/cli.js",
       },
@@ -37,22 +37,22 @@
     },
     "packages/opaline": {
       "name": "opaline",
-      "version": "0.8.1",
+      "version": "0.10.0",
       "bin": {
         "opaline": "./bin/opaline.js",
       },
       "dependencies": {
-        "@opalinehq/cli": "0.8.1",
+        "@opalinehq/cli": "0.10.0",
       },
     },
     "packages/rudel-alias": {
       "name": "rudel",
-      "version": "0.8.1",
+      "version": "0.10.0",
       "bin": {
         "rudel": "./bin/rudel.js",
       },
       "dependencies": {
-        "@opalinehq/cli": "0.8.1",
+        "@opalinehq/cli": "0.10.0",
       },
     },
   },

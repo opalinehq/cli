@@ -18,6 +18,12 @@ npx opaline@latest
 
 Run the command again to change which repositories sync. If you start setup in your browser, use the command it supplies, including the `--code` value.
 
+## Updates
+
+Eligible interactive commands may offer one **Update / Skip** prompt linked to the exact open-source release. Accepting updates a supported existing global installation and the retained automatic-upload runtime without changing repository selections. It never adds a global installation for npx-only users.
+
+Run `npx opaline@latest update` to check explicitly. See the [update guide](https://github.com/opalinehq/cli/blob/main/docs/usage.md#review-and-install-updates) for supported installations and fallback instructions.
+
 ## Data and privacy
 
 Opaline uploads full session transcripts, which can include prompts, responses, source code, tool output, and metadata. Known-secret filtering is best-effort and cannot guarantee every sensitive value is removed.

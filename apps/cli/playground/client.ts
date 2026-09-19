@@ -1,6 +1,7 @@
 import {
 	activateUploadReview,
 	applyUploadKey,
+	hasFailedUploadSessions,
 	toggleUploadRepository,
 	type UploadKey,
 	type UploadManagerState,
@@ -30,7 +31,7 @@ const PLAYBACK = {
 	screen: 1800,
 	scan: 2400,
 	login: 2600,
-	saving: 1200,
+	saving: 30_000,
 };
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 const terminal = element("terminal", HTMLDivElement);
@@ -226,6 +227,17 @@ function bindControls() {
 			})
 			.catch(showError);
 	});
+	terminal.addEventListener(
+		"wheel",
+		(event) => {
+			if (closed || state.stage !== "upload") return;
+			event.preventDefault();
+			interact(() =>
+				handleManagerKey({ name: event.deltaY > 0 ? "pagedown" : "pageup" }),
+			);
+		},
+		{ passive: false },
+	);
 	terminal.addEventListener("keydown", (event) => {
 		if (closed) return;
 		if (["Shift", "Control", "Alt", "Meta"].includes(event.key)) return;
@@ -403,17 +415,25 @@ async function refreshPreview() {
 	button("save-demo").disabled = next.scanning || next.uploading;
 	button("save-demo").textContent = next.uploading
 		? "Uploading…"
-		: state.error
-			? "Retry upload"
-			: next.scanning
-				? "Review after scan"
-				: currentScreen === "review"
-					? "Confirm upload"
-					: "Review selection";
+		: state.uploadFailed && !hasFailedUploadSessions(next.selectionRepositories)
+			? "Continue"
+			: state.error || state.uploadFailed
+				? "Retry upload"
+				: next.scanning
+					? "Review after scan"
+					: currentScreen === "review"
+						? "Confirm upload"
+						: "Review selection";
 	button("save-demo").hidden =
-		!screenById(currentScreen).manager || state.stage === "review";
+		!screenById(currentScreen).manager ||
+		state.stage === "review" ||
+		isUploadCompleteScreen(currentScreen);
 	button("edit-repos").hidden =
-		!state.stage || state.stage === "review" || next.uploading;
+		!state.stage ||
+		state.stage === "review" ||
+		isUploadCompleteScreen(currentScreen) ||
+		next.uploading ||
+		state.uploadFailed === true;
 	// The saved confirmation is derived from the current theme on every preview.
 	if (isUploadCompleteScreen(currentScreen) && showSavedConfirmation)
 		state.message = "";
@@ -470,7 +490,7 @@ function redrawTerminal(replay = false) {
 		const row = lines[repo.line];
 		if (!row) continue;
 		row.dataset.repository = repo.key;
-		if (state.stage === "review") continue;
+		if (state.stage) continue;
 		const action = document.createElement("button");
 		action.type = "button";
 		action.tabIndex = -1;
@@ -478,6 +498,7 @@ function redrawTerminal(replay = false) {
 		action.disabled =
 			preview.scanning ||
 			preview.uploading ||
+			state.uploadFailed === true ||
 			!!(state.stage && repo.index === 0);
 		action.addEventListener("click", () => {
 			if (isScanning()) return;
@@ -576,6 +597,19 @@ function updateManager(
 		closed = true;
 	} else if (result === "save") startDemoUpload();
 	else {
+		if (
+			manager.completion &&
+			!manager.uploadFailed &&
+			manager.stage === "upload"
+		) {
+			state.uploadSucceeded = true;
+			changeScreen(
+				manager.completion.kind === "setup" ? "saved-new" : "saved",
+				false,
+			);
+			showSavedConfirmation = false;
+			return;
+		}
 		if (manager.stage === "review" && currentScreen !== "review")
 			changeScreen("review", false);
 		else if (
@@ -616,7 +650,14 @@ function activateReview(action: "confirm" | "back" | "previous" | "next") {
 }
 
 function saveDemo() {
-	handleManagerKey({ name: "return" });
+	handleManagerKey({
+		name:
+			state.completion &&
+			state.uploadFailed &&
+			hasFailedUploadSessions(preview?.selectionRepositories ?? [])
+				? "r"
+				: "return",
+	});
 }
 
 function editSelection() {
@@ -731,6 +772,8 @@ function syncScreen() {
 		screen.id === "error" ||
 		screen.id === "scan" ||
 		screen.id === "saving" ||
+		screen.id.startsWith("upload-skipped") ||
+		screen.id.startsWith("upload-partial") ||
 		isUploadCompleteScreen(screen.id);
 	element("terminal-help", HTMLParagraphElement).textContent =
 		screen.id === "scan"
@@ -740,7 +783,11 @@ function syncScreen() {
 					? "Upload counts update in the table."
 					: screen.id === "review"
 						? "Review your selection, then confirm or go back to edit. ←→ or Tab selects an action; ↑↓ or Page Up/Down changes pages when needed."
-						: "Click a repo to toggle. Enter reviews selected repos before saving or uploading."
+						: screen.id.startsWith("upload-partial") ||
+								screen.id === "upload-failures" ||
+								isUploadCompleteScreen(screen.id)
+							? "Scroll or use arrow keys to page through session details."
+							: "Click a repo to toggle. Enter reviews selected repos before saving or uploading."
 				: screen.id === "destination"
 					? "↑↓ select an organization · Enter continue · Esc back."
 					: "Enter continues the sample flow. Use the screen menu to jump anywhere.";

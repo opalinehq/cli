@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm, truncate, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ORPCError } from "@orpc/client";
 import {
+	INGEST_AGGREGATE_CONTENT_MAX_BYTES,
 	INGEST_LIMIT_REASONS,
 	type IngestSessionInput,
 	REDACTION_DID_NOT_CONVERGE_CODE,
@@ -16,6 +20,7 @@ import {
 	formatRedactionSummary,
 	formatUploadError,
 	getSecretFilterUploadFailure,
+	getUploadSizeFailure,
 	isRetryableUploadError,
 	uploadSession,
 } from "../lib/uploader.js";
@@ -50,7 +55,7 @@ describe("formatUploadError", () => {
 		});
 
 		expect(formatUploadError(error)).toBe(
-			"Rate limit reached (500 sessions per 60 min). Wait and retry with: opaline upload --retry",
+			"Rate limit reached (500 sessions per 60 min). Wait and retry with: opaline upload",
 		);
 	});
 
@@ -64,7 +69,7 @@ describe("formatUploadError", () => {
 		});
 
 		expect(formatUploadError(error)).toBe(
-			"Ingest request limit reached (15000 requests per 60 min). Wait and retry with: opaline upload --retry",
+			"Ingest request limit reached (15000 requests per 60 min). Wait and retry with: opaline upload",
 		);
 	});
 
@@ -78,7 +83,7 @@ describe("formatUploadError", () => {
 		});
 
 		expect(formatUploadError(error)).toBe(
-			"Ingest byte limit reached (10240.00 MiB per 60 min). Wait and retry with: opaline upload --retry",
+			"Ingest byte limit reached (10240.00 MiB per 60 min). Wait and retry with: opaline upload",
 		);
 	});
 
@@ -136,7 +141,7 @@ describe("formatUploadError", () => {
 		});
 
 		expect(formatUploadError(error)).toBe(
-			"Upload request is too large (413 Payload Too Large). Request body too large. Maximum size is 500 MB. This is a request-size limit, not an auth or proxy issue. This session will keep failing until its transcript/subagent payload is smaller; other failed sessions can still be retried with: opaline upload --retry",
+			"Upload request is too large (413 Payload Too Large). Request body too large. Maximum size is 500 MB. This is a request-size limit, not an auth or proxy issue. This session will keep failing until its transcript/subagent payload is smaller; other failed sessions can still be retried with: opaline upload",
 		);
 	});
 
@@ -158,7 +163,7 @@ describe("formatUploadError", () => {
 		const error = new ORPCError("BAD_GATEWAY");
 
 		expect(formatUploadError(error)).toBe(
-			"Temporary Opaline server/proxy error (502 Bad Gateway). The CLI retries these automatically; retry remaining failed uploads with: opaline upload --retry",
+			"Temporary Opaline server/proxy error (502 Bad Gateway). The CLI retries these automatically; retry remaining failed uploads with: opaline upload",
 		);
 	});
 
@@ -166,7 +171,7 @@ describe("formatUploadError", () => {
 		const error = new ORPCError("INTERNAL_SERVER_ERROR");
 
 		expect(formatUploadError(error)).toBe(
-			"Opaline server error (500 Internal Server Error). This is not an auth problem. Retry later with: opaline upload --retry; if it repeats, share this status with the Opaline team.",
+			"Opaline server error (500 Internal Server Error). This is not an auth problem. Retry later with: opaline upload; if it repeats, share this status with the Opaline team.",
 		);
 	});
 
@@ -174,7 +179,7 @@ describe("formatUploadError", () => {
 		const error = new TypeError("fetch failed");
 
 		expect(formatUploadError(error)).toBe(
-			"Network error while contacting Opaline API: fetch failed. Check your connection and retry with: opaline upload --retry",
+			"Network error while contacting Opaline API: fetch failed. Check your connection and retry with: opaline upload",
 		);
 	});
 });
@@ -226,13 +231,79 @@ describe("uploadSession aggregate size guard", () => {
 		);
 
 		expect(result).toEqual({
+			totalBytes: 2 * 1024 * 1024,
+			maxBytes: 1024 * 1024,
 			success: false,
 			error:
-				"Session transcript payload is 2.00 MiB, above the 1.00 MiB per-session limit. Reduce the transcript/subagent payload before retrying.",
+				"Skipped: session files total 2.00 MiB, above the 1.00 MiB per-session limit. No upload attempted.",
 			attempts: 0,
 			retryable: false,
 		});
 	});
+
+	test("permits the exact size limit and skips one byte above it", () => {
+		const limit = INGEST_AGGREGATE_CONTENT_MAX_BYTES;
+		expect(getUploadSizeFailure(limit)).toBeUndefined();
+		expect(getUploadSizeFailure(limit + 1)).toMatchObject({
+			success: false,
+			totalBytes: limit + 1,
+			maxBytes: limit,
+			attempts: 0,
+			retryable: false,
+		});
+	});
+
+	for (const authType of ["api-key", "bearer"] as const) {
+		for (const includeSubagent of [false, true]) {
+			test(`skips oversized files before parsing or staging (${authType}, subagent: ${includeSubagent})`, async () => {
+				const directory = await mkdtemp(join(tmpdir(), "opaline-size-guard-"));
+				try {
+					const transcriptPath = join(directory, "main.jsonl");
+					const subagentPath = join(directory, "subagent.jsonl");
+					const limit = INGEST_AGGREGATE_CONTENT_MAX_BYTES;
+					// Sparse, invalid transcripts: reading/filtering them must not run.
+					await writeFile(transcriptPath, "invalid transcript\n");
+					await truncate(
+						transcriptPath,
+						includeSubagent ? limit / 2 : limit + 1,
+					);
+					if (includeSubagent) {
+						await writeFile(subagentPath, "invalid subagent\n");
+						await truncate(subagentPath, limit / 2 + 1);
+					}
+					const transfers: unknown[] = [];
+					const retries: number[] = [];
+					const result = await uploadSession(
+						{
+							kind: "file",
+							metadata: {
+								source: "claude_code",
+								sessionId: "oversized-file",
+								projectPath: directory,
+							},
+							transcriptPath,
+							subagents: includeSubagent
+								? [{ agentId: "child", path: subagentPath }]
+								: [],
+						},
+						{
+							endpoint: "http://127.0.0.1:1/rpc",
+							allowInsecureEndpoint: false,
+							authType,
+							token: "unused",
+							onTransferProgress: (progress) => transfers.push(progress),
+							onRetry: (attempt) => retries.push(attempt),
+						},
+					);
+					expect(result).toEqual(getUploadSizeFailure(limit + 1));
+					expect(transfers).toEqual([]);
+					expect(retries).toEqual([]);
+				} finally {
+					await rm(directory, { recursive: true, force: true });
+				}
+			});
+		}
+	}
 });
 
 describe("uploadSession transient transport handling", () => {
@@ -490,7 +561,7 @@ describe("uploadSession redaction safety budget", () => {
 			{
 				endpoint: "http://127.0.0.1:1/rpc",
 				allowInsecureEndpoint: false,
-				maxAggregateBytes: 16,
+				maxAggregateBytes: 100,
 				token: "unused",
 			},
 		);

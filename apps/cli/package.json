@@ -1,6 +1,6 @@
 {
 	"name": "@opalinehq/cli",
-	"version": "0.8.1",
+	"version": "0.10.0",
 	"type": "module",
 	"description": "Opaline CLI for Claude Code and Codex session analytics",
 	"license": "MIT",
@@ -42,7 +42,7 @@
 		"build": "bun run build.ts",
 		"prepack": "bun run build",
 		"test": "bun test",
-		"test:integration": "bun test ./src/__tests__/old-api-compat.test.ts ./src/__tests__/upload-destination.integration.test.ts",
+		"test:integration": "bun test ./src/__tests__/old-api-compat.test.ts ./src/__tests__/upload-destination.integration.test.ts ./src/__tests__/upload-manager-terminal.integration.ts",
 		"test:packed-smoke": "bun test ./src/__tests__/packed-cli-smoke.integration.ts"
 	},
 	"dependencies": {

@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.10.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.9.0...opaline-cli@0.10.0) (2026-09-18)
+
+
+### Features
+
+* review and update installed CLI and automatic uploads ([#490](https://github.com/opalinehq/cli/issues/490)) ([72aeed6](https://github.com/opalinehq/cli/commit/72aeed6305f693c8a21bff72445d1a4ee7f97b97))
+
+## [0.9.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.8.1...opaline-cli@0.9.0) (2026-09-18)
+
+
+### Features
+
+* report repository auto-upload settings to the web ([#489](https://github.com/opalinehq/cli/issues/489)) ([5817ed3](https://github.com/opalinehq/cli/commit/5817ed34e2da2306ba46e722493ecd539a5460ae))
+* show session upload progress and preserve partial success ([#487](https://github.com/opalinehq/cli/issues/487)) ([5ea2ee6](https://github.com/opalinehq/cli/commit/5ea2ee6a1114cd4a3853096af4b0bc530056a237))
+
 ## [0.8.1](https://github.com/opalinehq/cli/compare/opaline-cli@0.8.0...opaline-cli@0.8.1) (2026-09-17)
 
 

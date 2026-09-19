@@ -32,7 +32,7 @@ export async function getGitInfo(cwd: string): Promise<GitInfo> {
 		getGitRemoteUrl(repositoryRoot ?? cwd),
 		getGitBranch(cwd),
 		getGitSha(cwd),
-		getPackageInfo(repositoryRoot ?? cwd),
+		getPackageInfo(repositoryRoot ?? cwd, repositoryRoot),
 	]);
 
 	const gitRemote = remoteUrl ? normalizeRemoteUrl(remoteUrl) : undefined;
@@ -44,6 +44,21 @@ export async function getGitInfo(cwd: string): Promise<GitInfo> {
 		packageType: packageInfo?.type,
 		branch: branch ?? undefined,
 		sha: sha ?? undefined,
+	};
+}
+
+/** Discovery omits branch/SHA, but retains package names for legacy setting keys. */
+export async function getRepositoryInfo(cwd: string): Promise<GitInfo> {
+	const repositoryRoot = await getRepositoryRoot(cwd);
+	const [remoteUrl, packageInfo] = await Promise.all([
+		getGitRemoteUrl(repositoryRoot ?? cwd),
+		getPackageInfo(repositoryRoot ?? cwd, repositoryRoot),
+	]);
+	return {
+		repositoryRoot,
+		gitRemote: remoteUrl ? normalizeRemoteUrl(remoteUrl) : undefined,
+		packageName: packageInfo?.name,
+		packageType: packageInfo?.type,
 	};
 }
 
@@ -75,15 +90,16 @@ interface PackageInfo {
 	type: string;
 }
 
-async function getPackageInfo(cwd: string): Promise<PackageInfo | null> {
+async function getPackageInfo(
+	cwd: string,
+	repositoryRoot?: string,
+): Promise<PackageInfo | null> {
 	try {
-		const result = await exec("git", [
-			"-C",
-			cwd,
-			"rev-parse",
-			"--show-toplevel",
-		]);
-		const root = result.exitCode === 0 ? result.stdout.trim() : cwd;
+		const result = repositoryRoot
+			? undefined
+			: await exec("git", ["-C", cwd, "rev-parse", "--show-toplevel"]);
+		const root =
+			repositoryRoot ?? (result?.exitCode === 0 ? result.stdout.trim() : cwd);
 
 		return (
 			getNodePackage(root) ??

@@ -21,6 +21,10 @@ test("upload playback advances existing counts, preserves OFF repositories and k
 	const active = "github.com/team/ios-app";
 	const start = createPreview({ ...fixture, screen: "saving", progress: 0 });
 	expect(start.uploading).toBe(true);
+	expect(stripVTControlCharacters(start.ansi).replace(/\s+/g, " ")).toContain(
+		"0 B / —",
+	);
+	expect(stripVTControlCharacters(start.ansi)).toContain("Queued");
 	expect(start.state.uploadKeys).toContain(active);
 	expect(start.state.uploadKeys).not.toContain(off);
 	const partial = createPreview({
@@ -290,4 +294,27 @@ test("review page metadata stays aligned with visible rows and selected actions"
 			).toBe(control.label);
 	}
 	expect(seen).toEqual(preview.repositories.map((repo) => repo.key));
+});
+
+test("size-skip previews continue to completion without inflating uploaded counts", () => {
+	for (const user of ["new", "returning"]) {
+		const result = createPreview({
+			...fixture,
+			screen: `upload-skipped-${user}`,
+		});
+		expect(result.ansi).toContain("Continue [Enter]");
+		expect(result.ansi).not.toContain("Retry");
+		const completed = createPreview({
+			...fixture,
+			screen: user === "new" ? "saved-new" : "saved",
+			state: { ...result.state, uploadFailed: false, uploadSucceeded: true },
+		});
+		expect(completed.state.uploaded).toEqual(result.state.uploaded);
+		expect(completed.ansi).toContain("Successfully uploaded sessions");
+		expect(completed.ansi).toContain(
+			user === "new"
+				? "https://opaline.so/welcome"
+				: "https://opaline.so/acme/sessions",
+		);
+	}
 });

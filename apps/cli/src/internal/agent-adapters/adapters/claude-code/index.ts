@@ -273,6 +273,7 @@ class ClaudeCodeAdapter implements AgentAdapter {
 								? metadata.cwd
 								: decodedPath,
 						lastActivityAt: metadata.lastActivityAt,
+						sessionDate: metadata.sessionDate,
 					};
 					options.signal?.throwIfAborted();
 					await options.onSession?.(session);

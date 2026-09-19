@@ -53,6 +53,7 @@ export async function readJsonlFirstLine(
 export async function readSessionDiscoveryMetadata(filePath: string): Promise<{
 	cwd: string | undefined;
 	lastActivityAt: number | undefined;
+	sessionDate: number | undefined;
 }> {
 	try {
 		const file = await open(filePath, "r");
@@ -81,18 +82,27 @@ export async function readSessionDiscoveryMetadata(filePath: string): Promise<{
 						metadata.lastActivityAt,
 					);
 			}
-			return { cwd: head.cwd, lastActivityAt: lastActivityAt ?? mtimeMs };
+			return {
+				cwd: head.cwd,
+				sessionDate: head.sessionDate,
+				lastActivityAt: lastActivityAt ?? mtimeMs,
+			};
 		} finally {
 			await file.close();
 		}
 	} catch {
-		return { cwd: undefined, lastActivityAt: undefined };
+		return {
+			cwd: undefined,
+			sessionDate: undefined,
+			lastActivityAt: undefined,
+		};
 	}
 }
 
 function parseDiscoveryLines(content: string) {
 	let cwd: string | undefined;
 	let lastActivityAt: number | undefined;
+	let sessionDate: number | undefined;
 	for (const line of content.split("\n")) {
 		let entry: unknown;
 		try {
@@ -105,11 +115,13 @@ function parseDiscoveryLines(content: string) {
 			cwd = entry.cwd;
 		if ("timestamp" in entry && typeof entry.timestamp === "string") {
 			const timestamp = Date.parse(entry.timestamp);
-			if (Number.isFinite(timestamp))
+			if (Number.isFinite(timestamp)) {
+				sessionDate = Math.min(sessionDate ?? timestamp, timestamp);
 				lastActivityAt = Math.max(lastActivityAt ?? 0, timestamp);
+			}
 		}
 	}
-	return { cwd, lastActivityAt };
+	return { cwd, sessionDate, lastActivityAt };
 }
 
 export async function walkJsonlFiles(dir: string): Promise<string[]> {

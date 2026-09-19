@@ -54,6 +54,7 @@ async function transcriptHasTimestamp(path: string): Promise<boolean> {
 export interface CodexSessionMeta {
 	id: string;
 	cwd: string;
+	sessionDate?: number;
 	gitBranch?: string;
 	gitSha?: string;
 	gitRemote?: string;
@@ -77,6 +78,11 @@ export async function readCodexSessionMeta(
 				? payload.id
 				: basename(filePath, ".jsonl"),
 		cwd: typeof payload.cwd === "string" ? payload.cwd : "",
+		sessionDate:
+			typeof parsed.timestamp === "string" &&
+			Number.isFinite(Date.parse(parsed.timestamp))
+				? Date.parse(parsed.timestamp)
+				: undefined,
 		gitBranch: typeof git.branch === "string" ? git.branch : undefined,
 		gitSha:
 			typeof git.commit_hash === "string"
@@ -170,6 +176,7 @@ class CodexAdapter implements AgentAdapter {
 					gitSha: meta.gitSha,
 					gitRemote: meta.gitRemote,
 					lastActivityAt: metadata.lastActivityAt,
+					sessionDate: meta.sessionDate ?? metadata.sessionDate,
 				};
 				options.signal?.throwIfAborted();
 				await options.onSession?.(session);

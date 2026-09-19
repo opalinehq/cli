@@ -115,6 +115,10 @@ for (const global of [true, false]) {
 
 test("keeps legacy allowlist selections ON and removes the old key when switched OFF", async () => {
 	const fixture = await createFixture();
+	await writeFile(
+		join(fixture.repo, "package.json"),
+		JSON.stringify({ name: "legacy-package" }),
+	);
 	const claude = createClaudeCodeAdapter({ homeDir: fixture.root });
 	claude.installHook({ global: true });
 	const gitInfo = await getGitInfo(fixture.repo);
@@ -176,8 +180,12 @@ test("fills the table as sessions arrive and merges deleted Conductor worktrees 
 		);
 	}
 	const progress: number[] = [];
+	const discoveries: string[][] = [];
 	const rows = await discoverUploadRepositories(
-		(state) => progress.push(state.sessions),
+		(state, discovered) => {
+			progress.push(state.sessions);
+			discoveries.push(discovered.map((row) => row.key));
+		},
 		{ cwd: fixture.repo, configDir: fixture.config, adapters: [claude] },
 	);
 	expect(progress).toContain(0);
@@ -186,6 +194,11 @@ test("fills the table as sessions arrive and merges deleted Conductor worktrees 
 	expect(rows).toHaveLength(1);
 	expect(rows[0]?.sessionCount).toBe(2);
 	expect(rows[0]?.paths).toContain(missing);
+	for (const [index, keys] of discoveries.entries()) {
+		expect(keys).toHaveLength(new Set(keys).size);
+		for (const key of discoveries[index - 1] ?? []) expect(keys).toContain(key);
+		expect(keys.length).toBeLessThanOrEqual(rows.length);
+	}
 });
 
 test("an invalid Codex setting leaves existing Rudel hooks intact and retry migrates once", async () => {

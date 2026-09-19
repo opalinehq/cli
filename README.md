@@ -22,7 +22,7 @@
 
 ## See Opaline in action
 
-Opaline brings your team's coding sessions into a shared workspace. Browse sessions across repositories, follow conversations and tool calls, and see model usage, tokens, and costs in context.
+Opaline brings your team's coding sessions into a shared workspace. Browse sessions across repositories, follow conversations and tool calls, and see model usage, tokens, and estimated API costs in context.
 
 https://github.com/user-attachments/assets/0df4c0b9-bb41-44af-b104-050aa9ae0756
 
@@ -63,7 +63,6 @@ Known secret patterns are filtered before upload, but **filtering cannot guarant
 
 The CLI also sends limited usage analytics, including version, operating system, setup results, and repository/session counts. These events exclude transcript content, repository names, and local paths. Anonymous activity is linked to your account after sign-in.
 
-
 See [data handling](docs/data-handling.md) for the full disclosure and persistent opt-out settings.
 
 ## Common commands
@@ -73,6 +72,7 @@ See [data handling](docs/data-handling.md) for the full disclosure and persisten
 | `npx opaline@latest` | Manage repositories and upload sessions. |
 | `npx opaline@latest whoami` | Show your account and upload failures. |
 | `npx opaline@latest doctor` | Check authentication, connection, and hooks. |
+| `npx opaline@latest update` | Review and update supported persistent installations. |
 | `npx opaline@latest --help` | Show available commands and options. |
 
 Prefer a shorter command? [Install globally](docs/usage.md#optional-global-install) to use `opaline` directly.

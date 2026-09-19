@@ -150,6 +150,7 @@ test("reads transcript activity dates rather than the date the file was copied",
 	await utimes(path, new Date("2026-09-01"), new Date("2026-09-01"));
 	expect(await readSessionDiscoveryMetadata(path)).toEqual({
 		cwd: "/repo/with-hyphens",
+		sessionDate: Date.parse("2026-01-01T00:00:00Z"),
 		lastActivityAt: Date.parse("2026-02-01T00:00:00Z"),
 	});
 	expect(await readJsonlFirstLine(path)).toEqual({

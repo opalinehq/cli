@@ -15,6 +15,7 @@ import {
 	checkRepositoryUploads,
 	uploadRepositorySessions,
 } from "../lib/repository-session-upload.js";
+import { syncRepositorySettings } from "../lib/repository-settings-sync.js";
 import {
 	type RepositoryChange,
 	saveRepositoryChanges,
@@ -33,6 +34,7 @@ import {
 	type UploadManagerState,
 } from "../lib/upload-manager-state.js";
 import {
+	createUploadScreen,
 	promptUploadManager,
 	type UploadRepositoryScan,
 } from "../lib/upload-manager-terminal.js";
@@ -48,6 +50,7 @@ export async function runUpload(
 			"Open `opaline upload` in an interactive terminal to toggle repositories.",
 		);
 	}
+	const screen = createUploadScreen();
 	try {
 		const adapters = env.adapters ?? getUploadAdapters();
 		const repositories: UploadRepository[] = [];
@@ -64,21 +67,27 @@ export async function runUpload(
 			signal,
 		) => {
 			const rows = await discoverUploadRepositories(
-				(_progress, discovered) => onRepositories(discovered),
+				(progress, discovered) => onRepositories(discovered, progress),
 				{ signal, adapters, cwd: env.cwd },
 			);
 			const config = guided ? undefined : getManagerUploadConfig();
 			if (config) {
+				const settingsSync = syncRepositorySettings(rows, config, signal);
+				const updateHistory = () =>
+					onRepositories(rows, {
+						phase: "history",
+						sessions: rows.reduce((sum, row) => sum + row.sessionCount, 0),
+						repositories: rows.length,
+					});
+				updateHistory();
 				try {
-					await checkRepositoryUploads(
-						rows,
-						config,
-						() => onRepositories(rows),
-						signal,
-					);
+					await checkRepositoryUploads(rows, config, updateHistory, signal);
 				} catch (error) {
 					signal.throwIfAborted();
 					state.message = `Upload history unavailable: ${error instanceof Error ? error.message : String(error)}`;
+				} finally {
+					const warning = await settingsSync;
+					if (warning) state.message = `${state.message} ${warning}`.trim();
 				}
 			}
 			return rows;
@@ -86,9 +95,17 @@ export async function runUpload(
 		let operation: ((signal: AbortSignal) => Promise<void>) | undefined;
 		let operationError: Error | undefined;
 		let hasPreviousUploads: boolean | undefined;
+		let uploadedThisRun = 0;
+		let skippedBeforeRun: number | undefined;
+		const uploadedWorkspaces = new Set<string | undefined>();
 		while (
-			(await promptUploadManager(repositories, state, scan, operation)) ===
-			"save"
+			(await promptUploadManager(
+				repositories,
+				state,
+				scan,
+				operation,
+				screen,
+			)) === "save"
 		) {
 			scan = undefined;
 			operation = undefined;
@@ -129,8 +146,9 @@ export async function runUpload(
 							repositories,
 							state,
 							destinations,
+							screen.close,
 						)
-					: await resolveDestinations(destinations);
+					: await resolveDestinations(destinations, screen.close);
 				if (destination.cancelled) {
 					state.message = "Save cancelled. Your changes are still pending.";
 					continue;
@@ -157,8 +175,13 @@ export async function runUpload(
 					hasPreviousUploads = setup.hasUploadedSessions === true;
 				}
 				state.stage = "upload";
+				state.message = "";
+				state.uploadFailed = false;
+				state.uploadPage = 0;
+				state.followUpload = true;
 				state.completion = undefined;
 				operation = async (signal) => {
+					let settingsWarning: string | undefined;
 					try {
 						signal.throwIfAborted();
 						if (changes.length)
@@ -167,6 +190,12 @@ export async function runUpload(
 							});
 						state.desired.clear();
 						state.message = "";
+						if (config)
+							settingsWarning = await syncRepositorySettings(
+								repositories,
+								config,
+								signal,
+							);
 						signal.throwIfAborted();
 						if (targets.length && config) {
 							await guided?.start();
@@ -178,17 +207,27 @@ export async function runUpload(
 								() => {},
 								signal,
 							);
+							uploadedThisRun += summary.succeeded;
+							skippedBeforeRun ??=
+								targets.reduce((count, repo) => count + repo.sessionCount, 0) -
+								summary.total;
 							state.message =
 								summary.failed + summary.skipped
-									? `${summary.succeeded} uploaded · ${summary.failed + summary.skipped} need attention.`
-									: cliMessage("uploadSummary", { count: summary.succeeded });
-							if (!summary.failed && !summary.skipped) {
-								const uploadedWorkspaces = new Set(
-									targets.map(
-										(repo) =>
-											repo.uploadedOrganizationId ?? repo.organizationId,
-									),
-								);
+									? [
+											`${uploadedThisRun} uploaded`,
+											summary.failed ? `${summary.failed} failed` : "",
+											summary.skipped ? `${summary.skipped} skipped` : "",
+										]
+											.filter(Boolean)
+											.join(" · ")
+									: cliMessage("uploadSummary", { count: uploadedThisRun });
+							state.uploadFailed = summary.failed + summary.skipped > 0;
+							if (uploadedThisRun > 0 || summary.failed === 0) {
+								operationError = undefined;
+								for (const repo of targets)
+									uploadedWorkspaces.add(
+										repo.uploadedOrganizationId ?? repo.organizationId,
+									);
 								const completion = getUploadCompletion(
 									config.endpoint,
 									hasPreviousUploads ?? false,
@@ -198,34 +237,28 @@ export async function runUpload(
 								);
 								if (guided) {
 									await guided.complete({
-										uploaded: summary.succeeded,
-										skipped:
-											targets.reduce(
-												(count, repo) => count + repo.sessionCount,
-												0,
-											) - summary.total,
-										failed: 0,
+										uploaded: uploadedThisRun,
+										skipped: skippedBeforeRun,
+										// Size skips were never attempted. Keep them out of
+										// uploaded/already-present totals and actual failures.
+										failed: summary.failed,
 									});
 									state.completion = guided.completionLink(completion);
 								} else state.completion = completion;
 								state.selectionVisible = false;
 							} else {
-								state.error = {
-									message: [
-										state.message,
-										...targets
-											.filter((repo) => repo.uploadError)
-											.map((repo) => `${repo.name}: ${repo.uploadError}`),
-										"Already uploaded sessions are kept. Retry to upload the remaining sessions.",
-									].join("\n\n"),
-									page: 0,
-								};
-								if (guided) throw new Error(state.error.message);
+								state.uploadFailed = true;
+								state.uploadPage = 0;
+								if (guided) {
+									operationError = new Error(state.message);
+								}
 							}
 						} else
 							state.message = cliMessage("saveSummary", {
 								changes: `${changes.length} change${changes.length === 1 ? "" : "s"}`,
 							});
+						if (settingsWarning)
+							state.message = `${state.message} ${settingsWarning}`.trim();
 					} catch (error) {
 						if (guided && !signal.aborted) {
 							operationError =
@@ -243,7 +276,16 @@ export async function runUpload(
 				};
 			}
 		}
+		screen.close();
 		if (operationError) return operationError;
+		if (state.completion) {
+			p.log.success(state.message);
+			for (const url of state.completion.kind === "setup"
+				? [state.completion.url]
+				: state.completion.dashboards.map((dashboard) => dashboard.url))
+				p.log.info(url);
+			return;
+		}
 		p.outro(
 			getPendingRepositories(repositories, state).length
 				? cliMessage("discarded")
@@ -251,13 +293,15 @@ export async function runUpload(
 		);
 	} catch (error) {
 		return error instanceof Error ? error : new Error(String(error));
+	} finally {
+		screen.close();
 	}
 }
 
 function getManagerUploadConfig(
 	guided?: GuidedUpload,
 ): UploadConfig | undefined {
-	const credentials = loadCredentials();
+	const credentials = guided?.credentials ?? loadCredentials();
 	if (!credentials) return undefined;
 	return {
 		endpoint: `${guided?.apiBase ?? getApiBaseOverride() ?? credentials.apiBaseUrl}/rpc`,
@@ -273,8 +317,9 @@ async function resolveGuidedDestination(
 	repositories: UploadRepository[],
 	state: UploadManagerState,
 	changes: RepositoryChange[],
+	showPrompt: () => void,
 ) {
-	const approved = await guided.authorize(repositories, state);
+	const approved = await guided.authorize(repositories, state, showPrompt);
 	for (const change of changes)
 		if (change.enabled) change.organizationId = approved.organizationId;
 	return {
@@ -284,7 +329,10 @@ async function resolveGuidedDestination(
 	};
 }
 
-async function resolveDestinations(changes: RepositoryChange[]): Promise<
+async function resolveDestinations(
+	changes: RepositoryChange[],
+	showPrompt: () => void,
+): Promise<
 	| { cancelled: true }
 	| {
 			cancelled: false;
@@ -295,13 +343,17 @@ async function resolveDestinations(changes: RepositoryChange[]): Promise<
 	const enabling = changes.filter((change) => change.enabled);
 	if (enabling.length === 0) return { cancelled: false, organizations: [] };
 	const risk = describeSavedCredentialsApiBaseRisk();
-	if (risk) p.log.warn(risk);
+	if (risk) {
+		showPrompt();
+		p.log.warn(risk);
+	}
 	const apiBase = loadCredentials()?.apiBaseUrl ?? getDefaultApiBase();
 	let auth = await verifyAuth();
 	if (
 		!auth.authenticated &&
 		(auth.reason === "no_credentials" || auth.reason === "token_expired")
 	) {
+		showPrompt();
 		const error = await runLogin({
 			apiBase,
 			allowInsecureApiBase: false,
@@ -334,6 +386,7 @@ async function resolveDestinations(changes: RepositoryChange[]): Promise<
 		if (!organizationId && organizations.length === 1)
 			organizationId = organizations[0]?.id;
 		if (!organizationId) {
+			showPrompt();
 			const selected = await p.select({
 				message: cliMessage("destination"),
 				options: organizations.map((org) => ({
