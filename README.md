@@ -22,7 +22,7 @@
 
 ## See Opaline in action
 
-Opaline brings your team's coding sessions into a shared workspace. Browse sessions across repositories, follow conversations and tool calls, and see model usage, tokens, and estimated API costs in context.
+Opaline brings your team's coding sessions into a shared workspace. Browse sessions across repositories, follow conversations and tool calls, and see model usage, tokens, and API costs in context.
 
 https://github.com/user-attachments/assets/0df4c0b9-bb41-44af-b104-050aa9ae0756
 
