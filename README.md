@@ -1,6 +1,6 @@
 <h1 align="center">Opaline</h1>
 
-<p align="center"><strong>Clarity for your team's coding sessions.</strong></p>
+<p align="center"><strong>Pull back the curtain on your team's coding sessions.</strong></p>
 
 <p align="center">
   Explore your team's Claude Code and Codex sessions.<br>
