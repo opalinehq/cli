@@ -1,4 +1,4 @@
-<h1 align="center">Opaline</h1>
+<h1 align="center">Opaline CLI</h1>
 
 <p align="center"><strong>Pull back the curtain on your team's coding sessions.</strong></p>
 
