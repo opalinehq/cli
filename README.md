@@ -65,9 +65,6 @@ The CLI also sends limited usage analytics, including version, operating system,
 
 To run without CLI usage analytics:
 
-```bash
-DO_NOT_TRACK=1 npx opaline@latest
-```
 
 See [data handling](docs/data-handling.md) for the full disclosure and persistent opt-out settings.
 
