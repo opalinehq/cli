@@ -3,7 +3,7 @@
 <p align="center"><strong>Pull back the curtain on your team's coding sessions.</strong></p>
 
 <p align="center">
-  Explore your team's Claude Code and Codex sessions.<br>
+  Analytics for your team's Claude Code and Codex sessions.<br>
   Understand what happened, how agents worked, and where the effort went.
 </p>
 
