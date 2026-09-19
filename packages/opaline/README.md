@@ -36,7 +36,7 @@ Official releases also send limited usage analytics, including repository/sessio
 - [Data handling](https://github.com/opalinehq/cli/blob/main/docs/data-handling.md) — full disclosure and persistent analytics opt-out.
 - [GitHub](https://github.com/opalinehq/cli) — source code and contributions.
 
-`opaline` is the recommended installation name. It uses the `@opalinehq/cli` implementation at the same version. Existing credentials and settings remain in `~/.rudel`.
+Use `opaline` for new installations. Existing credentials and settings remain in `~/.rudel`.
 
 ## License
 
