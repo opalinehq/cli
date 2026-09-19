@@ -24,8 +24,7 @@
 
 Opaline brings your team's coding sessions into a shared workspace. Browse sessions across repositories, follow conversations and tool calls, and see model usage, tokens, and costs in context.
 
-<!-- PRODUCT RECORDING: Replace the placeholder image below with your Opaline app screen recording. Keep this product section above CLI setup. -->
-![Opaline product walkthrough — screen recording coming soon.](docs/assets/product-demo-placeholder.svg)
+https://github.com/user-attachments/assets/0df4c0b9-bb41-44af-b104-050aa9ae0756
 
 This repository contains the **open-source CLI** that connects your local sessions to [the Opaline app](https://opaline.so).
 
