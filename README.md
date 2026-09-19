@@ -83,6 +83,6 @@ Prefer a shorter command? [Install globally](docs/usage.md#optional-global-insta
 - [Data handling](docs/data-handling.md) — transcript uploads, secret filtering, and usage analytics.
 - [Contributing](CONTRIBUTING.md) — local development and the CLI playground.
 - [Report a bug](https://github.com/opalinehq/cli/issues) · [Report a security issue privately](SECURITY.md).
-- [Contact Evren](mailto:evren@opaline.so).
+- [Contact](mailto:evren@opaline.so).
 
 Licensed under [MIT](LICENSE).
