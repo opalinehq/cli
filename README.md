@@ -63,8 +63,6 @@ Known secret patterns are filtered before upload, but **filtering cannot guarant
 
 The CLI also sends limited usage analytics, including version, operating system, setup results, and repository/session counts. These events exclude transcript content, repository names, and local paths. Anonymous activity is linked to your account after sign-in.
 
-To run without CLI usage analytics:
-
 
 See [data handling](docs/data-handling.md) for the full disclosure and persistent opt-out settings.
 
