@@ -22,11 +22,6 @@ does not automatically authorize GitHub Actions. The repository field must
 match the GitHub repository running the workflow, including any repository
 rename. The publish job uses GitHub-hosted Ubuntu and Node 24.
 
-npm support has already created `opaline@0.0.1-security`, so its package
-settings exist. Configure its trusted publisher before running the first
-release. A normal stable release with the `latest` tag supersedes that holding
-package; it does not need to be unpublished.
-
 See [npm's trusted publishing documentation](https://docs.npmjs.com/trusted-publishers/).
 
 ## Automated releases
@@ -36,8 +31,6 @@ See [npm's trusted publishing documentation](https://docs.npmjs.com/trusted-publ
    configuration updates both launchers' versions and exact dependency pins.
    The workflow refreshes `bun.lock` on that release PR so frozen installs
    continue to work. Review all three package manifests and the lockfile.
-   The new launcher's starting version is a source baseline, not an assertion
-   that `opaline@0.5.3` has already been published.
 3. Merge the release PR. Release Please creates the GitHub release and the
    `opaline-cli@<version>` tag. There are no separate `rudel@*` or `opaline@*`
    Git tags: the existing repository tag rules remain compatible with this flow.
@@ -49,7 +42,7 @@ See [npm's trusted publishing documentation](https://docs.npmjs.com/trusted-publ
    same version and the `latest` tag.
 
 All three install names remain supported. Do not deprecate or unpublish the
-compatibility packages as part of this migration.
+compatibility packages when maintaining or releasing the CLI.
 
 Release Please tracks changes under `apps/cli`. A launcher-only change should
 include an update to the CLI's installation documentation under `apps/cli`
@@ -76,4 +69,4 @@ npx --yes rudel@latest --version
 
 The three commands should report the same CLI version. `rudel` also emits
 its existing rename notice to stderr. Migration instructions for existing
-global installations are in [README.md](README.md#install-names-and-upgrades).
+global installations are in the [CLI guide](docs/usage.md#optional-global-install).

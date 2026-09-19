@@ -1,5 +1,7 @@
 # Persistent Claude + Codex Skill Extraction
 
+> **Historical monorepo plan.** The paths, branches, and infrastructure below refer to the former combined repository. This is not a current specification or runbook for the public CLI. See [Contributing](../../CONTRIBUTING.md) for current CLI development instructions.
+
 Status: closeout implementation, regeneration, and all locally runnable verification are complete. No migration has been applied anywhere.
 
 ## Closeout decisions

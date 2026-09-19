@@ -1,75 +1,41 @@
-# `opaline`
+# Opaline CLI
 
-The canonical Opaline CLI package for Claude Code and OpenAI Codex session
-analytics.
+**Your Claude Code and Codex sessions, in one place.**
+
+This package, `@opalinehq/cli`, contains the shared CLI implementation. For new installations, use [`opaline`](https://www.npmjs.com/package/opaline), which runs the same implementation at the matching version.
+
+## Get started
+
+Requires Node.js 20 or newer. Run from any directory:
 
 ```bash
 npx opaline@latest
 ```
 
-Run this from any directory. The CLI scans local Claude Code and Codex sessions,
-shows repository and session counts, and lets you choose which repos to upload
-and keep syncing. Login opens only after selection. `pnpx opaline@latest`
-works too. A global install remains optional.
+Choose repositories with ↑↓ and Space. Press Enter to review, then Enter to confirm. Sign in through your browser when prompted. Existing sessions upload to Opaline, and future sessions sync automatically for enabled repositories.
 
-Copying the command from the Opaline demo adds a hidden `--code` value. That
-one-time code pairs the terminal with your browser for live selection and upload
-status. It expires after ten minutes if unused. Approve login in the same browser
-where you copied the command. First-time uploads continue browser setup; returning
-users open their workspace Sessions page.
+After upload, new users finish setup in the browser; returning users open their workspace's Sessions page. If you start setup in your browser, use the command it supplies, including its `--code` value.
 
-Automatic uploads retain the bundled CLI under `~/.rudel/runtime` and use your
-Node executable, so hooks keep working after the temporary runner cache is gone.
+Run the command again to change which repositories sync. Existing Rudel credentials and settings remain in `~/.rudel`.
 
-Interactive `opaline` / `opaline upload` calls check for updates before opening
-the upload manager. One **Update / Skip** prompt links to the exact GitHub release
-so you can review its notes and source first. Update refreshes an identifiable npm
-or pnpm global installation and the existing automatic-upload runtime; it does
-not enable repositories, install missing hooks, or change login/workspace settings.
-You can also run `npx opaline@latest update` explicitly.
+## Updates
 
-Updates pin the reviewed version and respect package-manager policy wrappers.
-If policy, ambiguous installations, or permissions prevent an update, the CLI
-reports which part needs attention. Windows global installs require their original
-package-manager command. Legacy hooks using a custom configuration profile require
-setup for that profile. Skip applies to the current invocation. Help/version, CI,
-background hooks, file imports, and browser pairing do not show update prompts.
-An npx invocation has already launched its selected version before this prompt;
-the confirmation controls changes to persistent installations. Older pinned
-invocations keep running their selected version.
+Eligible interactive commands may offer one **Update / Skip** prompt with a link to the exact open-source release. Accepting updates a supported existing npm or pnpm global installation and the retained automatic-upload runtime; it does not add a global installation for npx-only users or change repository selections, login, or workspace settings.
 
-`opaline upload` groups discovered worktrees by repository, saves the selected
-repositories for automatic upload, and sends only sessions the server does not
-already have. Press Space to toggle, Enter to review, then Enter to confirm.
-Existing Rudel hooks count as enabled and migrate when selections are saved.
+Run `npx opaline@latest update` to check explicitly. Ambiguous and Windows global installations stay unchanged; update failures report a manual command or corrective action when available. See [review and install updates](https://github.com/opalinehq/cli/blob/main/docs/usage.md#review-and-install-updates) for the complete behavior.
 
-The CLI keeps using the existing `~/.rudel` state directory so upgrades do not
-require another login. Its production API is `https://opaline.so`.
+## Data and privacy
 
-For commands, configuration, troubleshooting, and the full security/data
-handling disclosure, see the
-[repository README](https://github.com/opalinehq/cli#readme).
+Opaline uploads full session transcripts, which can include prompts, responses, source code, tool output, and metadata. Known-secret filtering is best-effort and cannot guarantee every sensitive value is removed.
 
-Important: session transcripts are uploaded. Known-pattern secret filtering is
-best-effort and cannot guarantee that every sensitive value is removed.
-Capable servers use direct multipart object-storage uploads after filtering;
-older servers continue to use the legacy ingest endpoint.
+Official releases also send limited usage analytics, including repository/session counts, linked to your account after sign-in. Those events exclude transcript content, repository names, and local paths. Set `DO_NOT_TRACK=1` or `POSTHOG_ENABLED=false` in the CLI's environment to opt out of usage analytics.
 
-Official releases send a small set of usage events to PostHog: first run,
-login attempts and results, and automatic-upload setup results. These include
-the CLI version and operating system. The first-run event includes the command name.
-Setup results include the selected repository count, total local session count,
-and an anonymous list of session counts per repository, grouped by agent and
-destination workspace. Duplicate discoveries within a repository count once.
-These describe the selected local sessions, including previously uploaded ones,
-and do not measure successful uploads. The upload table measures the selected repositories, including when opened
-through the legacy `enable` or `disable` names. Counts are snapshots,
-not values to sum across repeated setup events or agents sharing a repository.
-An anonymous local identifier links activity to your Opaline account after login.
-Command arguments, connection codes, repository names, local paths, and session
-contents are not included in these product analytics events. `doctor` and hook
-invocations do not emit first-run events.
+## Learn more
 
-Set `DO_NOT_TRACK=1` or `POSTHOG_ENABLED=false` to disable product analytics.
-Analytics failures do not prevent CLI commands from running. Source builds are
-unconfigured unless explicitly supplied with PostHog configuration.
+- [CLI guide](https://github.com/opalinehq/cli/blob/main/docs/usage.md) — commands, installation, configuration, troubleshooting, and migration from Rudel.
+- [Data handling](https://github.com/opalinehq/cli/blob/main/docs/data-handling.md) — full transcript and analytics disclosure, including persistent opt-out.
+- [Contributing](https://github.com/opalinehq/cli/blob/main/CONTRIBUTING.md) — local development and the CLI playground.
+
+## License
+
+[MIT](LICENSE)

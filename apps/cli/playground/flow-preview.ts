@@ -1,3 +1,4 @@
+import { PRODUCTION_API_BASE } from "../src/lib/api-target.js";
 import type { CliCopyKey } from "../src/lib/cli-copy.js";
 import { cliMessage } from "../src/lib/cli-messages.js";
 import type { UploadManagerTheme } from "../src/lib/upload-manager-theme.js";
@@ -43,7 +44,7 @@ export function renderFlowPreview(
 	if (screen === "login") {
 		intro();
 		line("●", message("authBrowser"));
-		line("│", "https://app.rudel.ai/device?user_code=DEMO-1234", 2);
+		line("│", `${PRODUCTION_API_BASE}/device?user_code=DEMO-1234`, 2);
 		line("●", message("authCode", { code: "DEMO-1234" }));
 		spin(message("authWaiting"));
 	} else if (screen === "authenticated") {
