@@ -39,9 +39,16 @@ export interface FileBackedUploadSubagent {
 	path: string;
 }
 
+export interface FileBackedUploadSubagentDiscovery {
+	omittedCount: number | null;
+	reason: string | null;
+	status: "complete" | "partial" | "unavailable";
+}
+
 export interface FileBackedUploadRequest {
 	kind: "file";
 	metadata: Omit<IngestSessionInput, "content" | "subagents">;
+	subagentDiscovery: FileBackedUploadSubagentDiscovery;
 	subagents: FileBackedUploadSubagent[];
 	transcriptPath: string;
 }

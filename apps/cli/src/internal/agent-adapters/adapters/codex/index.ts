@@ -248,6 +248,11 @@ class CodexAdapter implements AgentAdapter {
 				organizationId: context.organizationId,
 				upload_mode: context.uploadMode,
 			},
+			subagentDiscovery: {
+				omittedCount: 0,
+				reason: null,
+				status: "complete",
+			},
 			subagents: [],
 			transcriptPath: session.transcriptPath,
 		};

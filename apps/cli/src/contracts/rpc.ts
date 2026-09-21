@@ -14,6 +14,12 @@ import {
 	SESSION_UPLOAD_SHRINK_REJECTED_CODE,
 	SESSION_UPLOAD_SHRINK_REJECTED_MESSAGE,
 } from "./ingest.js";
+import {
+	RepositoryEvidenceCommitInputSchema,
+	RepositoryEvidenceCommitOutputSchema,
+	RepositoryEvidenceInitInputSchema,
+	RepositoryEvidenceInitOutputSchema,
+} from "./repository-evidence.js";
 import { ReportUploadFailuresInputSchema } from "./upload-failure.js";
 
 const UserSchema = z.object({
@@ -109,4 +115,12 @@ export const contract = {
 				}),
 			},
 		}),
+	repositoryEvidence: {
+		commit: oc
+			.input(RepositoryEvidenceCommitInputSchema)
+			.output(RepositoryEvidenceCommitOutputSchema),
+		init: oc
+			.input(RepositoryEvidenceInitInputSchema)
+			.output(RepositoryEvidenceInitOutputSchema),
+	},
 };

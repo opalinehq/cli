@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 const fixtureHomes: string[] = [];
 const hookCommand = "opaline hooks claude session-end";
+const startHookCommand = "opaline hooks claude session-start";
 const otherHook = { type: "command", command: "echo keep-existing-hook" };
 
 afterAll(async () => {
@@ -38,6 +39,12 @@ test("installs once in user settings and can disable from another repository", a
 	expect(JSON.parse(installed)).toEqual({
 		...original,
 		hooks: {
+			SessionStart: [
+				{
+					matcher: "",
+					hooks: [{ type: "command", command: startHookCommand, async: true }],
+				},
+			],
 			SessionEnd: [
 				{ matcher: "", hooks: [otherHook] },
 				{
@@ -86,6 +93,12 @@ test("upgrades a legacy user hook and preserves neighboring hooks on removal", a
 	await runProbe("install", home, home);
 	expect(JSON.parse(await readFile(settingsPath, "utf8"))).toEqual({
 		hooks: {
+			SessionStart: [
+				{
+					matcher: "",
+					hooks: [{ type: "command", command: startHookCommand, async: true }],
+				},
+			],
 			SessionEnd: [
 				{
 					matcher: "",

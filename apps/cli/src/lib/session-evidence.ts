@@ -1,0 +1,523 @@
+import { readFile } from "node:fs/promises";
+import type { IngestSessionInput } from "../contracts/index.js";
+import type {
+	FileBackedUploadRequest,
+	FileBackedUploadSubagentDiscovery,
+} from "../internal/agent-adapters/index.js";
+import { filterSessionTextFields } from "../internal/secret-filter/index.js";
+import { getApiBaseOverride } from "./api-target.js";
+import type { Credentials } from "./credentials.js";
+import { getConfigDir } from "./local-state.js";
+import { collectSessionRepositoryContext } from "./repo-context.js";
+import {
+	createRepositorySpoolBinding,
+	createRepositorySpoolEnv,
+	markRepositorySpoolCaptureAccepted,
+} from "./repo-spool.js";
+import {
+	deferPendingRepositoryEvidence,
+	normalizeRepositoryEvidenceEndpoint,
+	readPendingRepositoryEvidence,
+	removePendingRepositoryEvidence,
+	writePendingRepositoryEvidence,
+} from "./repository-evidence-pending.js";
+import {
+	buildRepositoryEvidenceUpload,
+	isRetryableRepositoryEvidenceError,
+	uploadRepositoryEvidence,
+} from "./repository-evidence-upload.js";
+import {
+	buildSessionAttribution,
+	type SessionAttributionHookKind,
+	type SessionAttributionSourceStream,
+} from "./session-attribution.js";
+import {
+	describeAcceptedTranscriptPrefix,
+	planTranscriptRevision,
+} from "./transcript-revision.js";
+import {
+	advanceTranscriptRevision,
+	readTranscriptRevision,
+	type TranscriptRevisionDeliveryScope,
+} from "./transcript-revision-store.js";
+import { allowsInsecureEndpointFromEnv } from "./upload-endpoint.js";
+
+type EvidenceLifecycle = "start" | "resume" | "checkpoint" | "end";
+
+const EVIDENCE_DELIVERY_BUDGET_MS = 20_000;
+
+export async function captureAndUploadSessionEvidence(input: {
+	readonly credentials: Credentials;
+	readonly lifecycle: EvidenceLifecycle;
+	readonly hookReceivedAt: string;
+	readonly onWarning?: (message: string) => void;
+	readonly organizationId: string;
+	readonly request: IngestSessionInput | FileBackedUploadRequest;
+	readonly requestMaterializedAt?: {
+		readonly completedAt: string;
+		readonly startedAt: string;
+	};
+	readonly terminalTranscript: boolean;
+}): Promise<{ readonly contextId: string; readonly receiptId: string }> {
+	if (!input.credentials.user) {
+		throw new Error("Repository evidence requires an authenticated CLI user.");
+	}
+	const configDir = getConfigDir();
+	const apiBase = getApiBaseOverride() ?? input.credentials.apiBaseUrl;
+	const endpoint = normalizeRepositoryEvidenceEndpoint(`${apiBase}/rpc`);
+	const materialized = await materializeEvidenceRequest(
+		input.request,
+		input.requestMaterializedAt,
+	);
+	const request = materialized.request;
+	const filtered = filterSessionTextFields({
+		content: request.content,
+		subagents: request.subagents,
+	});
+	const contextCapture = await collectSessionRepositoryContext({
+		accountId: input.credentials.user.id,
+		endpoint,
+		lifecycle: input.lifecycle,
+		organizationId: input.organizationId,
+		repositoryPath: request.projectPath,
+	});
+	const scope = {
+		actorId: input.credentials.user.id,
+		provider: request.source,
+		providerInstanceId: contextCapture.context.localIdentity.installationId,
+		sessionId: request.sessionId,
+	} as const;
+	const deliveryScope: TranscriptRevisionDeliveryScope = {
+		endpoint,
+		organizationId: input.organizationId,
+		transcriptScope: scope,
+	};
+	const previous = await readTranscriptRevision(deliveryScope);
+	const transcriptRevision = await planTranscriptRevision({
+		content: new TextEncoder().encode(filtered.content),
+		previous,
+		scope,
+		terminal: input.terminalTranscript,
+	});
+	const acceptedRoot = describeAcceptedTranscriptPrefix(
+		new TextEncoder().encode(filtered.content),
+		input.terminalTranscript,
+	);
+	const acceptedRootContent = new TextDecoder().decode(acceptedRoot.bytes);
+	const firstActionAt = findFirstTranscriptTimestamp(acceptedRootContent);
+	const timing = getFirstActionTiming(
+		input.lifecycle,
+		firstActionAt,
+		contextCapture.bundle.manifest.completedAt,
+	);
+	const attribution = buildSessionAttribution({
+		captureId: contextCapture.bundle.manifest.captureId,
+		childDiscovery: materialized.childDiscovery,
+		hook: {
+			kind: getAttributionHookKind(input.lifecycle, request.source),
+			nativeBeforeActionBoundary:
+				input.lifecycle === "start" && request.source === "claude_code",
+			receivedAt: input.hookReceivedAt,
+		},
+		opalineSessionId: request.sessionId,
+		source: request.source,
+		streams: applyFilteredContent(materialized.streams, filtered),
+		terminal: input.terminalTranscript,
+		transcriptRevision: transcriptRevision.manifest,
+	});
+	const upload = buildRepositoryEvidenceUpload({
+		attribution,
+		bundle: contextCapture.bundle,
+		captureLifecycle: input.lifecycle,
+		context: contextCapture.context,
+		firstActionAt: timing.firstActionAt,
+		firstActionBasis: timing.firstActionBasis,
+		firstActionRelationship: timing.firstActionRelationship,
+		organizationId: input.organizationId,
+		session: {
+			...request,
+			content: filtered.content,
+			subagents: filtered.subagents ? [...filtered.subagents] : undefined,
+		},
+		terminalTranscript: input.terminalTranscript,
+		transcriptLastEventAt: attribution.streams[0]?.prefix.lastEventAt ?? null,
+		transcriptRevision,
+	});
+	const currentPending = {
+		endpoint,
+		transcriptRevision: transcriptRevision.manifest,
+		upload,
+	};
+	await writePendingRepositoryEvidence(currentPending, configDir);
+	const deadlineAt = Date.now() + EVIDENCE_DELIVERY_BUDGET_MS;
+	const receipt = await uploadWithBoundedRetries(upload, input.credentials, {
+		deadlineAt,
+		endpoint,
+	});
+	await markRepositorySpoolCaptureAccepted(
+		contextCapture.context.binding,
+		contextCapture.stored.capture.captureId,
+		"local-context",
+		contextCapture.context.spoolEnv,
+	);
+	await advanceTranscriptRevision(
+		transcriptRevision.manifest,
+		deliveryScope,
+		configDir,
+	);
+	await removePendingRepositoryEvidence(currentPending, configDir);
+	let pendingError: unknown;
+	try {
+		pendingError = await retryOnePendingRepositoryEvidence(
+			input.credentials,
+			input.credentials.user.id,
+			endpoint,
+			configDir,
+			deadlineAt,
+			input.onWarning,
+		);
+	} catch (error) {
+		pendingError = error;
+	}
+	if (pendingError !== undefined) throw pendingError;
+	return {
+		contextId: receipt.contextId,
+		receiptId: receipt.receiptId,
+	};
+}
+
+export async function retryPendingSessionEvidence(
+	credentials: Credentials,
+	options: {
+		readonly allowInsecureEndpoint?: boolean;
+		readonly endpoint?: string;
+		readonly maxItems?: number;
+		readonly onWarning?: (message: string) => void;
+	} = {},
+): Promise<number> {
+	if (!credentials.user) {
+		throw new Error("Repository evidence requires an authenticated CLI user.");
+	}
+	const configDir = getConfigDir();
+	const requestedEndpoint = normalizeRepositoryEvidenceEndpoint(
+		options.endpoint ?? `${getApiBaseOverride() ?? credentials.apiBaseUrl}/rpc`,
+	);
+	let completed = 0;
+	const failures: unknown[] = [];
+	const maxItems = options.maxItems ?? 25;
+	const attemptedOperationIds = new Set<string>();
+	for (let attempted = 0; attempted < maxItems; attempted++) {
+		const readErrors: unknown[] = [];
+		const [pending] = await readPendingRepositoryEvidence(configDir, {
+			actorId: credentials.user.id,
+			endpoint: requestedEndpoint,
+			excludeOperationIds: attemptedOperationIds,
+			maxItems: 1,
+			onError: (error) => readErrors.push(error),
+			onWarning: (warning) => options.onWarning?.(warning.message),
+		});
+		failures.push(...readErrors);
+		if (!pending) {
+			if (readErrors.length > 0) continue;
+			break;
+		}
+		attemptedOperationIds.add(pending.upload.input.operationId);
+		try {
+			await uploadWithBoundedRetries(pending.upload, credentials, {
+				allowInsecureEndpoint: options.allowInsecureEndpoint,
+				endpoint: pending.endpoint,
+			});
+			await markPendingRepositoryCaptureAccepted(pending, configDir);
+			await advanceTranscriptRevision(
+				pending.transcriptRevision,
+				getPendingDeliveryScope(pending),
+				configDir,
+			);
+			await removePendingRepositoryEvidence(pending, configDir);
+			completed++;
+		} catch (error) {
+			failures.push(error);
+			await deferPendingRepositoryEvidence(pending, configDir);
+		}
+	}
+	if (failures.length > 0) {
+		throw new AggregateError(
+			failures,
+			`${failures.length} pending repository evidence capture(s) remain.`,
+		);
+	}
+	return completed;
+}
+
+async function retryOnePendingRepositoryEvidence(
+	credentials: Credentials,
+	actorId: string,
+	endpoint: string,
+	configDir: string,
+	deadlineAt: number,
+	onWarning: ((message: string) => void) | undefined,
+): Promise<unknown | undefined> {
+	if (Date.now() >= deadlineAt) return undefined;
+	const failures: unknown[] = [];
+	for (const pending of await readPendingRepositoryEvidence(configDir, {
+		actorId,
+		endpoint,
+		maxItems: 1,
+		onError: (error) => failures.push(error),
+		onWarning: (warning) => onWarning?.(warning.message),
+	})) {
+		try {
+			await uploadWithBoundedRetries(pending.upload, credentials, {
+				deadlineAt,
+				endpoint: pending.endpoint,
+			});
+			await markPendingRepositoryCaptureAccepted(pending, configDir);
+			await advanceTranscriptRevision(
+				pending.transcriptRevision,
+				getPendingDeliveryScope(pending),
+				configDir,
+			);
+			await removePendingRepositoryEvidence(pending, configDir);
+		} catch (error) {
+			failures.push(error);
+			await deferPendingRepositoryEvidence(pending, configDir);
+		}
+	}
+	return failures[0];
+}
+
+async function markPendingRepositoryCaptureAccepted(
+	pending: Awaited<ReturnType<typeof readPendingRepositoryEvidence>>[number],
+	configDir: string,
+): Promise<void> {
+	const binding = await createRepositorySpoolBinding({
+		accountId: pending.transcriptRevision.scope.actorId,
+		apiBaseUrl: pending.endpoint,
+		localIdentity: pending.upload.input.repository.local,
+		workspaceId: pending.upload.input.organizationId,
+	});
+	await markRepositorySpoolCaptureAccepted(
+		binding,
+		pending.upload.input.capture.contextId,
+		"local-context",
+		createRepositorySpoolEnv(configDir),
+	);
+}
+
+async function uploadWithBoundedRetries(
+	upload: ReturnType<typeof buildRepositoryEvidenceUpload>,
+	credentials: Credentials,
+	overrides: {
+		readonly allowInsecureEndpoint?: boolean;
+		readonly deadlineAt?: number;
+		readonly endpoint?: string;
+	} = {},
+) {
+	const apiBase = getApiBaseOverride() ?? credentials.apiBaseUrl;
+	const config = {
+		allowInsecureEndpoint:
+			overrides.allowInsecureEndpoint ?? allowsInsecureEndpointFromEnv(),
+		authType: credentials.authType,
+		endpoint: overrides.endpoint ?? `${apiBase}/rpc`,
+		token: credentials.token,
+	};
+	let lastError: unknown;
+	for (let attempt = 1; attempt <= 3; attempt++) {
+		const remainingMs = overrides.deadlineAt
+			? overrides.deadlineAt - Date.now()
+			: undefined;
+		if (remainingMs !== undefined && remainingMs <= 0) {
+			throw deliveryBudgetExceeded();
+		}
+		try {
+			return await uploadRepositoryEvidence(upload, {
+				...config,
+				operationTimeoutMs: remainingMs,
+			});
+		} catch (error) {
+			lastError = error;
+			if (!isRetryableRepositoryEvidenceError(error) || attempt === 3) break;
+			const retryDelayMs = overrides.deadlineAt
+				? Math.min(attempt * 100, overrides.deadlineAt - Date.now())
+				: attempt * 100;
+			if (retryDelayMs <= 0) throw deliveryBudgetExceeded();
+			await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+		}
+	}
+	throw lastError;
+}
+
+function getPendingDeliveryScope(
+	pending: Awaited<ReturnType<typeof readPendingRepositoryEvidence>>[number],
+): TranscriptRevisionDeliveryScope {
+	return {
+		endpoint: pending.endpoint,
+		organizationId: pending.upload.input.organizationId,
+		transcriptScope: pending.transcriptRevision.scope,
+	};
+}
+
+function deliveryBudgetExceeded(): Error {
+	return new Error(
+		`Repository evidence delivery exceeded its ${EVIDENCE_DELIVERY_BUDGET_MS}ms budget.`,
+	);
+}
+
+async function materializeEvidenceRequest(
+	request: IngestSessionInput | FileBackedUploadRequest,
+	requestMaterializedAt:
+		| { readonly completedAt: string; readonly startedAt: string }
+		| undefined,
+): Promise<{
+	readonly childDiscovery: FileBackedUploadSubagentDiscovery;
+	readonly request: IngestSessionInput;
+	readonly streams: readonly SessionAttributionSourceStream[];
+}> {
+	if (!isFileBackedEvidenceRequest(request)) {
+		const now = new Date().toISOString();
+		const materializedAt = requestMaterializedAt ?? {
+			completedAt: now,
+			startedAt: now,
+		};
+		return {
+			childDiscovery: {
+				omittedCount: null,
+				reason: "In-memory hook input did not include a child stream directory",
+				status: "unavailable",
+			},
+			request,
+			streams: [
+				{
+					content: request.content,
+					declaredAgentId: null,
+					materializedAt,
+					role: "root",
+				},
+			],
+		};
+	}
+	const [root, subagents] = await Promise.all([
+		readMaterializedStream(request.transcriptPath, null, "root"),
+		Promise.all(
+			request.subagents.map((subagent) =>
+				readMaterializedStream(subagent.path, subagent.agentId, "child"),
+			),
+		),
+	]);
+	return {
+		childDiscovery: request.subagentDiscovery,
+		request: {
+			...request.metadata,
+			content: root.content,
+			subagents:
+				subagents.length > 0
+					? subagents.map((subagent) => ({
+							agentId: subagent.declaredAgentId ?? "",
+							content: subagent.content,
+						}))
+					: undefined,
+		},
+		streams: [root, ...subagents],
+	};
+}
+
+async function readMaterializedStream(
+	path: string,
+	declaredAgentId: string | null,
+	role: "root" | "child",
+): Promise<SessionAttributionSourceStream> {
+	const startedAt = new Date().toISOString();
+	const content = await readFile(path, "utf8");
+	return {
+		content,
+		declaredAgentId,
+		materializedAt: {
+			completedAt: new Date().toISOString(),
+			startedAt,
+		},
+		role,
+	};
+}
+
+function applyFilteredContent(
+	streams: readonly SessionAttributionSourceStream[],
+	filtered: ReturnType<typeof filterSessionTextFields>,
+): readonly SessionAttributionSourceStream[] {
+	return streams.map((stream, index) => ({
+		...stream,
+		content:
+			index === 0
+				? filtered.content
+				: (filtered.subagents?.[index - 1]?.content ?? ""),
+	}));
+}
+
+function getAttributionHookKind(
+	lifecycle: EvidenceLifecycle,
+	source: IngestSessionInput["source"],
+): SessionAttributionHookKind {
+	if (source === "codex") return "codex-agent-turn-complete";
+	return lifecycle === "start" ? "claude-session-start" : "claude-session-end";
+}
+
+function isFileBackedEvidenceRequest(
+	request: IngestSessionInput | FileBackedUploadRequest,
+): request is FileBackedUploadRequest {
+	return "kind" in request && request.kind === "file";
+}
+
+function getFirstActionTiming(
+	lifecycle: EvidenceLifecycle,
+	firstActionAt: string | null,
+	captureCompletedAt: string,
+) {
+	if (lifecycle === "start") {
+		return {
+			firstActionAt: null,
+			firstActionBasis: "native-hook" as const,
+			firstActionRelationship: "before-first-action" as const,
+		};
+	}
+	if (
+		firstActionAt !== null &&
+		Date.parse(captureCompletedAt) >= Date.parse(firstActionAt)
+	) {
+		return {
+			firstActionAt,
+			firstActionBasis: "transcript-watermark" as const,
+			firstActionRelationship: "after-first-action" as const,
+		};
+	}
+	return {
+		firstActionAt: null,
+		firstActionBasis: "unavailable" as const,
+		firstActionRelationship: "unknown" as const,
+	};
+}
+
+function findFirstTranscriptTimestamp(content: string): string | null {
+	for (const line of content.split("\n")) {
+		const timestamp = readTimestamp(line);
+		if (timestamp !== null) return timestamp;
+	}
+	return null;
+}
+
+function readTimestamp(line: string): string | null {
+	if (!line.trim()) return null;
+	try {
+		const value: unknown = JSON.parse(line);
+		if (
+			typeof value === "object" &&
+			value !== null &&
+			"timestamp" in value &&
+			typeof value.timestamp === "string" &&
+			!Number.isNaN(Date.parse(value.timestamp))
+		) {
+			return value.timestamp;
+		}
+	} catch {
+		return null;
+	}
+	return null;
+}
