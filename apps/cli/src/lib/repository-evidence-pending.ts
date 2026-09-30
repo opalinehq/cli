@@ -22,6 +22,7 @@ import type {
 	BuiltRepositoryEvidenceUpload,
 	RepositoryEvidenceBytes,
 } from "./repository-evidence-upload.js";
+import { transcriptSourcePath } from "./transcript-continuation.js";
 import type { TranscriptRevisionManifest } from "./transcript-revision.js";
 import { hasValidTranscriptRevisionIntegrity } from "./transcript-revision.js";
 
@@ -190,6 +191,7 @@ export async function readPendingRepositoryEvidence(
 		} catch (error) {
 			if (error instanceof IncompatiblePendingFilterError) {
 				await abandonPendingRepositoryCapture(error.pending, configDir);
+				await removeContinuationSource(error.pending, configDir);
 				await quarantinePending(entry.path, directory);
 				options.onWarning?.(error);
 				continue;
@@ -223,6 +225,52 @@ async function abandonPendingRepositoryCapture(
 		"local-context",
 		createRepositorySpoolEnv(configDir),
 	);
+}
+
+async function removeContinuationSource(
+	pending: PendingRepositoryEvidence,
+	configDir: string,
+): Promise<void> {
+	if (!pending.continuation) return;
+	await rm(transcriptSourcePath(configDir, pending.continuation.sourceId), {
+		force: true,
+	});
+}
+
+export async function readPendingTranscriptSourceIds(
+	configDir: string,
+): Promise<ReadonlySet<string> | undefined> {
+	const directory = pendingDirectory(configDir);
+	const sourceIds = new Set<string>();
+	let names: readonly string[];
+	try {
+		names = await readdir(directory);
+	} catch (error) {
+		if (isErrorCode(error, "ENOENT")) return sourceIds;
+		throw error;
+	}
+	for (const name of names) {
+		if (!name.endsWith(".json")) continue;
+		let value: unknown;
+		try {
+			value = JSON.parse(await readFile(join(directory, name), "utf8"));
+		} catch (error) {
+			if (isErrorCode(error, "ENOENT")) continue;
+			return undefined;
+		}
+		const continuation =
+			typeof value === "object" && value !== null && "continuation" in value
+				? value.continuation
+				: undefined;
+		if (
+			typeof continuation === "object" &&
+			continuation !== null &&
+			"sourceId" in continuation &&
+			typeof continuation.sourceId === "string"
+		)
+			sourceIds.add(continuation.sourceId);
+	}
+	return sourceIds;
 }
 
 async function quarantinePending(
