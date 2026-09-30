@@ -4,6 +4,7 @@ import { z } from "zod";
 import {
 	REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES,
 	REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES,
+	SourceSchema,
 } from "../contracts/index.js";
 
 export const TRANSCRIPT_MAX_CHUNK_BYTES = REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES;
@@ -56,7 +57,7 @@ const TranscriptRevisionManifestSchema = z.object({
 	revisionId: z.string(),
 	scope: z.object({
 		actorId: z.string(),
-		provider: z.enum(["claude_code", "codex"]),
+		provider: SourceSchema,
 		providerInstanceId: z.string(),
 		sessionId: z.string(),
 	}),
@@ -71,14 +72,16 @@ const TranscriptRevisionManifestSchema = z.object({
 });
 
 /**
- * Checks the shape only. The caller must also check
- * `hasValidTranscriptRevisionIntegrity`, which hashes the original value
- * because the schema output does not keep the stored key order.
+ * Hashes the original value, not the parsed output, because the parsed output
+ * does not keep the stored key order.
  */
 export function isTranscriptRevisionManifest(
 	value: unknown,
 ): value is TranscriptRevisionManifest {
-	return TranscriptRevisionManifestSchema.safeParse(value).success;
+	return (
+		TranscriptRevisionManifestSchema.safeParse(value).success &&
+		hasValidTranscriptRevisionIntegrity(value as TranscriptRevisionManifest)
+	);
 }
 
 export interface PlannedTranscriptChunk extends TranscriptChunkReference {

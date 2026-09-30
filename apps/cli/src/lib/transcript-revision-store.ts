@@ -15,10 +15,8 @@ import type {
 	TranscriptRevisionManifest,
 	TranscriptRevisionScope,
 } from "./transcript-revision.js";
-import {
-	hasValidTranscriptRevisionIntegrity,
-	isTranscriptRevisionManifest,
-} from "./transcript-revision.js";
+import { isTranscriptRevisionManifest } from "./transcript-revision.js";
+import { normalizeRepositoryEvidenceEndpoint } from "./upload-endpoint.js";
 
 const STORE_VERSION = 2;
 const LOCK_POLL_MS = 25;
@@ -60,8 +58,7 @@ async function readTranscriptRevisionUnlocked(
 		const value: unknown = JSON.parse(text);
 		if (
 			!isTranscriptRevisionManifest(value) ||
-			!sameScope(value.scope, deliveryScope.transcriptScope) ||
-			!hasValidTranscriptRevisionIntegrity(value)
+			!sameScope(value.scope, deliveryScope.transcriptScope)
 		) {
 			throw new Error(
 				"Stored transcript revision is invalid for this session.",
@@ -309,16 +306,6 @@ function isNewerRevision(
 					!current.terminal &&
 					candidate.parentRevisionId === current.revisionId)))
 	);
-}
-
-export function normalizeRepositoryEvidenceEndpoint(endpoint: string): string {
-	const url = new URL(endpoint);
-	url.hash = "";
-	url.search = "";
-	url.pathname = url.pathname.replace(/\/{2,}/gu, "/");
-	if (url.pathname.length > 1)
-		url.pathname = url.pathname.replace(/\/+$/gu, "");
-	return url.toString();
 }
 
 function sameScope(

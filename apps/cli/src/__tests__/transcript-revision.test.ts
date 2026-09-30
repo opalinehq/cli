@@ -339,22 +339,19 @@ function buildJsonl(
 }
 
 describe("transcript revision manifest validation", () => {
-	async function planStored(planScope: TranscriptRevisionScope) {
+	// biome-ignore lint/suspicious/noExplicitAny: tests corrupt stored JSON.
+	async function planStored(planScope: unknown): Promise<any> {
 		const plan = await planTranscriptRevision({
 			content: new TextEncoder().encode('{"ordinal":0}\n{"ordinal":1}\n'),
 			previous: undefined,
-			scope: planScope,
+			scope: planScope as TranscriptRevisionScope,
 			terminal: false,
 		});
-		return JSON.parse(JSON.stringify(plan.manifest)) as Record<string, unknown>;
+		return JSON.parse(JSON.stringify(plan.manifest));
 	}
 
-	test("accepts a stored manifest and keeps its integrity hash valid", async () => {
-		const stored = await planStored(scope);
-
-		expect(isTranscriptRevisionManifest(stored)).toBe(true);
-		if (!isTranscriptRevisionManifest(stored)) throw new Error("unreachable");
-		expect(hasValidTranscriptRevisionIntegrity(stored)).toBe(true);
+	test("accepts a stored manifest", async () => {
+		expect(isTranscriptRevisionManifest(await planStored(scope))).toBe(true);
 	});
 
 	test.each([
@@ -364,39 +361,19 @@ describe("transcript revision manifest validation", () => {
 	])(
 		"rejects a hash-consistent manifest with %s in the scope",
 		async (_name, badScope) => {
-			const stored = await planStored(
-				badScope as unknown as TranscriptRevisionScope,
-			);
+			const stored = await planStored(badScope);
 
-			expect(
-				hasValidTranscriptRevisionIntegrity(
-					stored as unknown as Parameters<
-						typeof hasValidTranscriptRevisionIntegrity
-					>[0],
-				),
-			).toBe(true);
+			expect(hasValidTranscriptRevisionIntegrity(stored)).toBe(true);
 			expect(isTranscriptRevisionManifest(stored)).toBe(false);
 		},
 	);
 
 	test.each([
-		[
-			"a chunk without a hash",
-			(chunk: Record<string, unknown>) => {
-				delete chunk.sha256;
-			},
-		],
-		[
-			"a chunk with a string offset",
-			(chunk: Record<string, unknown>) => {
-				chunk.startByte = "0";
-			},
-		],
-	])("rejects a manifest with %s", async (_name, corrupt) => {
+		["a chunk without a hash", { sha256: undefined }],
+		["a chunk with a string offset", { startByte: "0" }],
+	])("rejects a manifest with %s", async (_name, chunkPatch) => {
 		const stored = await planStored(scope);
-		const [chunk] = stored.chunks as Record<string, unknown>[];
-		if (!chunk) throw new Error("Expected a chunk");
-		corrupt(chunk);
+		stored.chunks[0] = { ...stored.chunks[0], ...chunkPatch };
 
 		expect(isTranscriptRevisionManifest(stored)).toBe(false);
 	});

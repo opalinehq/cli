@@ -22,12 +22,11 @@ import type {
 	BuiltRepositoryEvidenceUpload,
 	RepositoryEvidenceBytes,
 } from "./repository-evidence-upload.js";
-import type { TranscriptRevisionManifest } from "./transcript-revision.js";
 import {
-	hasValidTranscriptRevisionIntegrity,
 	isTranscriptRevisionManifest,
+	type TranscriptRevisionManifest,
 } from "./transcript-revision.js";
-import { normalizeRepositoryEvidenceEndpoint } from "./transcript-revision-store.js";
+import { normalizeRepositoryEvidenceEndpoint } from "./upload-endpoint.js";
 
 const PENDING_VERSION = 4;
 const UNSCOPED_PENDING_VERSION = 3;
@@ -301,8 +300,7 @@ function parsePending(
 		record.version !== PENDING_VERSION ||
 		typeof record.endpoint !== "string" ||
 		!Array.isArray(record.objects) ||
-		!isTranscriptRevisionManifest(record.transcriptRevision) ||
-		!hasValidTranscriptRevisionIntegrity(record.transcriptRevision)
+		!isTranscriptRevisionManifest(record.transcriptRevision)
 	) {
 		throw invalidPending();
 	}
