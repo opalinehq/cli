@@ -17,6 +17,7 @@ import {
 	createRepositorySpoolEnv,
 	getAcceptedRepositorySpoolParent,
 	listRepositorySpool,
+	markRepositorySpoolCaptureAbandoned,
 	markRepositorySpoolCaptureAccepted,
 	planRepositoryBundle,
 	type RepositoryBundleCandidate,
@@ -59,8 +60,8 @@ describe("repository spool", () => {
 		expect(result.capture.integrity).toBe("valid");
 		expect(JSON.stringify({ result, listing })).not.toContain(secret);
 		expect(listing.retention).toEqual({
-			automaticCleanup: false,
-			policy: "manual",
+			automaticCleanup: true,
+			policy: "retire-accepted-on-quota-pressure",
 			oldestCaptureAt: "2026-09-18T10:00:00.000Z",
 			abandonedTemporaryFiles: 0,
 		});
@@ -168,7 +169,13 @@ describe("repository spool", () => {
 			baseEnv,
 		);
 		expect(recovered.capture.integrity).toBe("valid");
-		expect(recovered.quota.orphanBlobCount).toBe(0);
+		const recoveredListing = await listRepositorySpool(
+			binding,
+			repositoryRoot,
+			baseEnv,
+		);
+		expect(recoveredListing.quota.orphanBlobCount).toBe(0);
+		expect(recovered.quota.usedBytes).toBe(recoveredListing.quota.usedBytes);
 	});
 
 	test("detects blob corruption without printing the blob body", async () => {
@@ -550,6 +557,540 @@ describe("repository spool", () => {
 		});
 	});
 });
+
+describe("repository spool hot path", () => {
+	test("does not re-verify or rescan historical captures when writing another capture", async () => {
+		const observed: Array<{
+			readonly history: number;
+			readonly scans: number;
+			readonly verifications: number;
+		}> = [];
+		for (const history of [3, 30]) {
+			let verifications = 0;
+			let scans = 0;
+			const env: RepositorySpoolEnv = {
+				...createRepositorySpoolEnv(join(tempRoot, `hot-path-${history}`)),
+				onCaptureRead: (kind) => {
+					if (kind === "verify") verifications += 1;
+					else scans += 1;
+				},
+			};
+			const binding = await makeBinding(repositoryRoot, env, "account-a");
+			for (let index = 0; index < history; index += 1) {
+				await writeRepositoryBundle(
+					makeHistoricalCandidate(index),
+					binding,
+					repositoryRoot,
+					"checkpoint",
+					env,
+				);
+			}
+			verifications = 0;
+			scans = 0;
+
+			const result = await writeRepositoryBundle(
+				makeHistoricalCandidate(history),
+				binding,
+				repositoryRoot,
+				"checkpoint",
+				env,
+			);
+
+			observed.push({ history, scans, verifications });
+			expect(result.quota.captureCount).toBe(history + 1);
+			expect(result.quota.blobCount).toBe(history + 1);
+		}
+
+		expect(observed).toEqual([
+			{ history: 3, scans: 0, verifications: 1 },
+			{ history: 30, scans: 0, verifications: 1 },
+		]);
+	});
+
+	test("keeps incremental accounting equal to a full audit and rebuilds it after loss", async () => {
+		const env = createRepositorySpoolEnv(join(tempRoot, "accounting"));
+		const binding = await makeBinding(repositoryRoot, env, "account-a");
+		for (let index = 0; index < 4; index += 1) {
+			await writeRepositoryBundle(
+				makeHistoricalCandidate(index),
+				binding,
+				repositoryRoot,
+				"checkpoint",
+				env,
+			);
+		}
+		const audit = await listRepositorySpool(binding, repositoryRoot, env);
+		await rm(join(env.configDir, "repo-context-spool", "accounting.v2.json"));
+
+		const rebuilt = await writeRepositoryBundle(
+			makeHistoricalCandidate(4),
+			binding,
+			repositoryRoot,
+			"checkpoint",
+			env,
+		);
+		const auditAfter = await listRepositorySpool(binding, repositoryRoot, env);
+
+		expect(audit.quota.captureCount).toBe(4);
+		expect(rebuilt.quota.captureCount).toBe(5);
+		expect(rebuilt.quota.usedBytes).toBe(auditAfter.quota.usedBytes);
+		expect(rebuilt.quota.blobCount).toBe(auditAfter.quota.blobCount);
+	});
+});
+
+describe("repository spool retirement", () => {
+	test("reclaims abandoned captures under quota pressure without accepting them as parents", async () => {
+		const env = {
+			...createRepositorySpoolEnv(join(tempRoot, "retire-abandoned")),
+			maxCaptures: 2,
+		};
+		const binding = await makeBinding(repositoryRoot, env, "account-a");
+		const head = makeHistoricalCandidate(0);
+		const abandoned = makeHistoricalCandidate(1);
+		for (const candidate of [head, abandoned]) {
+			await writeRepositoryBundle(
+				candidate,
+				binding,
+				repositoryRoot,
+				"checkpoint",
+				env,
+			);
+		}
+		await markRepositorySpoolCaptureAccepted(
+			binding,
+			head.captureId,
+			"local-context",
+			env,
+		);
+		expect(
+			await markRepositorySpoolCaptureAbandoned(
+				binding,
+				abandoned.captureId,
+				"github",
+				env,
+			),
+		).toBe(false);
+		expect(
+			await markRepositorySpoolCaptureAbandoned(
+				binding,
+				abandoned.captureId,
+				"local-context",
+				env,
+			),
+		).toBe(true);
+		expect(
+			await getAcceptedRepositorySpoolParent(binding, "local-context", env),
+		).toMatchObject({ id: head.captureId });
+		const next = makeHistoricalCandidate(2);
+		await writeRepositoryBundle(
+			next,
+			binding,
+			repositoryRoot,
+			"checkpoint",
+			env,
+		);
+		const listing = await listRepositorySpool(binding, repositoryRoot, env);
+		expect(listing.captures.map((capture) => capture.captureId).sort()).toEqual(
+			[head.captureId, next.captureId].sort(),
+		);
+		expect(listing.quota.blobCount).toBe(2);
+		expect(listing.quota.orphanBlobCount).toBe(0);
+		expect(
+			listing.captures.every((capture) => capture.integrity === "valid"),
+		).toBe(true);
+		expect(
+			(await walk(join(env.configDir, "repo-context-spool"))).files.some(
+				(path) => path.endsWith(".abandoned.json"),
+			),
+		).toBe(false);
+	});
+
+	test("keeps an abandoned parent and its blobs while a child still awaits delivery", async () => {
+		const env = {
+			...createRepositorySpoolEnv(join(tempRoot, "abandoned-parent")),
+			maxCaptures: 2,
+		};
+		const binding = await makeBinding(repositoryRoot, env, "account-a");
+		const parent = makeHistoricalCandidate(0);
+		const child = makeCandidate({
+			captureId: "unsent-child",
+			capturedAt: "2026-09-20T00:01:00.000Z",
+			parentCaptureId: parent.captureId,
+			referencedBlobIds: parent.referencedBlobIds,
+			reusedBytes: parent.materializedBytes,
+		});
+		for (const candidate of [parent, child]) {
+			await writeRepositoryBundle(
+				candidate,
+				binding,
+				repositoryRoot,
+				"checkpoint",
+				env,
+			);
+		}
+		await markRepositorySpoolCaptureAbandoned(
+			binding,
+			parent.captureId,
+			"local-context",
+			env,
+		);
+		await expect(
+			writeRepositoryBundle(
+				makeHistoricalCandidate(2),
+				binding,
+				repositoryRoot,
+				"checkpoint",
+				env,
+			),
+		).rejects.toThrow(/opaline upload --retry/u);
+		const listing = await listRepositorySpool(binding, repositoryRoot, env);
+		expect(listing.captures).toHaveLength(2);
+		expect(
+			listing.captures.every((capture) => capture.integrity === "valid"),
+		).toBe(true);
+		expect(listing.quota.blobCount).toBe(1);
+	});
+
+	test("retires accepted captures that nothing references when capacity runs out", async () => {
+		const env: RepositorySpoolEnv = {
+			...createRepositorySpoolEnv(join(tempRoot, "retire-accepted")),
+			maxCaptures: 4,
+		};
+		const binding = await makeBinding(repositoryRoot, env, "account-a");
+		const accepted = [0, 1, 2].map(makeHistoricalCandidate);
+		for (const candidate of accepted) {
+			await writeRepositoryBundle(
+				candidate,
+				binding,
+				repositoryRoot,
+				"checkpoint",
+				env,
+			);
+			await markRepositorySpoolCaptureAccepted(
+				binding,
+				candidate.captureId,
+				"local-context",
+				env,
+			);
+		}
+		const unsent = makeHistoricalCandidate(3);
+		await writeRepositoryBundle(
+			unsent,
+			binding,
+			repositoryRoot,
+			"checkpoint",
+			env,
+		);
+		const full = await listRepositorySpool(binding, repositoryRoot, env);
+		expect(full.quota.captureCount).toBe(env.maxCaptures);
+
+		const next = makeHistoricalCandidate(4);
+		const result = await writeRepositoryBundle(
+			next,
+			binding,
+			repositoryRoot,
+			"checkpoint",
+			env,
+		);
+		const listing = await listRepositorySpool(binding, repositoryRoot, env);
+
+		expect(result.created).toBe(true);
+		expect(listing.captures.map((capture) => capture.captureId).sort()).toEqual(
+			[accepted[2], unsent, next].map((c) => c?.captureId).sort(),
+		);
+		expect(listing.captures.every((c) => c.integrity === "valid")).toBe(true);
+		expect(listing.quota.blobCount).toBe(3);
+		expect(listing.quota.orphanBlobCount).toBe(0);
+		expect(result.quota.usedBytes).toBe(listing.quota.usedBytes);
+		expect(
+			await getAcceptedRepositorySpoolParent(binding, "local-context", env),
+		).toEqual({
+			blobIds: accepted[2]?.referencedBlobIds,
+			id: accepted[2]?.captureId,
+		});
+	});
+
+	test("never retires captures awaiting delivery and reports how to recover", async () => {
+		const env: RepositorySpoolEnv = {
+			...createRepositorySpoolEnv(join(tempRoot, "retire-unsent")),
+			maxCaptures: 3,
+		};
+		const binding = await makeBinding(repositoryRoot, env, "account-a");
+		const stored = [0, 1, 2].map(makeHistoricalCandidate);
+		for (const candidate of stored) {
+			await writeRepositoryBundle(
+				candidate,
+				binding,
+				repositoryRoot,
+				"checkpoint",
+				env,
+			);
+		}
+		await markRepositorySpoolCaptureAccepted(
+			binding,
+			stored[0]?.captureId ?? "",
+			"local-context",
+			env,
+		);
+
+		await expect(
+			writeRepositoryBundle(
+				makeHistoricalCandidate(3),
+				binding,
+				repositoryRoot,
+				"checkpoint",
+				env,
+			),
+		).rejects.toThrow(/opaline upload --retry/u);
+		const listing = await listRepositorySpool(binding, repositoryRoot, env);
+
+		expect(listing.captures.map((capture) => capture.captureId).sort()).toEqual(
+			stored.map((candidate) => candidate.captureId).sort(),
+		);
+		expect(listing.captures.every((c) => c.integrity === "valid")).toBe(true);
+	});
+
+	test("keeps the accepted parent of an unsent capture", async () => {
+		const env: RepositorySpoolEnv = {
+			...createRepositorySpoolEnv(join(tempRoot, "retire-parent")),
+			maxCaptures: 3,
+		};
+		const binding = await makeBinding(repositoryRoot, env, "account-a");
+		const parent = makeHistoricalCandidate(0);
+		const child = {
+			...makeHistoricalCandidate(1),
+			parentCaptureId: parent.captureId,
+		};
+		const head = makeHistoricalCandidate(2);
+		for (const candidate of [parent, child, head]) {
+			await writeRepositoryBundle(
+				candidate,
+				binding,
+				repositoryRoot,
+				"checkpoint",
+				env,
+			);
+		}
+		for (const candidate of [parent, head]) {
+			await markRepositorySpoolCaptureAccepted(
+				binding,
+				candidate.captureId,
+				"local-context",
+				env,
+			);
+		}
+
+		await expect(
+			writeRepositoryBundle(
+				makeHistoricalCandidate(3),
+				binding,
+				repositoryRoot,
+				"checkpoint",
+				env,
+			),
+		).rejects.toThrow(/awaiting delivery/u);
+		const listing = await listRepositorySpool(binding, repositoryRoot, env);
+
+		expect(listing.captures.map((capture) => capture.captureId).sort()).toEqual(
+			[parent, child, head].map((candidate) => candidate.captureId).sort(),
+		);
+	});
+
+	test("keeps blobs that a retained capture still references", async () => {
+		const env: RepositorySpoolEnv = {
+			...createRepositorySpoolEnv(join(tempRoot, "retire-shared-blob")),
+			maxCaptures: 2,
+		};
+		const binding = await makeBinding(repositoryRoot, env, "account-a");
+		const shared = makeBlob("shared blob body");
+		const first = makeCandidate({
+			captureId: "capture-shared-first",
+			capturedAt: "2026-09-19T10:00:00.000Z",
+			blobs: [shared],
+		});
+		const head = makeCandidate({
+			blobs: [makeBlob("head blob body")],
+			captureId: "capture-shared-head",
+			capturedAt: "2026-09-19T10:01:00.000Z",
+			parentCaptureId: first.captureId,
+			referencedBlobIds: [shared.id, makeBlob("head blob body").id],
+		});
+		for (const candidate of [first, head]) {
+			await writeRepositoryBundle(
+				candidate,
+				binding,
+				repositoryRoot,
+				"checkpoint",
+				env,
+			);
+			await markRepositorySpoolCaptureAccepted(
+				binding,
+				candidate.captureId,
+				"local-context",
+				env,
+			);
+		}
+		const next = makeCandidate({
+			captureId: "capture-shared-next",
+			capturedAt: "2026-09-19T10:02:00.000Z",
+			contents: ["next blob body"],
+			parentCaptureId: head.captureId,
+		});
+
+		await writeRepositoryBundle(
+			next,
+			binding,
+			repositoryRoot,
+			"checkpoint",
+			env,
+		);
+		const listing = await listRepositorySpool(binding, repositoryRoot, env);
+
+		expect(listing.captures.map((capture) => capture.captureId).sort()).toEqual(
+			[head.captureId, next.captureId].sort(),
+		);
+		expect(listing.quota.blobCount).toBe(3);
+		expect(listing.quota.orphanBlobCount).toBe(0);
+		expect(
+			(await walk(join(env.configDir, "repo-context-spool"))).files.some(
+				(path) => path.endsWith(`${shared.id.slice("sha256:".length)}.blob`),
+			),
+		).toBe(true);
+		expect(
+			await getAcceptedRepositorySpoolParent(binding, "local-context", env),
+		).toMatchObject({ id: head.captureId });
+	});
+
+	test("reclaims accepted captures from another binding when the global quota is full", async () => {
+		const env: RepositorySpoolEnv = {
+			...createRepositorySpoolEnv(join(tempRoot, "retire-cross-binding")),
+			maxCaptures: 4,
+		};
+		const bindingA = await makeBinding(repositoryRoot, env, "account-a");
+		const bindingB = await makeBinding(repositoryRoot, env, "account-b");
+		const acceptedA = [0, 1, 2].map(makeHistoricalCandidate);
+		for (const candidate of acceptedA) {
+			await writeRepositoryBundle(
+				candidate,
+				bindingA,
+				repositoryRoot,
+				"checkpoint",
+				env,
+			);
+			await markRepositorySpoolCaptureAccepted(
+				bindingA,
+				candidate.captureId,
+				"local-context",
+				env,
+			);
+		}
+		const unsentA = makeHistoricalCandidate(3);
+		await writeRepositoryBundle(
+			unsentA,
+			bindingA,
+			repositoryRoot,
+			"checkpoint",
+			env,
+		);
+		expect(
+			(await listRepositorySpool(bindingA, repositoryRoot, env)).quota
+				.captureCount,
+		).toBe(env.maxCaptures);
+
+		const firstInB = makeHistoricalCandidate(4);
+		const result = await writeRepositoryBundle(
+			firstInB,
+			bindingB,
+			repositoryRoot,
+			"checkpoint",
+			env,
+		);
+		const listingA = await listRepositorySpool(bindingA, repositoryRoot, env);
+		const listingB = await listRepositorySpool(bindingB, repositoryRoot, env);
+
+		expect(result.created).toBe(true);
+		expect(listingB.captures.map((capture) => capture.captureId)).toEqual([
+			firstInB.captureId,
+		]);
+		expect(
+			listingA.captures.map((capture) => capture.captureId).sort(),
+		).toEqual([acceptedA[2], unsentA].map((c) => c?.captureId).sort());
+		expect(listingA.captures.every((c) => c.integrity === "valid")).toBe(true);
+		expect(listingA.quota.captureCount).toBe(3);
+		expect(listingA.quota.blobCount).toBe(3);
+		expect(listingA.quota.orphanBlobCount).toBe(0);
+		expect(result.quota.captureCount).toBe(listingA.quota.captureCount);
+		expect(result.quota.usedBytes).toBe(listingA.quota.usedBytes);
+		expect(
+			await getAcceptedRepositorySpoolParent(bindingA, "local-context", env),
+		).toEqual({
+			blobIds: acceptedA[2]?.referencedBlobIds,
+			id: acceptedA[2]?.captureId,
+		});
+	});
+
+	test("does not delete a blob that the capture being written reuses", async () => {
+		const env: RepositorySpoolEnv = {
+			...createRepositorySpoolEnv(join(tempRoot, "retire-reused-blob")),
+			maxCaptures: 2,
+		};
+		const binding = await makeBinding(repositoryRoot, env, "account-a");
+		const reused = makeBlob("reused by the next capture");
+		const old = makeCandidate({
+			blobs: [reused],
+			captureId: "capture-reuse-old",
+			capturedAt: "2026-09-19T11:00:00.000Z",
+		});
+		const head = makeCandidate({
+			captureId: "capture-reuse-head",
+			capturedAt: "2026-09-19T11:01:00.000Z",
+			contents: ["reuse head body"],
+		});
+		for (const candidate of [old, head]) {
+			await writeRepositoryBundle(
+				candidate,
+				binding,
+				repositoryRoot,
+				"checkpoint",
+				env,
+			);
+			await markRepositorySpoolCaptureAccepted(
+				binding,
+				candidate.captureId,
+				"local-context",
+				env,
+			);
+		}
+		const next = makeCandidate({
+			blobs: [reused],
+			captureId: "capture-reuse-next",
+			capturedAt: "2026-09-19T11:02:00.000Z",
+		});
+
+		const result = await writeRepositoryBundle(
+			next,
+			binding,
+			repositoryRoot,
+			"checkpoint",
+			env,
+		);
+
+		expect(result.capture.integrity).toBe("valid");
+		const listing = await listRepositorySpool(binding, repositoryRoot, env);
+		expect(listing.captures.every((c) => c.integrity === "valid")).toBe(true);
+		expect(listing.quota.orphanBlobCount).toBe(0);
+	});
+});
+
+function makeHistoricalCandidate(index: number): RepositoryBundleCandidate {
+	return makeCandidate({
+		captureId: `capture-history-${index}`,
+		capturedAt: new Date(
+			Date.UTC(2026, 8, 20, 0, 0, 0) + index * 60_000,
+		).toISOString(),
+		contents: [`historical blob body ${index}`],
+	});
+}
 
 interface CandidateOptions {
 	readonly captureId: string;

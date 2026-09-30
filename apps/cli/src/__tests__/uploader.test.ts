@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +12,7 @@ import {
 	SESSION_OWNERSHIP_CONFLICT_CODE,
 	SESSION_UPLOAD_SHRINK_REJECTED_CODE,
 } from "../contracts/index.js";
+import * as secretFilter from "../internal/secret-filter/index.js";
 import {
 	SecretFilterConvergenceError,
 	SecretFilterJsonIntegrityError,
@@ -213,6 +214,81 @@ describe("isRetryableUploadError", () => {
 });
 
 describe("uploadSession aggregate size guard", () => {
+	test("preflights an impossible large in-memory payload without invoking filtering", async () => {
+		const totalBytes =
+			Math.floor(
+				INGEST_AGGREGATE_CONTENT_MAX_BYTES /
+					(1 - secretFilter.MAX_REDACTION_RATIO),
+			) + 1;
+		const content = "a".repeat(totalBytes);
+		const filterSpy = spyOn(secretFilter, "filterSessionTextFields");
+		try {
+			const result = await uploadSession(
+				{
+					source: "claude_code",
+					sessionId: "preflight-test",
+					projectPath: "/test",
+					content,
+				},
+				{
+					endpoint: "http://127.0.0.1:1/rpc",
+					allowInsecureEndpoint: false,
+					token: "unused",
+				},
+			);
+			expect(filterSpy).not.toHaveBeenCalled();
+			expect(result).toEqual(getUploadSizeFailure(totalBytes));
+		} finally {
+			filterSpy.mockRestore();
+		}
+	});
+
+	test("allows a raw oversized small payload that fits after safe redaction", async () => {
+		const content = `${"a".repeat(209)} ghp_${"b".repeat(36)}`;
+		const stub = startIngestStub({
+			respond: () =>
+				Response.json({ json: { success: true, sessionId: "shrink-to-fit" } }),
+		});
+		try {
+			const result = await uploadSession(
+				{
+					source: "claude_code",
+					sessionId: "shrink-to-fit",
+					projectPath: "/test",
+					content,
+				},
+				{
+					endpoint: `${stub.loopbackBase}/rpc`,
+					allowInsecureEndpoint: true,
+					maxAggregateBytes: 240,
+					token: INGEST_STUB_TEST_TOKEN,
+				},
+			);
+			expect(result.success).toBe(true);
+			expect(stub.requests).toHaveLength(1);
+		} finally {
+			await stub.server.stop(true);
+		}
+	});
+
+	test("keeps redaction-budget abort precedence below the 32 MiB preflight threshold", async () => {
+		const result = await uploadSession(
+			{
+				source: "claude_code",
+				sessionId: "budget-before-size",
+				projectPath: "/test",
+				content: `ghp_${"b".repeat(36)}\n`.repeat(20),
+			},
+			{
+				endpoint: "http://127.0.0.1:1/rpc",
+				allowInsecureEndpoint: false,
+				maxAggregateBytes: 1,
+				token: "unused",
+			},
+		);
+		expect(result.redactionBudgetExceeded).toBe(true);
+		expect(result.attempts).toBe(0);
+	});
 	test("rejects an oversized aggregate before making a network attempt", async () => {
 		const result = await uploadSession(
 			{
@@ -235,7 +311,7 @@ describe("uploadSession aggregate size guard", () => {
 			maxBytes: 1024 * 1024,
 			success: false,
 			error:
-				"Skipped: session files total 2.00 MiB, above the 1.00 MiB per-session limit. No upload attempted.",
+				"Session transcript payload is 2.00 MiB, above the 1.00 MiB per-session limit. Reduce the transcript/subagent payload before retrying.",
 			attempts: 0,
 			retryable: false,
 		});

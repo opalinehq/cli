@@ -3,6 +3,7 @@ import { isAbsolute, resolve } from "node:path";
 import { filterKnownSecrets } from "../secret-filter/index.js";
 import type { BlobStore } from "./blob-store.js";
 import { addSanitizedTextBlob } from "./blob-store.js";
+import { getHighRiskContentPathspecExclusions } from "./path-policy.js";
 import type {
 	CaptureConsistency,
 	GitCommandResult,
@@ -19,22 +20,22 @@ import type {
 } from "./types.js";
 
 const UTF8_DECODER = new TextDecoder();
-const SAFE_DIFF_PATHSPEC: readonly string[] = [
+export const SAFE_DIFF_PATHSPEC: readonly string[] = [
 	".",
-	":(exclude,icase,glob)**/.env",
-	":(exclude,icase,glob)**/.env.*",
-	":(exclude,icase,glob)**/.npmrc",
-	":(exclude,icase,glob)**/.netrc",
-	":(exclude,icase,glob)**/.pypirc",
-	":(exclude,icase,glob)**/credentials.json",
-	":(exclude,icase,glob)**/service-account.json",
-	":(exclude,icase,glob)**/id_rsa",
-	":(exclude,icase,glob)**/id_ed25519",
-	":(exclude,icase,glob)**/*.pem",
-	":(exclude,icase,glob)**/*.key",
-	":(exclude,icase,glob)**/*.p12",
-	":(exclude,icase,glob)**/*.pfx",
+	...getHighRiskContentPathspecExclusions(),
 ];
+
+function buildDiffPathspec(
+	excludedPathPrefixes: readonly string[],
+): readonly string[] {
+	return [
+		...SAFE_DIFF_PATHSPEC,
+		...excludedPathPrefixes.map((prefix) => {
+			const normalized = prefix.endsWith("/") ? prefix.slice(0, -1) : prefix;
+			return `:(exclude,top,literal)${normalized}`;
+		}),
+	];
+}
 
 export interface GitIndexEntry {
 	readonly objectId: string;
@@ -66,6 +67,7 @@ export async function collectGitSnapshot(
 	limits: LocalContextCollectionLimits,
 	git: LocalContextGitRunner,
 	blobStore: BlobStore,
+	excludedPathPrefixes: readonly string[],
 ): Promise<GitCollectionResult> {
 	const rootResult = await runGit(
 		requestedRoot,
@@ -89,6 +91,7 @@ export async function collectGitSnapshot(
 	}
 
 	const repositoryRoot = decode(rootResult.stdout).trim();
+	const diffPathspec = buildDiffPathspec(excludedPathPrefixes);
 	const commands = await Promise.all([
 		runNamed(
 			"head",
@@ -185,7 +188,7 @@ export async function collectGitSnapshot(
 				"--no-color",
 				"--submodule=short",
 				"--",
-				...SAFE_DIFF_PATHSPEC,
+				...diffPathspec,
 			],
 			limits,
 			git,
@@ -201,7 +204,7 @@ export async function collectGitSnapshot(
 				"--no-color",
 				"--submodule=short",
 				"--",
-				...SAFE_DIFF_PATHSPEC,
+				...diffPathspec,
 			],
 			limits,
 			git,

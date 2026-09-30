@@ -211,64 +211,71 @@ export const RepositoryEvidenceCaptureSchema = z.object({
 	transcriptWatermark: RepositoryEvidenceTranscriptWatermarkSchema.nullable(),
 });
 
-export const RepositoryEvidenceInitInputSchema = z
-	.object({
-		capture: RepositoryEvidenceCaptureSchema,
-		coverage: z
-			.array(RepositoryEvidenceCoverageItemSchema)
-			.min(1)
-			.max(RepositoryEvidenceCoverageAreaSchema.options.length),
-		manifestObjectId: RepositoryEvidenceObjectIdSchema,
-		objects: z
-			.array(RepositoryEvidenceObjectDescriptorSchema)
-			.min(1)
-			.max(REPOSITORY_EVIDENCE_MAX_OBJECTS),
-		operationId: z.string().uuid(),
-		organizationId: BoundedIdentitySchema,
-		protocol: z.literal(REPOSITORY_EVIDENCE_PROTOCOL),
-		repository: RepositoryEvidenceRepositoryIdentitySchema,
-		session: RepositoryEvidenceSessionIdentitySchema,
-	})
-	.superRefine((input, context) => {
-		const objectIds = input.objects.map((object) => object.objectId);
-		if (new Set(objectIds).size !== objectIds.length) {
-			context.addIssue({
-				code: "custom",
-				message: "Evidence object IDs must be unique",
-				path: ["objects"],
-			});
-		}
-		const manifest = input.objects.find(
-			(object) => object.objectId === input.manifestObjectId,
-		);
-		if (manifest?.kind !== "context-manifest") {
-			context.addIssue({
-				code: "custom",
-				message:
-					"Manifest object ID must reference a context-manifest descriptor",
-				path: ["manifestObjectId"],
-			});
-		}
-		const coverageAreas = input.coverage.map((item) => item.area);
-		if (new Set(coverageAreas).size !== coverageAreas.length) {
-			context.addIssue({
-				code: "custom",
-				message: "Evidence coverage areas must be unique",
-				path: ["coverage"],
-			});
-		}
-		const aggregateBytes = input.objects.reduce(
-			(total, object) => total + object.byteLength,
-			0,
-		);
-		if (aggregateBytes > REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES) {
-			context.addIssue({
-				code: "custom",
-				message: `Aggregate evidence exceeds ${REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES} bytes`,
-				path: ["objects"],
-			});
-		}
-	});
+export function createRepositoryEvidenceInitInputSchema(
+	maxAggregateBytes = REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES,
+) {
+	return z
+		.object({
+			capture: RepositoryEvidenceCaptureSchema,
+			coverage: z
+				.array(RepositoryEvidenceCoverageItemSchema)
+				.min(1)
+				.max(RepositoryEvidenceCoverageAreaSchema.options.length),
+			manifestObjectId: RepositoryEvidenceObjectIdSchema,
+			objects: z
+				.array(RepositoryEvidenceObjectDescriptorSchema)
+				.min(1)
+				.max(REPOSITORY_EVIDENCE_MAX_OBJECTS),
+			operationId: z.string().uuid(),
+			organizationId: BoundedIdentitySchema,
+			protocol: z.literal(REPOSITORY_EVIDENCE_PROTOCOL),
+			repository: RepositoryEvidenceRepositoryIdentitySchema,
+			session: RepositoryEvidenceSessionIdentitySchema,
+		})
+		.superRefine((input, context) => {
+			const objectIds = input.objects.map((object) => object.objectId);
+			if (new Set(objectIds).size !== objectIds.length) {
+				context.addIssue({
+					code: "custom",
+					message: "Evidence object IDs must be unique",
+					path: ["objects"],
+				});
+			}
+			const manifest = input.objects.find(
+				(object) => object.objectId === input.manifestObjectId,
+			);
+			if (manifest?.kind !== "context-manifest") {
+				context.addIssue({
+					code: "custom",
+					message:
+						"Manifest object ID must reference a context-manifest descriptor",
+					path: ["manifestObjectId"],
+				});
+			}
+			const coverageAreas = input.coverage.map((item) => item.area);
+			if (new Set(coverageAreas).size !== coverageAreas.length) {
+				context.addIssue({
+					code: "custom",
+					message: "Evidence coverage areas must be unique",
+					path: ["coverage"],
+				});
+			}
+			const aggregateBytes = input.objects.reduce(
+				(total, object) => total + object.byteLength,
+				0,
+			);
+			if (aggregateBytes > maxAggregateBytes) {
+				context.addIssue({
+					code: "custom",
+					message: `Aggregate evidence exceeds ${maxAggregateBytes} bytes`,
+					path: ["objects"],
+				});
+			}
+		});
+}
+
+export const RepositoryEvidenceInitInputSchema =
+	createRepositoryEvidenceInitInputSchema();
 
 export const RepositoryEvidenceUploadPartSchema = z.object({
 	byteLength: z.number().int().positive(),

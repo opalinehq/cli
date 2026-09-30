@@ -35,6 +35,7 @@ export {
 	resolveRepoIdentity,
 } from "./repo-identity.js";
 export {
+	createRepositoryEvidenceInitInputSchema,
 	REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES,
 	REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES,
 	REPOSITORY_EVIDENCE_MAX_OBJECTS,

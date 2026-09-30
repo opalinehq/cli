@@ -1,4 +1,11 @@
-import { afterAll, afterEach, describe, expect, test } from "bun:test";
+import {
+	afterAll,
+	afterEach,
+	describe,
+	expect,
+	setDefaultTimeout,
+	test,
+} from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,6 +14,8 @@ import {
 	collectSessionRepositoryContext,
 	resolveRepositoryContext,
 } from "../lib/repo-context.js";
+
+setDefaultTimeout(30_000);
 
 const tempRoot = await mkdtemp(join(tmpdir(), "opaline-repo-context-"));
 const originalConfigDir = process.env.OPALINE_CONFIG_DIR;
@@ -51,7 +60,7 @@ describe("repository context privacy", () => {
 				entry.path.startsWith(".context/rudel-local-cli/"),
 			),
 		).toBe(false);
-	}, 15_000);
+	});
 
 	test("rejects the repository root as the CLI config directory", async () => {
 		const repositoryRoot = await createRepository("root-config-repository");

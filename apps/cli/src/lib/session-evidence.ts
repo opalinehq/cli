@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import type { IngestSessionInput } from "../contracts/index.js";
 import type {
 	FileBackedUploadRequest,
@@ -18,12 +18,13 @@ import {
 	deferPendingRepositoryEvidence,
 	normalizeRepositoryEvidenceEndpoint,
 	readPendingRepositoryEvidence,
-	removePendingRepositoryEvidence,
 	writePendingRepositoryEvidence,
 } from "./repository-evidence-pending.js";
 import {
 	buildRepositoryEvidenceUpload,
+	getTranscriptDeliveryBudget,
 	isRetryableRepositoryEvidenceError,
+	requireRepositoryEvidenceApiKey,
 	uploadRepositoryEvidence,
 } from "./repository-evidence-upload.js";
 import {
@@ -32,9 +33,11 @@ import {
 	type SessionAttributionSourceStream,
 } from "./session-attribution.js";
 import {
-	describeAcceptedTranscriptPrefix,
-	planTranscriptRevision,
-} from "./transcript-revision.js";
+	continueAcceptedTranscript,
+	persistTranscriptSource,
+	transcriptSourcePath,
+} from "./transcript-continuation.js";
+import { planTranscriptRevisionFile } from "./transcript-revision.js";
 import {
 	advanceTranscriptRevision,
 	readTranscriptRevision,
@@ -62,6 +65,7 @@ export async function captureAndUploadSessionEvidence(input: {
 	if (!input.credentials.user) {
 		throw new Error("Repository evidence requires an authenticated CLI user.");
 	}
+	requireRepositoryEvidenceApiKey(input.credentials.authType);
 	const configDir = getConfigDir();
 	const apiBase = getApiBaseOverride() ?? input.credentials.apiBaseUrl;
 	const endpoint = normalizeRepositoryEvidenceEndpoint(`${apiBase}/rpc`);
@@ -93,97 +97,111 @@ export async function captureAndUploadSessionEvidence(input: {
 		transcriptScope: scope,
 	};
 	const previous = await readTranscriptRevision(deliveryScope);
-	const transcriptRevision = await planTranscriptRevision({
-		content: new TextEncoder().encode(filtered.content),
-		previous,
-		scope,
-		terminal: input.terminalTranscript,
-	});
-	const acceptedRoot = describeAcceptedTranscriptPrefix(
-		new TextEncoder().encode(filtered.content),
-		input.terminalTranscript,
-	);
-	const acceptedRootContent = new TextDecoder().decode(acceptedRoot.bytes);
-	const firstActionAt = findFirstTranscriptTimestamp(acceptedRootContent);
-	const timing = getFirstActionTiming(
-		input.lifecycle,
-		firstActionAt,
-		contextCapture.bundle.manifest.completedAt,
-	);
-	const attribution = buildSessionAttribution({
-		captureId: contextCapture.bundle.manifest.captureId,
-		childDiscovery: materialized.childDiscovery,
-		hook: {
-			kind: getAttributionHookKind(input.lifecycle, request.source),
-			nativeBeforeActionBoundary:
-				input.lifecycle === "start" && request.source === "claude_code",
-			receivedAt: input.hookReceivedAt,
-		},
-		opalineSessionId: request.sessionId,
-		source: request.source,
-		streams: applyFilteredContent(materialized.streams, filtered),
-		terminal: input.terminalTranscript,
-		transcriptRevision: transcriptRevision.manifest,
-	});
-	const upload = buildRepositoryEvidenceUpload({
-		attribution,
-		bundle: contextCapture.bundle,
-		captureLifecycle: input.lifecycle,
-		context: contextCapture.context,
-		firstActionAt: timing.firstActionAt,
-		firstActionBasis: timing.firstActionBasis,
-		firstActionRelationship: timing.firstActionRelationship,
-		organizationId: input.organizationId,
-		session: {
-			...request,
-			content: filtered.content,
-			subagents: filtered.subagents ? [...filtered.subagents] : undefined,
-		},
-		terminalTranscript: input.terminalTranscript,
-		transcriptLastEventAt: attribution.streams[0]?.prefix.lastEventAt ?? null,
-		transcriptRevision,
-	});
-	const currentPending = {
-		endpoint,
-		transcriptRevision: transcriptRevision.manifest,
-		upload,
-	};
-	await writePendingRepositoryEvidence(currentPending, configDir);
-	const deadlineAt = Date.now() + EVIDENCE_DELIVERY_BUDGET_MS;
-	const receipt = await uploadWithBoundedRetries(upload, input.credentials, {
-		deadlineAt,
-		endpoint,
-	});
-	await markRepositorySpoolCaptureAccepted(
-		contextCapture.context.binding,
-		contextCapture.stored.capture.captureId,
-		"local-context",
-		contextCapture.context.spoolEnv,
-	);
-	await advanceTranscriptRevision(
-		transcriptRevision.manifest,
-		deliveryScope,
-		configDir,
-	);
-	await removePendingRepositoryEvidence(currentPending, configDir);
-	let pendingError: unknown;
+	const sourceId = await persistTranscriptSource(filtered.content, configDir);
+	let hasPending = false;
 	try {
-		pendingError = await retryOnePendingRepositoryEvidence(
-			input.credentials,
-			input.credentials.user.id,
-			endpoint,
-			configDir,
-			deadlineAt,
-			input.onWarning,
+		const transcriptRevision = await planTranscriptRevisionFile({
+			path: transcriptSourcePath(configDir, sourceId),
+			limits: {
+				maxDeliveryBytes: getTranscriptDeliveryBudget(contextCapture.bundle),
+			},
+			previous,
+			scope,
+			terminal: input.terminalTranscript,
+		});
+		const firstActionAt = findFirstTranscriptTimestamp(filtered.content);
+		const timing = getFirstActionTiming(
+			input.lifecycle,
+			firstActionAt,
+			contextCapture.bundle.manifest.completedAt,
 		);
-	} catch (error) {
-		pendingError = error;
+		const attribution = buildSessionAttribution({
+			captureId: contextCapture.bundle.manifest.captureId,
+			childDiscovery: materialized.childDiscovery,
+			hook: {
+				kind: getAttributionHookKind(input.lifecycle, request.source),
+				nativeBeforeActionBoundary:
+					input.lifecycle === "start" && request.source === "claude_code",
+				receivedAt: input.hookReceivedAt,
+			},
+			opalineSessionId: request.sessionId,
+			source: request.source,
+			streams: applyFilteredContent(materialized.streams, filtered),
+			terminal: input.terminalTranscript,
+			transcriptRevision: transcriptRevision.manifest,
+		});
+		const upload = buildRepositoryEvidenceUpload({
+			attribution,
+			bundle: contextCapture.bundle,
+			captureLifecycle: input.lifecycle,
+			context: contextCapture.context,
+			firstActionAt: timing.firstActionAt,
+			firstActionBasis: timing.firstActionBasis,
+			firstActionRelationship: timing.firstActionRelationship,
+			organizationId: input.organizationId,
+			session: {
+				...request,
+				content: filtered.content,
+				subagents: filtered.subagents ? [...filtered.subagents] : undefined,
+			},
+			terminalTranscript: input.terminalTranscript,
+			transcriptLastEventAt: attribution.streams[0]?.prefix.lastEventAt ?? null,
+			transcriptRevision,
+		});
+		const currentPending = {
+			continuation: { sourceId, terminal: input.terminalTranscript },
+			endpoint,
+			transcriptRevision: transcriptRevision.manifest,
+			upload,
+		};
+		if (transcriptRevision.delivery.status !== "complete") {
+			input.onWarning?.(
+				transcriptRevision.delivery.status === "deferred"
+					? `Transcript evidence for session ${request.sessionId} exceeds one delivery; ${transcriptRevision.delivery.remainingBytes} bytes remain for upload --retry.`
+					: `Transcript evidence for session ${request.sessionId} is blocked by a ${transcriptRevision.delivery.recordBytes}-byte record that exceeds the delivery limit.`,
+			);
+		}
+		await writePendingRepositoryEvidence(currentPending, configDir);
+		hasPending = true;
+		const deadlineAt = Date.now() + EVIDENCE_DELIVERY_BUDGET_MS;
+		const receipt = await uploadWithBoundedRetries(upload, input.credentials, {
+			deadlineAt,
+			endpoint,
+		});
+		await markRepositorySpoolCaptureAccepted(
+			contextCapture.context.binding,
+			contextCapture.stored.capture.captureId,
+			"local-context",
+			contextCapture.context.spoolEnv,
+		);
+		await advanceTranscriptRevision(
+			transcriptRevision.manifest,
+			deliveryScope,
+			configDir,
+		);
+		await continueAcceptedTranscript(currentPending, configDir);
+		let pendingError: unknown;
+		try {
+			pendingError = await retryOnePendingRepositoryEvidence(
+				input.credentials,
+				input.credentials.user.id,
+				endpoint,
+				configDir,
+				deadlineAt,
+				input.onWarning,
+			);
+		} catch (error) {
+			pendingError = error;
+		}
+		if (pendingError !== undefined) throw pendingError;
+		return {
+			contextId: receipt.contextId,
+			receiptId: receipt.receiptId,
+		};
+	} finally {
+		if (!hasPending)
+			await rm(transcriptSourcePath(configDir, sourceId), { force: true });
 	}
-	if (pendingError !== undefined) throw pendingError;
-	return {
-		contextId: receipt.contextId,
-		receiptId: receipt.receiptId,
-	};
 }
 
 export async function retryPendingSessionEvidence(
@@ -198,6 +216,7 @@ export async function retryPendingSessionEvidence(
 	if (!credentials.user) {
 		throw new Error("Repository evidence requires an authenticated CLI user.");
 	}
+	requireRepositoryEvidenceApiKey(credentials.authType);
 	const configDir = getConfigDir();
 	const requestedEndpoint = normalizeRepositoryEvidenceEndpoint(
 		options.endpoint ?? `${getApiBaseOverride() ?? credentials.apiBaseUrl}/rpc`,
@@ -233,7 +252,7 @@ export async function retryPendingSessionEvidence(
 				getPendingDeliveryScope(pending),
 				configDir,
 			);
-			await removePendingRepositoryEvidence(pending, configDir);
+			await continueAcceptedTranscript(pending, configDir);
 			completed++;
 		} catch (error) {
 			failures.push(error);
@@ -277,7 +296,7 @@ async function retryOnePendingRepositoryEvidence(
 				getPendingDeliveryScope(pending),
 				configDir,
 			);
-			await removePendingRepositoryEvidence(pending, configDir);
+			await continueAcceptedTranscript(pending, configDir);
 		} catch (error) {
 			failures.push(error);
 			await deferPendingRepositoryEvidence(pending, configDir);

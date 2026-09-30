@@ -17,7 +17,7 @@ export interface CompiledSecretRule {
 const COMPILED_SECRET_RULES = GENERATED_SECRET_RULES.map(compileSecretRule);
 const UTF8_ENCODER = new TextEncoder();
 
-export const FILTER_VERSION = 5;
+export const FILTER_VERSION = 6;
 export const MAX_FILTER_PASSES = 4;
 export const OVERLONG_MATCH_THRESHOLD_BYTES = 8192;
 export const MAX_REDACTION_RATIO = 0.2;

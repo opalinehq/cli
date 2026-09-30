@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { buildLegacyTranscriptWatermark } from "../lib/repository-evidence-upload.js";
-import { buildSessionAttribution } from "../lib/session-attribution.js";
+import {
+	buildSessionAttribution,
+	continueSessionAttribution,
+} from "../lib/session-attribution.js";
 import { planTranscriptRevision } from "../lib/transcript-revision.js";
 
 const MATERIALIZED_AT = {
@@ -96,6 +99,25 @@ describe("session capture attribution", () => {
 		expect(JSON.stringify(attribution)).not.toContain(
 			"account-id-must-not-be-native",
 		);
+		const next = await planTranscriptRevision({
+			content: new TextEncoder().encode(`${content}\n`),
+			previous: revision.manifest,
+			scope: revision.manifest.scope,
+			terminal: true,
+		});
+		const continued = continueSessionAttribution(
+			attribution,
+			"continuation-capture",
+			next.manifest,
+		);
+		expect(continued.captureId).toBe("continuation-capture");
+		expect(continued.streams[0]?.sourceRevision).toEqual({
+			generation: next.manifest.generation,
+			parentRevisionId: revision.manifest.revisionId,
+			revisionId: next.manifest.revisionId,
+		});
+		expect(continued.streams[0]?.prefix).toEqual(stream.prefix);
+		expect(continued.streams[0]?.native).toEqual(stream.native);
 	});
 
 	test("keeps Claude child identity without inventing parent or run IDs", async () => {

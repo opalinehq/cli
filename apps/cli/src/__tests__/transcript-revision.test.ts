@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES } from "../contracts/index.js";
 import {
 	planTranscriptRevision,
 	type TranscriptRevisionScope,
@@ -142,3 +143,195 @@ describe("transcript revision planning", () => {
 		expect(next.manifest.generation).toBe(1);
 	});
 });
+
+describe("transcript revision chunk bounds", () => {
+	const mebibyte = 1024 * 1024;
+
+	test("splits an appended region just above the protocol object limit into bounded contiguous chunks", async () => {
+		const content = buildJsonl(65, mebibyte);
+		expect(content.byteLength).toBeGreaterThan(
+			REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES,
+		);
+
+		const plan = await planTranscriptRevision({
+			content,
+			previous: undefined,
+			scope,
+			terminal: false,
+		});
+
+		expect(plan.delivery).toEqual({ status: "complete" });
+		expect(plan.newChunks.length).toBeGreaterThan(1);
+		for (const chunk of plan.newChunks) {
+			expect(chunk.bytes.byteLength).toBeLessThanOrEqual(
+				REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES,
+			);
+			expect(content[chunk.endByte - 1]).toBe(0x0a);
+		}
+		expect(plan.newChunks[0]?.startByte).toBe(0);
+		expect(plan.newChunks.at(-1)?.endByte).toBe(content.byteLength);
+		for (const [index, chunk] of plan.newChunks.entries()) {
+			expect(chunk.startByte).toBe(plan.newChunks[index - 1]?.endByte ?? 0);
+		}
+		expect(
+			plan.newChunks.reduce((total, chunk) => total + chunk.recordCount, 0),
+		).toBe(65);
+		expect(plan.manifest.watermark.recordCount).toBe(65);
+		expect(plan.manifest.chunks).toHaveLength(plan.newChunks.length);
+	});
+
+	test("keeps a region exactly at the object limit in one chunk", async () => {
+		const content = buildJsonl(64, mebibyte);
+		expect(content.byteLength).toBe(REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES);
+
+		const plan = await planTranscriptRevision({
+			content,
+			previous: undefined,
+			scope,
+			terminal: false,
+		});
+
+		expect(plan.newChunks).toHaveLength(1);
+		expect(plan.newChunks[0]?.bytes.byteLength).toBe(
+			REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES,
+		);
+	});
+
+	test("splits a single record above the object limit at byte boundaries and reassembles it", async () => {
+		const record = buildJsonl(1, REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES + 1024);
+		const content = Buffer.concat([record, buildJsonl(1, 64, 1)]);
+
+		const plan = await planTranscriptRevision({
+			content,
+			previous: undefined,
+			scope,
+			terminal: false,
+		});
+
+		expect(plan.newChunks.length).toBeGreaterThan(1);
+		for (const chunk of plan.newChunks) {
+			expect(chunk.bytes.byteLength).toBeLessThanOrEqual(
+				REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES,
+			);
+		}
+		expect(
+			Buffer.compare(
+				Buffer.concat(plan.newChunks.map((chunk) => chunk.bytes)),
+				content,
+			),
+		).toBe(0);
+		expect(
+			plan.newChunks.reduce((total, chunk) => total + chunk.recordCount, 0),
+		).toBe(2);
+		expect(plan.manifest.watermark.recordCount).toBe(2);
+	});
+
+	test("counts only the records that begin inside each chunk when a record straddles chunks", async () => {
+		const content = Buffer.concat([
+			buildJsonl(1, 10),
+			buildJsonl(1, 100, 1),
+			buildJsonl(1, 10, 2),
+		]);
+
+		const plan = await planTranscriptRevision({
+			content,
+			limits: { maxChunkBytes: 48 },
+			previous: undefined,
+			scope,
+			terminal: false,
+		});
+
+		expect(plan.newChunks.length).toBeGreaterThan(3);
+		for (const chunk of plan.newChunks) {
+			expect(chunk.bytes.byteLength).toBeLessThanOrEqual(48);
+		}
+		expect(
+			Buffer.compare(
+				Buffer.concat(plan.newChunks.map((chunk) => chunk.bytes)),
+				content,
+			),
+		).toBe(0);
+		expect(
+			plan.newChunks.reduce((total, chunk) => total + chunk.recordCount, 0),
+		).toBe(3);
+	});
+
+	test("stops a delivery on a record boundary when the byte budget is reached and resumes from the watermark", async () => {
+		const content = buildJsonl(5, 100);
+		const recordBytes = content.byteLength / 5;
+
+		const first = await planTranscriptRevision({
+			content,
+			limits: { maxDeliveryBytes: recordBytes * 2 + 10 },
+			previous: undefined,
+			scope,
+			terminal: true,
+		});
+
+		expect(first.delivery).toEqual({
+			remainingBytes: recordBytes * 3,
+			status: "deferred",
+		});
+		expect(first.manifest.watermark.byteOffset).toBe(recordBytes * 2);
+		expect(first.manifest.watermark.recordCount).toBe(2);
+		expect(first.manifest.terminal).toBe(false);
+
+		const second = await planTranscriptRevision({
+			content,
+			previous: first.manifest,
+			scope,
+			terminal: true,
+		});
+
+		expect(second.delivery).toEqual({ status: "complete" });
+		expect(second.manifest.watermark.byteOffset).toBe(content.byteLength);
+		expect(second.manifest.watermark.recordCount).toBe(5);
+		expect(second.manifest.terminal).toBe(true);
+		expect(second.manifest.parentRevisionId).toBe(first.manifest.revisionId);
+	});
+
+	test("fails closed without advancing when the next record exceeds the delivery budget", async () => {
+		const content = Buffer.concat([buildJsonl(1, 10), buildJsonl(1, 500, 1)]);
+		const firstRecordBytes = buildJsonl(1, 10).byteLength;
+		const first = await planTranscriptRevision({
+			content: content.subarray(0, firstRecordBytes),
+			previous: undefined,
+			scope,
+			terminal: false,
+		});
+
+		const blocked = await planTranscriptRevision({
+			content,
+			limits: { maxDeliveryBytes: 100 },
+			previous: first.manifest,
+			scope,
+			terminal: true,
+		});
+
+		expect(blocked.delivery).toEqual({
+			recordBytes: content.byteLength - firstRecordBytes,
+			recordStartByte: firstRecordBytes,
+			status: "blocked",
+		});
+		expect(blocked.newChunks).toEqual([]);
+		expect(blocked.manifest.watermark.byteOffset).toBe(firstRecordBytes);
+		expect(blocked.manifest.terminal).toBe(false);
+	});
+});
+
+function buildJsonl(
+	count: number,
+	recordBytes: number,
+	firstOrdinal = 0,
+): Buffer {
+	const records: Buffer[] = [];
+	for (let index = 0; index < count; index += 1) {
+		const prefix = `{"ordinal":${String(firstOrdinal + index).padStart(6, "0")},"text":"`;
+		const suffix = '"}\n';
+		const padding = recordBytes - prefix.length - suffix.length;
+		records.push(
+			Buffer.from(`${prefix}${"x".repeat(Math.max(0, padding))}${suffix}`),
+		);
+	}
+	return Buffer.concat(records);
+}

@@ -12,6 +12,12 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import { RepositoryEvidenceInitInputSchema } from "../contracts/index.js";
+import { FILTER_VERSION } from "../internal/secret-filter/index.js";
+import {
+	createRepositorySpoolBinding,
+	createRepositorySpoolEnv,
+	markRepositorySpoolCaptureAbandoned,
+} from "./repo-spool.js";
 import type {
 	BuiltRepositoryEvidenceUpload,
 	RepositoryEvidenceBytes,
@@ -22,15 +28,37 @@ import { hasValidTranscriptRevisionIntegrity } from "./transcript-revision.js";
 const PENDING_VERSION = 4;
 const UNSCOPED_PENDING_VERSION = 3;
 
+export interface PendingRepositoryEvidenceQuota {
+	readonly maxFiles: number;
+	readonly maxTotalBytes: number;
+}
+
+export const DEFAULT_PENDING_REPOSITORY_EVIDENCE_QUOTA: PendingRepositoryEvidenceQuota =
+	{ maxFiles: 200, maxTotalBytes: 512 * 1024 * 1024 };
+
 export interface PendingRepositoryEvidence {
+	readonly continuation?: {
+		readonly sourceId: string;
+		readonly terminal: boolean;
+	};
 	readonly endpoint: string;
 	readonly transcriptRevision: TranscriptRevisionManifest;
 	readonly upload: BuiltRepositoryEvidenceUpload;
 }
 
+class IncompatiblePendingFilterError extends Error {
+	constructor(readonly pending: PendingRepositoryEvidence) {
+		super(
+			`Repository evidence capture ${pending.upload.input.capture.contextId} uses an incompatible secret filter version and was quarantined (not uploaded). Recollect the session with the current CLI before retrying.`,
+		);
+		this.name = "IncompatiblePendingFilterError";
+	}
+}
+
 export async function writePendingRepositoryEvidence(
 	pending: PendingRepositoryEvidence,
 	configDir: string,
+	quota: PendingRepositoryEvidenceQuota = DEFAULT_PENDING_REPOSITORY_EVIDENCE_QUOTA,
 ): Promise<string> {
 	assertInitialRevisionClosure(
 		pending.transcriptRevision,
@@ -40,8 +68,10 @@ export async function writePendingRepositoryEvidence(
 	await mkdir(directory, { mode: 0o700, recursive: true });
 	if (process.platform !== "win32") await chmod(directory, 0o700);
 	const path = join(directory, pendingFileName(pending));
+	await assertPendingQuota(directory, path, pending, quota);
 	const temporary = `${path}.${randomUUID()}.tmp`;
 	const value = {
+		continuation: pending.continuation,
 		version: PENDING_VERSION,
 		endpoint: pending.endpoint,
 		input: pending.upload.input,
@@ -63,6 +93,41 @@ export async function writePendingRepositoryEvidence(
 		await rm(temporary, { force: true });
 	}
 	return path;
+}
+
+async function assertPendingQuota(
+	directory: string,
+	path: string,
+	pending: PendingRepositoryEvidence,
+	quota: PendingRepositoryEvidenceQuota,
+): Promise<void> {
+	const incomingBytes =
+		[...pending.upload.objects.values()].reduce(
+			(total, object) => total + Math.ceil(object.bytes.byteLength / 3) * 4,
+			0,
+		) +
+		64 * 1024;
+	let files = 0;
+	let totalBytes = 0;
+	for (const name of await readdir(directory)) {
+		if (!name.endsWith(".json")) continue;
+		const existing = join(directory, name);
+		if (existing === path) continue;
+		try {
+			totalBytes += (await stat(existing)).size;
+			files += 1;
+		} catch (error) {
+			if (!isErrorCode(error, "ENOENT")) throw error;
+		}
+	}
+	if (
+		files + 1 > quota.maxFiles ||
+		totalBytes + incomingBytes > quota.maxTotalBytes
+	) {
+		throw new Error(
+			`Pending repository evidence quota exceeded (${files} captures, ${totalBytes} bytes stored; limit ${quota.maxFiles} captures and ${quota.maxTotalBytes} bytes). Deliver or discard pending evidence before capturing more.`,
+		);
+	}
 }
 
 export async function readPendingRepositoryEvidence(
@@ -113,27 +178,42 @@ export async function readPendingRepositoryEvidence(
 			throw error;
 		}
 		try {
-			const value = parsePending(text);
-			if (
-				(options.actorId &&
-					value.transcriptRevision.scope.actorId !== options.actorId) ||
-				(options.endpoint &&
-					value.endpoint !==
-						normalizeRepositoryEvidenceEndpoint(options.endpoint))
-			) {
-				throw invalidPending();
-			}
+			const value = parsePending(text, options.actorId, options.endpoint);
 			if (options.excludeOperationIds?.has(value.upload.input.operationId)) {
 				continue;
 			}
 			pending.push(value);
 		} catch (error) {
+			if (error instanceof IncompatiblePendingFilterError) {
+				await abandonPendingRepositoryCapture(error.pending, configDir);
+				await quarantinePending(entry.path, directory);
+				options.onWarning?.(error);
+				continue;
+			}
+			await quarantinePending(entry.path, directory);
 			if (!options.onError) throw error;
 			options.onError(error);
-			await quarantinePending(entry.path, directory);
 		}
 	}
 	return pending;
+}
+
+async function abandonPendingRepositoryCapture(
+	pending: PendingRepositoryEvidence,
+	configDir: string,
+): Promise<void> {
+	const binding = await createRepositorySpoolBinding({
+		accountId: pending.transcriptRevision.scope.actorId,
+		apiBaseUrl: pending.endpoint,
+		localIdentity: pending.upload.input.repository.local,
+		workspaceId: pending.upload.input.organizationId,
+	});
+	await markRepositorySpoolCaptureAbandoned(
+		binding,
+		pending.upload.input.capture.contextId,
+		"local-context",
+		createRepositorySpoolEnv(configDir),
+	);
 }
 
 async function quarantinePending(
@@ -196,7 +276,11 @@ function shortHash(value: string): string {
 	return createHash("sha256").update(value).digest("hex").slice(0, 16);
 }
 
-function parsePending(text: string): PendingRepositoryEvidence {
+function parsePending(
+	text: string,
+	actorId: string | undefined,
+	endpoint: string | undefined,
+): PendingRepositoryEvidence {
 	const value: unknown = JSON.parse(text);
 	if (typeof value !== "object" || value === null) throw invalidPending();
 	const record = value as Record<string, unknown>;
@@ -209,6 +293,21 @@ function parsePending(text: string): PendingRepositoryEvidence {
 		throw invalidPending();
 	}
 	const input = RepositoryEvidenceInitInputSchema.parse(record.input);
+	let continuation: PendingRepositoryEvidence["continuation"];
+	if (record.continuation !== undefined) {
+		const value = record.continuation;
+		if (
+			typeof value !== "object" ||
+			value === null ||
+			!("sourceId" in value) ||
+			typeof value.sourceId !== "string" ||
+			!/^[0-9a-f-]{36}$/.test(value.sourceId) ||
+			!("terminal" in value) ||
+			typeof value.terminal !== "boolean"
+		)
+			throw invalidPending();
+		continuation = { sourceId: value.sourceId, terminal: value.terminal };
+	}
 	const objects = new Map<string, RepositoryEvidenceBytes>();
 	for (const value of record.objects) {
 		if (typeof value !== "object" || value === null) throw invalidPending();
@@ -239,11 +338,23 @@ function parsePending(text: string): PendingRepositoryEvidence {
 	}
 	if (objects.size !== input.objects.length) throw invalidPending();
 	assertInitialRevisionClosure(record.transcriptRevision, objects);
-	return {
+	const pending = {
+		continuation,
 		endpoint: normalizeRepositoryEvidenceEndpoint(record.endpoint),
 		transcriptRevision: record.transcriptRevision,
 		upload: { input, objects },
 	};
+	if (
+		(actorId && pending.transcriptRevision.scope.actorId !== actorId) ||
+		(endpoint &&
+			pending.endpoint !== normalizeRepositoryEvidenceEndpoint(endpoint))
+	) {
+		throw invalidPending();
+	}
+	if (input.objects.some((object) => object.filterVersion !== FILTER_VERSION)) {
+		throw new IncompatiblePendingFilterError(pending);
+	}
+	return pending;
 }
 
 function assertInitialRevisionClosure(

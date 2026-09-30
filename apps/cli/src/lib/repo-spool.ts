@@ -27,6 +27,10 @@ const CAPTURE_FILE_SUFFIX = ".capture.json";
 const BLOB_FILE_SUFFIX = ".blob";
 const TEMP_FILE_SUFFIX = ".tmp";
 const ACCEPTED_CAPTURE_VERSION = 1;
+const ACCEPTED_MARKER_SUFFIX = ".accepted.json";
+const ABANDONED_CAPTURE_VERSION = 1;
+const ABANDONED_MARKER_SUFFIX = ".abandoned.json";
+const ACCOUNTING_VERSION = 1;
 const WRITE_LOCK_NAME = ".write-lock";
 const WRITE_LOCK_STALE_MS = 60_000;
 const WRITE_LOCK_TIMEOUT_MS = 15_000;
@@ -105,6 +109,7 @@ export interface RepositorySpoolEnv {
 		temporaryPath: string,
 		finalPath: string,
 	) => Promise<void>;
+	readonly onCaptureRead?: (kind: "verify" | "scan", path: string) => void;
 }
 
 export interface RepositorySpoolPlan {
@@ -126,7 +131,7 @@ export interface RepositorySpoolPlan {
 	readonly missingBlobIds: readonly string[];
 	readonly alreadyStored: boolean;
 	readonly selfContained: boolean;
-	readonly quota: RepositorySpoolQuota;
+	readonly quota: RepositorySpoolUsage;
 }
 
 export interface RepositorySpoolCaptureSummary {
@@ -154,22 +159,33 @@ export interface RepositorySpoolCaptureSummary {
 	readonly integrityError: string | null;
 }
 
-export interface RepositorySpoolQuota {
+export interface RepositorySpoolUsage {
 	readonly usedBytes: number;
 	readonly maxBytes: number;
 	readonly remainingBytes: number;
 	readonly captureCount: number;
 	readonly maxCaptures: number;
 	readonly blobCount: number;
+}
+
+export interface RepositorySpoolQuota extends RepositorySpoolUsage {
 	readonly orphanBlobCount: number;
 	readonly orphanBlobBytes: number;
 }
 
 export interface RepositorySpoolRetention {
-	readonly automaticCleanup: false;
-	readonly policy: "manual";
+	readonly automaticCleanup: true;
+	readonly policy: "retire-accepted-on-quota-pressure";
 	readonly oldestCaptureAt: string | null;
 	readonly abandonedTemporaryFiles: number;
+}
+
+export interface RepositorySpoolRetirementResult {
+	readonly retiredCaptures: number;
+	readonly retiredBlobs: number;
+	readonly freedBytes: number;
+	readonly unsentCaptures: number;
+	readonly unsentBytes: number;
 }
 
 export interface RepositorySpoolListing {
@@ -182,8 +198,7 @@ export interface RepositorySpoolListing {
 export interface RepositorySpoolWriteResult {
 	readonly created: boolean;
 	readonly capture: RepositorySpoolCaptureSummary;
-	readonly quota: RepositorySpoolQuota;
-	readonly retention: RepositorySpoolRetention;
+	readonly quota: RepositorySpoolUsage;
 }
 
 export interface RepositorySpoolParentReference {
@@ -195,6 +210,14 @@ interface AcceptedRepositoryCapture {
 	readonly captureId: string;
 	readonly capturedAt: string;
 	readonly version: typeof ACCEPTED_CAPTURE_VERSION;
+}
+
+interface SpoolAccounting {
+	readonly version: typeof ACCOUNTING_VERSION;
+	readonly state: "clean" | "dirty";
+	readonly usedBytes: number;
+	readonly captureCount: number;
+	readonly blobCount: number;
 }
 
 interface StoredCaptureRecordBody {
@@ -243,6 +266,8 @@ interface InspectedCapture {
 }
 
 export class RepositorySpoolQuotaError extends Error {}
+
+export class RepositorySpoolCapacityError extends RepositorySpoolQuotaError {}
 
 export class RepositorySpoolCorruptionError extends Error {}
 
@@ -333,6 +358,14 @@ export async function markRepositorySpoolCaptureAccepted(
 		) {
 			return false;
 		}
+		await writeMutablePrivateFile(
+			getAcceptedMarkerPath(paths, candidate.record.captureId),
+			`${JSON.stringify({
+				captureId: candidate.record.captureId,
+				version: ACCEPTED_CAPTURE_VERSION,
+			})}\n`,
+			env,
+		);
 		const acceptedPath = getAcceptedCapturePath(paths, artifactKind);
 		const current = await readAcceptedRepositoryCapture(acceptedPath);
 		if (
@@ -350,6 +383,42 @@ export async function markRepositorySpoolCaptureAccepted(
 				captureId: candidate.record.captureId,
 				capturedAt: candidate.record.capturedAt,
 				version: ACCEPTED_CAPTURE_VERSION,
+			})}\n`,
+			env,
+		);
+		return true;
+	} finally {
+		await releaseLock();
+	}
+}
+
+export async function markRepositorySpoolCaptureAbandoned(
+	binding: RepositorySpoolBinding,
+	captureId: string,
+	artifactKind: "local-context" | "github",
+	env: RepositorySpoolEnv,
+): Promise<boolean> {
+	const paths = getSpoolPaths(binding, env);
+	await ensureSpoolDirectories(paths);
+	const releaseLock = await acquireSpoolWriteLock(paths.root, env);
+	try {
+		const candidate = await inspectCaptureIfPresent(
+			getCapturePath(paths, captureId),
+			paths,
+			env,
+		);
+		if (
+			!candidate?.record ||
+			candidate.summary.integrity !== "valid" ||
+			candidate.record.artifactKind !== artifactKind
+		) {
+			return false;
+		}
+		await writeMutablePrivateFile(
+			getAbandonedMarkerPath(paths, candidate.record.captureId),
+			`${JSON.stringify({
+				captureId: candidate.record.captureId,
+				version: ABANDONED_CAPTURE_VERSION,
 			})}\n`,
 			env,
 		);
@@ -384,7 +453,6 @@ export async function planRepositoryBundle(
 				`Capture ${candidate.captureId} already exists with different or corrupt content.`,
 			);
 		}
-		const listing = await listRepositorySpool(binding, repositoryRoot, env);
 		return {
 			artifactKind: candidate.artifactKind,
 			captureId: candidate.captureId,
@@ -404,7 +472,7 @@ export async function planRepositoryBundle(
 			missingBlobIds: [],
 			alreadyStored: true,
 			selfContained: existingCapture.summary.selfContained,
-			quota: listing.quota,
+			quota: await getSpoolUsage(env),
 		};
 	}
 
@@ -430,8 +498,8 @@ export async function planRepositoryBundle(
 	);
 	const captureRecordBytes = Buffer.byteLength(serializeRecord(record));
 	const storedNewBytes = captureRecordBytes + newlyMaterializedBytes;
-	const status = await inspectSpool(binding, repositoryRoot, env);
-	assertWithinQuota(status.quota, storedNewBytes, 1, env);
+	const usage = await getSpoolUsage(env);
+	assertWithinQuota(usage, storedNewBytes, 1, env);
 
 	return {
 		artifactKind: candidate.artifactKind,
@@ -452,7 +520,7 @@ export async function planRepositoryBundle(
 		missingBlobIds,
 		alreadyStored: false,
 		selfContained: candidate.externalObjectIds.length === 0,
-		quota: status.quota,
+		quota: usage,
 	};
 }
 
@@ -467,14 +535,18 @@ export async function writeRepositoryBundle(
 	await ensureSpoolDirectories(paths);
 	const releaseLock = await acquireSpoolWriteLock(paths.root, env);
 	try {
-		const plan = await planRepositoryBundle(
+		await ensureCleanAccountingLocked(env);
+		const plan = await planWithRetirement(
 			candidate,
 			binding,
 			repositoryRoot,
 			captureLifecycle,
+			paths,
 			env,
 		);
 		if (!plan.alreadyStored) {
+			const before = await ensureCleanAccountingLocked(env);
+			await writeSpoolAccounting({ ...before, state: "dirty" }, env);
 			const blobsById = new Map(candidate.blobs.map((blob) => [blob.id, blob]));
 			for (const blobId of plan.missingBlobIds) {
 				const blob = blobsById.get(blobId);
@@ -502,23 +574,284 @@ export async function writeRepositoryBundle(
 				paths.captures,
 				env,
 			);
+			await writeSpoolAccounting(
+				{
+					...before,
+					blobCount: before.blobCount + plan.missingBlobIds.length,
+					captureCount: before.captureCount + 1,
+					state: "clean",
+					usedBytes: before.usedBytes + plan.storedNewBytes,
+				},
+				env,
+			);
 		}
 
-		const listing = await listRepositorySpool(binding, repositoryRoot, env);
-		const capture = listing.captures.find(
-			(item) => item.captureId === candidate.captureId,
+		const inspected = await inspectCaptureIfPresent(
+			getCapturePath(paths, candidate.captureId),
+			paths,
+			env,
 		);
-		if (capture?.integrity !== "valid") {
+		if (inspected?.summary.integrity !== "valid") {
 			throw new RepositorySpoolCorruptionError(
 				`Capture ${candidate.captureId} was not committed intact.`,
 			);
 		}
 		return {
 			created: !plan.alreadyStored,
-			capture,
-			quota: listing.quota,
-			retention: listing.retention,
+			capture: inspected.summary,
+			quota: await getSpoolUsage(env),
 		};
+	} finally {
+		await releaseLock();
+	}
+}
+
+async function planWithRetirement(
+	candidate: RepositoryBundleCandidate,
+	binding: RepositorySpoolBinding,
+	repositoryRoot: string,
+	captureLifecycle: RepositoryCaptureLifecycle,
+	paths: SpoolPaths,
+	env: RepositorySpoolEnv,
+): Promise<RepositorySpoolPlan> {
+	try {
+		return await planRepositoryBundle(
+			candidate,
+			binding,
+			repositoryRoot,
+			captureLifecycle,
+			env,
+		);
+	} catch (error) {
+		if (!(error instanceof RepositorySpoolCapacityError)) throw error;
+		const retirement = await retireAcceptedCapturesLocked(
+			paths,
+			env,
+			new Set([
+				...candidate.referencedBlobIds,
+				...candidate.blobs.map((blob) => blob.id),
+			]),
+		);
+		try {
+			return await planRepositoryBundle(
+				candidate,
+				binding,
+				repositoryRoot,
+				captureLifecycle,
+				env,
+			);
+		} catch (retryError) {
+			if (!(retryError instanceof RepositorySpoolCapacityError)) {
+				throw retryError;
+			}
+			throw new RepositorySpoolCapacityError(
+				`${retryError.message} Retired ${retirement.retiredCaptures} accepted or abandoned capture(s); ${retirement.unsentCaptures} capture(s) holding ${retirement.unsentBytes} bytes are still awaiting delivery and were kept. Run \`opaline upload --retry\` to deliver them, then capture again.`,
+			);
+		}
+	}
+}
+
+interface RetirementCapture {
+	readonly bytes: number;
+	readonly path: string;
+	readonly record: StoredCaptureRecord | null;
+}
+
+interface BindingRetirementPlan {
+	readonly captures: readonly RetirementCapture[];
+	readonly keepBlobIds: ReadonlySet<string>;
+	readonly paths: SpoolPaths;
+	readonly retired: readonly RetirementCapture[];
+	readonly unsent: readonly RetirementCapture[];
+}
+
+async function retireAcceptedCapturesLocked(
+	currentPaths: SpoolPaths,
+	env: RepositorySpoolEnv,
+	keepBlobIds: ReadonlySet<string>,
+): Promise<RepositorySpoolRetirementResult> {
+	const before = await ensureCleanAccountingLocked(env);
+	const bindingPaths = new Map<string, SpoolPaths>([
+		[currentPaths.binding, currentPaths],
+	]);
+	for (const name of await readNamesIfDirectory(currentPaths.root)) {
+		const binding = join(currentPaths.root, name);
+		if (bindingPaths.has(binding)) continue;
+		const details = await lstat(binding);
+		if (!details.isDirectory() || details.isSymbolicLink()) continue;
+		bindingPaths.set(binding, {
+			binding,
+			blobs: join(binding, "blobs"),
+			captures: join(binding, "captures"),
+			root: currentPaths.root,
+		});
+	}
+	const plans: BindingRetirementPlan[] = [];
+	for (const paths of bindingPaths.values()) {
+		plans.push(
+			await planBindingRetirement(
+				paths,
+				env,
+				paths.binding === currentPaths.binding ? keepBlobIds : new Set(),
+			),
+		);
+	}
+	const unsentCaptures = plans.reduce(
+		(total, plan) => total + plan.unsent.length,
+		0,
+	);
+	const unsentBytes = plans.reduce(
+		(total, plan) =>
+			total + plan.unsent.reduce((sum, capture) => sum + capture.bytes, 0),
+		0,
+	);
+	const retiredCaptures = plans.reduce(
+		(total, plan) => total + plan.retired.length,
+		0,
+	);
+	if (retiredCaptures === 0) {
+		return {
+			freedBytes: 0,
+			retiredBlobs: 0,
+			retiredCaptures: 0,
+			unsentBytes,
+			unsentCaptures,
+		};
+	}
+
+	await writeSpoolAccounting({ ...before, state: "dirty" }, env);
+	let freedBytes = 0;
+	let retiredBlobs = 0;
+	for (const plan of plans) {
+		const applied = await applyBindingRetirement(plan);
+		freedBytes += applied.freedBytes;
+		retiredBlobs += applied.retiredBlobs;
+	}
+	await writeSpoolAccounting(
+		{
+			...before,
+			blobCount: Math.max(0, before.blobCount - retiredBlobs),
+			captureCount: Math.max(0, before.captureCount - retiredCaptures),
+			state: "clean",
+			usedBytes: Math.max(0, before.usedBytes - freedBytes),
+		},
+		env,
+	);
+	return {
+		freedBytes,
+		retiredBlobs,
+		retiredCaptures,
+		unsentBytes,
+		unsentCaptures,
+	};
+}
+
+async function planBindingRetirement(
+	paths: SpoolPaths,
+	env: RepositorySpoolEnv,
+	keepBlobIds: ReadonlySet<string>,
+): Promise<BindingRetirementPlan> {
+	const names = await readNamesIfDirectory(paths.captures);
+	const acceptedMarkers = new Set(
+		names.filter((name) => name.endsWith(ACCEPTED_MARKER_SUFFIX)),
+	);
+	const abandonedMarkers = new Set(
+		names.filter((name) => name.endsWith(ABANDONED_MARKER_SUFFIX)),
+	);
+	const captures: RetirementCapture[] = [];
+	for (const name of names.filter((item) =>
+		item.endsWith(CAPTURE_FILE_SUFFIX),
+	)) {
+		const path = join(paths.captures, name);
+		env.onCaptureRead?.("scan", path);
+		captures.push({
+			bytes: await sizeIfRegularFile(path),
+			path,
+			record: await readStoredCapture(path),
+		});
+	}
+	const heads = new Set<string>();
+	for (const artifactKind of ["local-context", "github"] as const) {
+		const head = await readAcceptedRepositoryCapture(
+			getAcceptedCapturePath(paths, artifactKind),
+		);
+		if (head) heads.add(head.captureId);
+	}
+	const isRetirable = (captureId: string) =>
+		acceptedMarkers.has(getAcceptedMarkerName(captureId)) ||
+		abandonedMarkers.has(getAbandonedMarkerName(captureId));
+	const unsent = captures.filter(
+		(capture) =>
+			capture.record === null || !isRetirable(capture.record.captureId),
+	);
+	const protectedIds = new Set(heads);
+	for (const capture of unsent) {
+		if (capture.record?.parentCaptureId) {
+			protectedIds.add(capture.record.parentCaptureId);
+		}
+	}
+	const retired = captures.filter(
+		(capture) =>
+			capture.record !== null &&
+			isRetirable(capture.record.captureId) &&
+			!protectedIds.has(capture.record.captureId),
+	);
+	return { captures, keepBlobIds, paths, retired, unsent };
+}
+
+async function applyBindingRetirement(
+	plan: BindingRetirementPlan,
+): Promise<{ readonly freedBytes: number; readonly retiredBlobs: number }> {
+	if (plan.retired.length === 0) return { freedBytes: 0, retiredBlobs: 0 };
+	const { paths } = plan;
+	const retiredPaths = new Set(plan.retired.map((capture) => capture.path));
+	let freedBytes = 0;
+	for (const capture of plan.retired) {
+		freedBytes += capture.bytes;
+		await rm(capture.path, { force: true });
+		if (capture.record) {
+			await rm(getAcceptedMarkerPath(paths, capture.record.captureId), {
+				force: true,
+			});
+			await rm(getAbandonedMarkerPath(paths, capture.record.captureId), {
+				force: true,
+			});
+		}
+	}
+	const retainedBlobIds = new Set(plan.keepBlobIds);
+	for (const capture of plan.captures) {
+		if (retiredPaths.has(capture.path) || capture.record === null) continue;
+		for (const blobId of capture.record.referencedBlobIds) {
+			retainedBlobIds.add(blobId);
+		}
+		for (const blobId of capture.record.materializedBlobIds) {
+			retainedBlobIds.add(blobId);
+		}
+	}
+	let retiredBlobs = 0;
+	if (!plan.captures.some((capture) => capture.record === null)) {
+		for (const name of await readNamesIfDirectory(paths.blobs)) {
+			if (!name.endsWith(BLOB_FILE_SUFFIX)) continue;
+			const blobId = `sha256:${name.slice(0, -BLOB_FILE_SUFFIX.length)}`;
+			if (retainedBlobIds.has(blobId)) continue;
+			const path = join(paths.blobs, name);
+			freedBytes += await sizeIfRegularFile(path);
+			retiredBlobs += 1;
+			await rm(path, { force: true });
+		}
+	}
+	return { freedBytes, retiredBlobs };
+}
+
+export async function retireAcceptedRepositoryCaptures(
+	binding: RepositorySpoolBinding,
+	env: RepositorySpoolEnv,
+): Promise<RepositorySpoolRetirementResult> {
+	const paths = getSpoolPaths(binding, env);
+	await ensureSpoolDirectories(paths);
+	const releaseLock = await acquireSpoolWriteLock(paths.root, env);
+	try {
+		return await retireAcceptedCapturesLocked(paths, env, new Set());
 	} finally {
 		await releaseLock();
 	}
@@ -567,12 +900,116 @@ async function inspectSpool(
 		captures,
 		quota: globalStatus.quota,
 		retention: {
-			automaticCleanup: false,
-			policy: "manual",
+			automaticCleanup: true,
+			policy: "retire-accepted-on-quota-pressure",
 			oldestCaptureAt,
 			abandonedTemporaryFiles: globalStatus.temporaryFiles,
 		},
 	};
+}
+
+function toUsage(
+	accounting: Pick<SpoolAccounting, "usedBytes" | "captureCount" | "blobCount">,
+	env: RepositorySpoolEnv,
+): RepositorySpoolUsage {
+	return {
+		usedBytes: accounting.usedBytes,
+		maxBytes: env.maxStoredBytes,
+		remainingBytes: Math.max(0, env.maxStoredBytes - accounting.usedBytes),
+		captureCount: accounting.captureCount,
+		maxCaptures: env.maxCaptures,
+		blobCount: accounting.blobCount,
+	};
+}
+
+function getAccountingPath(env: RepositorySpoolEnv): string {
+	return join(
+		env.configDir,
+		"repo-context-spool",
+		`accounting.v${SPOOL_SCHEMA_VERSION}.json`,
+	);
+}
+
+async function readSpoolAccounting(
+	env: RepositorySpoolEnv,
+): Promise<SpoolAccounting | null> {
+	const bytes = await readFileIfPresent(getAccountingPath(env));
+	if (!bytes) return null;
+	let value: unknown;
+	try {
+		value = JSON.parse(bytes.toString("utf8"));
+	} catch {
+		return null;
+	}
+	if (
+		!isRecord(value) ||
+		value.version !== ACCOUNTING_VERSION ||
+		(value.state !== "clean" && value.state !== "dirty") ||
+		!isNonNegativeInteger(value.usedBytes) ||
+		!isNonNegativeInteger(value.captureCount) ||
+		!isNonNegativeInteger(value.blobCount)
+	) {
+		return null;
+	}
+	return {
+		blobCount: value.blobCount,
+		captureCount: value.captureCount,
+		state: value.state,
+		usedBytes: value.usedBytes,
+		version: ACCOUNTING_VERSION,
+	};
+}
+
+async function writeSpoolAccounting(
+	accounting: Omit<SpoolAccounting, "version">,
+	env: RepositorySpoolEnv,
+): Promise<void> {
+	await writeMutablePrivateFile(
+		getAccountingPath(env),
+		`${JSON.stringify({ ...accounting, version: ACCOUNTING_VERSION })}\n`,
+		env,
+	);
+}
+
+async function getSpoolUsage(
+	env: RepositorySpoolEnv,
+): Promise<RepositorySpoolUsage> {
+	const accounting = await readSpoolAccounting(env);
+	if (accounting?.state === "clean") return toUsage(accounting, env);
+	return (await inspectGlobalUsage(env)).quota;
+}
+
+async function ensureCleanAccountingLocked(
+	env: RepositorySpoolEnv,
+): Promise<SpoolAccounting> {
+	const accounting = await readSpoolAccounting(env);
+	if (accounting?.state === "clean") return accounting;
+	const { quota } = await inspectGlobalUsage(env);
+	const rebuilt: SpoolAccounting = {
+		blobCount: quota.blobCount,
+		captureCount: quota.captureCount,
+		state: "clean",
+		usedBytes: quota.usedBytes,
+		version: ACCOUNTING_VERSION,
+	};
+	await writeSpoolAccounting(rebuilt, env);
+	return rebuilt;
+}
+
+function getAcceptedMarkerName(captureId: string): string {
+	return `${sha256(captureId)}${ACCEPTED_MARKER_SUFFIX}`;
+}
+
+function getAcceptedMarkerPath(paths: SpoolPaths, captureId: string): string {
+	return join(paths.captures, getAcceptedMarkerName(captureId));
+}
+
+function getAbandonedMarkerName(captureId: string): string {
+	return `${sha256(captureId)}${ABANDONED_MARKER_SUFFIX}`;
+}
+
+function getAbandonedMarkerPath(paths: SpoolPaths, captureId: string): string {
+	return join(paths.captures, getAbandonedMarkerName(captureId));
 }
 
 async function inspectGlobalUsage(env: RepositorySpoolEnv): Promise<{
@@ -608,6 +1045,7 @@ async function inspectGlobalUsage(env: RepositorySpoolEnv): Promise<{
 			if (!name.endsWith(CAPTURE_FILE_SUFFIX)) continue;
 			captureCount += 1;
 			usedBytes += await sizeIfRegularFile(path);
+			env.onCaptureRead?.("scan", path);
 			const record = await readStoredCapture(path);
 			if (record) {
 				for (const blobId of record.referencedBlobIds) referenced.add(blobId);
@@ -799,6 +1237,7 @@ async function inspectCaptureIfPresent(
 ): Promise<InspectedCapture | null> {
 	const content = await readFileIfPresent(path);
 	if (content === null) return null;
+	env.onCaptureRead?.("verify", path);
 	await enforcePrivateFile(path);
 	const storedBytes = content.byteLength;
 	const record = parseStoredCapture(content.toString("utf8"));
@@ -1037,19 +1476,19 @@ function validateBlob(
 }
 
 function assertWithinQuota(
-	quota: RepositorySpoolQuota,
+	quota: RepositorySpoolUsage,
 	newBytes: number,
 	newCaptures: number,
 	env: RepositorySpoolEnv,
 ): void {
 	if (quota.usedBytes + newBytes > env.maxStoredBytes) {
-		throw new RepositorySpoolQuotaError(
-			`Repository spool needs ${newBytes} new bytes but only ${quota.remainingBytes} bytes remain. Existing captures were kept; Opaline never deletes them automatically.`,
+		throw new RepositorySpoolCapacityError(
+			`Repository spool needs ${newBytes} new bytes but only ${quota.remainingBytes} bytes remain. Accepted or abandoned captures are retired automatically when space runs out; captures awaiting delivery are never deleted.`,
 		);
 	}
 	if (quota.captureCount + newCaptures > env.maxCaptures) {
-		throw new RepositorySpoolQuotaError(
-			`Repository spool capture limit (${env.maxCaptures}) reached. Existing captures were kept; Opaline never deletes them automatically.`,
+		throw new RepositorySpoolCapacityError(
+			`Repository spool capture limit (${env.maxCaptures}) reached. Accepted or abandoned captures are retired automatically when space runs out; captures awaiting delivery are never deleted.`,
 		);
 	}
 }

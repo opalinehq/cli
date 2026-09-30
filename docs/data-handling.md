@@ -26,6 +26,14 @@ Servers without that capability continue to receive the filtered legacy ingest r
 
 The CLI defaults to `https://opaline.so`. Insecure login and upload overrides are documented in the [configuration reference](usage.md#configuration); they transmit credentials or transcripts without transport encryption.
 
+## Repository context evidence
+
+Automatic-upload hooks also capture repository context: Git state and safe patches, instruction and skill files, package configuration, and a filtered transcript revision. Credential-like paths (including `.env.example`, `.env.sample`, and `.env.template`) and the CLI's configuration directory are excluded from both filesystem content and Git patches.
+
+Evidence objects are limited to 64 MiB, with at most 128 MiB per delivery and reserved manifest headroom. Large transcript tails are retained privately in the CLI configuration directory and continue through `opaline upload --retry`, including after a terminal hook or a CLI restart. Pending captures and continuation sources have bounded disk quotas; accepted or abandoned repository-spool captures can be retired under quota pressure, but unsent captures are preserved.
+
+Pending evidence created with a different known-secret filter version is quarantined with a warning rather than uploaded. Recollect the session with the current CLI to apply the current filter. Repository-context delivery is separate from the full session upload; an evidence-storage outage does not prevent that session upload.
+
 ## Usage analytics
 
 Usage analytics are separate from session uploads. Official releases include PostHog capture configuration for a limited set of events:

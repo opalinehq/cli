@@ -38,6 +38,7 @@ export async function collectLocalContextBundle(
 		options.limits,
 		env.git,
 		blobStore,
+		options.excludedPathPrefixes,
 	);
 	const fileSystem = await collectFileSystemContext(
 		git.repositoryRoot,

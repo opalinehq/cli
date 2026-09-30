@@ -130,6 +130,29 @@ export function addHook(path: string = getClaudeSettingsPath()): void {
 	writeClaudeSettings(settings, path);
 }
 
+export function ensureSessionStartHook(
+	path: string = getClaudeSettingsPath(),
+): boolean {
+	const settings = readClaudeSettings(path);
+	if (!hasOwnedHook(settings, "SessionEnd")) return false;
+	const entries = settings.hooks?.SessionStart ?? [];
+	if (
+		entries.some((entry) =>
+			entry.hooks?.some(
+				(hook) =>
+					isOwnedHook(hook.command, "SessionStart") &&
+					hook.type === "command" &&
+					hook.async === true,
+			),
+		)
+	)
+		return false;
+	settings.hooks ??= {};
+	settings.hooks.SessionStart = reconcileHook(entries, "SessionStart");
+	writeClaudeSettings(settings, path);
+	return true;
+}
+
 export function removeHook(path: string = getClaudeSettingsPath()): void {
 	const settings = readClaudeSettings(path);
 	if (!settings.hooks) return;
@@ -162,7 +185,7 @@ function reconcileHook(
 			if (!isOwnedHook(hook.command, event)) return [hook];
 			if (installed) return [];
 			installed = true;
-			return [{ ...hook, command }];
+			return [{ ...hook, type: "command", command, async: true }];
 		});
 		return hooks.length ? [{ ...entry, hooks }] : [];
 	});

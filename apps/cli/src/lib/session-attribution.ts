@@ -138,6 +138,29 @@ export function buildSessionAttribution(input: {
 	};
 }
 
+export function continueSessionAttribution(
+	attribution: SessionAttributionManifest,
+	captureId: string,
+	revision: TranscriptRevisionManifest,
+): SessionAttributionManifest {
+	return {
+		...attribution,
+		captureId,
+		streams: attribution.streams.map((stream) =>
+			stream.role === "root"
+				? {
+						...stream,
+						sourceRevision: {
+							generation: revision.generation,
+							parentRevisionId: revision.parentRevisionId ?? null,
+							revisionId: revision.revisionId,
+						},
+					}
+				: stream,
+		),
+	};
+}
+
 function buildStreamAttribution(
 	stream: SessionAttributionSourceStream,
 	input: {

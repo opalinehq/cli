@@ -57,6 +57,20 @@ const CONFIG_EXTENSIONS = new Set([
 	".xml",
 ]);
 const DOCUMENT_EXTENSIONS = new Set([".adoc", ".mdx", ".rst", ".txt"]);
+const HIGH_RISK_CONTENT_PATHS = {
+	names: [
+		".env",
+		".npmrc",
+		".netrc",
+		".pypirc",
+		"credentials.json",
+		"service-account.json",
+		"id_rsa",
+		"id_ed25519",
+	],
+	prefixes: [".env."],
+	suffixes: [".pem", ".key", ".p12", ".pfx"],
+};
 
 export interface PathExclusion {
 	readonly excluded: boolean;
@@ -98,28 +112,21 @@ export function getPathExclusion(
 
 export function isHighRiskContentPath(relativePath: string): boolean {
 	const name = basename(relativePath).toLowerCase();
-	if (
-		name === ".env.example" ||
-		name === ".env.sample" ||
-		name === ".env.template"
-	) {
-		return false;
-	}
 	return (
-		name === ".env" ||
-		name.startsWith(".env.") ||
-		name === ".npmrc" ||
-		name === ".netrc" ||
-		name === ".pypirc" ||
-		name === "credentials.json" ||
-		name === "service-account.json" ||
-		name === "id_rsa" ||
-		name === "id_ed25519" ||
-		name.endsWith(".pem") ||
-		name.endsWith(".key") ||
-		name.endsWith(".p12") ||
-		name.endsWith(".pfx")
+		HIGH_RISK_CONTENT_PATHS.names.includes(name) ||
+		HIGH_RISK_CONTENT_PATHS.prefixes.some((prefix) =>
+			name.startsWith(prefix),
+		) ||
+		HIGH_RISK_CONTENT_PATHS.suffixes.some((suffix) => name.endsWith(suffix))
 	);
+}
+
+export function getHighRiskContentPathspecExclusions(): readonly string[] {
+	return [
+		...HIGH_RISK_CONTENT_PATHS.names,
+		...HIGH_RISK_CONTENT_PATHS.prefixes.map((prefix) => `${prefix}*`),
+		...HIGH_RISK_CONTENT_PATHS.suffixes.map((suffix) => `*${suffix}`),
+	].map((pattern) => `:(exclude,icase,glob)**/${pattern}`);
 }
 
 export function findSkillDirectories(

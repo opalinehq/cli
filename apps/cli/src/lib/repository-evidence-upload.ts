@@ -2,24 +2,37 @@ import { createHash, randomUUID } from "node:crypto";
 import { createORPCClient, ORPCError } from "@orpc/client";
 import { RPCLink } from "@orpc/client/fetch";
 import type { ContractRouterClient } from "@orpc/contract";
+import type { IngestSessionInput } from "../contracts/index.js";
 import {
 	type contract,
-	type IngestSessionInput,
+	createRepositoryEvidenceInitInputSchema,
 	parseSafeApiEndpoint,
+	REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES,
 	REPOSITORY_EVIDENCE_PROTOCOL,
 	type RepositoryEvidenceCapture,
 	type RepositoryEvidenceCommitOutput,
 	type RepositoryEvidenceCoverageArea,
 	type RepositoryEvidenceInitInput,
+	RepositoryEvidenceInitInputSchema,
 	type RepositoryEvidenceObjectDescriptor,
 } from "../contracts/index.js";
 import {
 	assessContextSkillUse,
+	type GitDiff,
+	type GitRepositorySnapshot,
 	type LocalContextBundle,
 } from "../internal/local-context-source/index.js";
+import { FILTER_VERSION } from "../internal/secret-filter/index.js";
 import type { RepositoryContext } from "./repo-context.js";
-import type { SessionAttributionManifest } from "./session-attribution.js";
-import type { TranscriptRevisionPlan } from "./transcript-revision.js";
+import {
+	continueSessionAttribution,
+	type SessionAttributionManifest,
+} from "./session-attribution.js";
+import type {
+	TranscriptDeliveryState,
+	TranscriptRevisionPlan,
+} from "./transcript-revision.js";
+import { extractTranscriptSkills } from "./transcript-skills.js";
 import { describeUploadEndpointRejection } from "./upload-endpoint.js";
 
 export interface RepositoryEvidenceBytes {
@@ -32,6 +45,32 @@ export interface BuiltRepositoryEvidenceUpload {
 	readonly objects: ReadonlyMap<string, RepositoryEvidenceBytes>;
 }
 
+const MANIFEST_HEADROOM_BYTES = 1024 * 1024;
+
+interface RepositoryEvidenceDeliveryLimits {
+	readonly maxAggregateBytes?: number;
+	readonly manifestHeadroomBytes?: number;
+}
+
+export function getTranscriptDeliveryBudget(
+	bundle: LocalContextBundle,
+	limits: RepositoryEvidenceDeliveryLimits = {},
+): number {
+	const encoder = new TextEncoder();
+	const contextBytes =
+		encoder.encode(JSON.stringify(bundle.manifest)).byteLength +
+		bundle.blobs.reduce(
+			(total, blob) => total + encoder.encode(blob.content).byteLength,
+			0,
+		);
+	return Math.max(
+		0,
+		(limits.maxAggregateBytes ?? REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES) -
+			contextBytes -
+			(limits.manifestHeadroomBytes ?? MANIFEST_HEADROOM_BYTES),
+	);
+}
+
 export interface RepositoryEvidenceUploadConfig {
 	readonly allowInsecureEndpoint: boolean;
 	readonly authType?: "bearer" | "api-key";
@@ -42,23 +81,26 @@ export interface RepositoryEvidenceUploadConfig {
 	readonly token: string;
 }
 
-export function buildRepositoryEvidenceUpload(input: {
-	readonly attribution: SessionAttributionManifest;
-	readonly bundle: LocalContextBundle;
-	readonly captureLifecycle: RepositoryEvidenceCapture["timing"]["lifecycle"];
-	readonly context: Pick<RepositoryContext, "localIdentity" | "remoteHint">;
-	readonly firstActionAt: string | null;
-	readonly firstActionBasis: RepositoryEvidenceCapture["timing"]["firstActionBasis"];
-	readonly firstActionRelationship: RepositoryEvidenceCapture["timing"]["firstActionRelationship"];
-	readonly organizationId: string;
-	readonly session: Pick<
-		IngestSessionInput,
-		"content" | "sessionId" | "source" | "subagents"
-	>;
-	readonly terminalTranscript: boolean;
-	readonly transcriptLastEventAt: string | null;
-	readonly transcriptRevision: TranscriptRevisionPlan;
-}): BuiltRepositoryEvidenceUpload {
+export function buildRepositoryEvidenceUpload(
+	input: {
+		readonly attribution?: SessionAttributionManifest;
+		readonly bundle: LocalContextBundle;
+		readonly captureLifecycle: RepositoryEvidenceCapture["timing"]["lifecycle"];
+		readonly context: Pick<RepositoryContext, "localIdentity" | "remoteHint">;
+		readonly firstActionAt: string | null;
+		readonly firstActionBasis: RepositoryEvidenceCapture["timing"]["firstActionBasis"];
+		readonly firstActionRelationship: RepositoryEvidenceCapture["timing"]["firstActionRelationship"];
+		readonly organizationId: string;
+		readonly session: Pick<
+			IngestSessionInput,
+			"content" | "sessionId" | "source" | "subagents"
+		>;
+		readonly terminalTranscript: boolean;
+		readonly transcriptLastEventAt: string | null;
+		readonly transcriptRevision: TranscriptRevisionPlan;
+	},
+	limits: RepositoryEvidenceDeliveryLimits = {},
+): BuiltRepositoryEvidenceUpload {
 	const observedSkills = extractObservedSkills(input.session);
 	const skillAssessments = assessContextSkillUse(
 		input.bundle.manifest.contextIndex.skills,
@@ -138,10 +180,10 @@ export function buildRepositoryEvidenceUpload(input: {
 			input.transcriptLastEventAt,
 		),
 	};
-	return {
+	const built = {
 		input: {
 			capture,
-			coverage: buildCoverage(input.bundle),
+			coverage: buildCoverage(input.bundle, input.transcriptRevision.delivery),
 			manifestObjectId: manifest.descriptor.objectId,
 			objects: [...objects.values()].map((object) => object.descriptor),
 			operationId: randomUUID(),
@@ -163,6 +205,10 @@ export function buildRepositoryEvidenceUpload(input: {
 		},
 		objects,
 	};
+	createRepositoryEvidenceInitInputSchema(limits.maxAggregateBytes).parse(
+		built.input,
+	);
+	return built;
 }
 
 export function buildLegacyTranscriptWatermark(
@@ -178,10 +224,106 @@ export function buildLegacyTranscriptWatermark(
 	};
 }
 
+export function buildRepositoryEvidenceContinuation(
+	previous: BuiltRepositoryEvidenceUpload,
+	plan: TranscriptRevisionPlan,
+): BuiltRepositoryEvidenceUpload {
+	const oldManifest = previous.objects.get(previous.input.manifestObjectId);
+	if (!oldManifest) throw new Error("Missing continuation context manifest");
+	const manifest: unknown = JSON.parse(
+		new TextDecoder().decode(oldManifest.bytes),
+	);
+	if (
+		typeof manifest !== "object" ||
+		manifest === null ||
+		!("localContext" in manifest) ||
+		typeof manifest.localContext !== "object" ||
+		manifest.localContext === null
+	)
+		throw new Error("Invalid continuation context manifest");
+	const identity = createHash("sha256")
+		.update(previous.input.operationId)
+		.update(plan.manifest.revisionId)
+		.digest("hex");
+	const operationId = `${identity.slice(0, 8)}-${identity.slice(8, 12)}-4${identity.slice(13, 16)}-8${identity.slice(17, 20)}-${identity.slice(20, 32)}`;
+	const nextManifest = buildObject(
+		new TextEncoder().encode(
+			JSON.stringify({
+				...manifest,
+				...("attribution" in manifest && manifest.attribution
+					? {
+							attribution: continueSessionAttribution(
+								manifest.attribution as SessionAttributionManifest,
+								operationId,
+								plan.manifest,
+							),
+						}
+					: {}),
+				localContext: {
+					...manifest.localContext,
+					captureId: operationId,
+					parentCaptureId: previous.input.capture.contextId,
+				},
+				transcriptRevision: plan.manifest,
+			}),
+		),
+		"context-manifest",
+		"application/json",
+		FILTER_VERSION,
+	);
+	const objects = new Map(
+		[...previous.objects].filter(
+			([, object]) => object.descriptor.kind === "source-blob",
+		),
+	);
+	objects.set(nextManifest.descriptor.objectId, nextManifest);
+	for (const chunk of plan.newChunks) {
+		const object = buildObject(
+			chunk.bytes,
+			"transcript-chunk",
+			"application/x-ndjson",
+			FILTER_VERSION,
+		);
+		objects.set(object.descriptor.objectId, object);
+	}
+	const input = RepositoryEvidenceInitInputSchema.parse({
+		...previous.input,
+		capture: {
+			...previous.input.capture,
+			contextId: operationId,
+			parentContextId: previous.input.capture.contextId,
+			transcriptWatermark: buildLegacyTranscriptWatermark(
+				plan,
+				previous.input.capture.transcriptWatermark?.lastEventAt ?? null,
+			),
+		},
+		coverage: previous.input.coverage.map((item) =>
+			item.area === "transcript-watermark"
+				? buildTranscriptCoverage(plan.delivery)
+				: item,
+		),
+		manifestObjectId: nextManifest.descriptor.objectId,
+		objects: [...objects.values()].map((object) => object.descriptor),
+		operationId,
+	});
+	return { input, objects };
+}
+
+export function requireRepositoryEvidenceApiKey(
+	authType: RepositoryEvidenceUploadConfig["authType"],
+): void {
+	if (authType !== "api-key") {
+		throw new Error(
+			"Repository evidence requires an ingest API key; run `opaline login` to refresh your credentials.",
+		);
+	}
+}
+
 export async function uploadRepositoryEvidence(
 	upload: BuiltRepositoryEvidenceUpload,
 	config: RepositoryEvidenceUploadConfig,
 ): Promise<RepositoryEvidenceCommitOutput> {
+	requireRepositoryEvidenceApiKey(config.authType);
 	const endpoint = parseSafeApiEndpoint(config.endpoint, {
 		allowPlaintext: config.allowInsecureEndpoint,
 	});
@@ -190,11 +332,7 @@ export async function uploadRepositoryEvidence(
 			`Evidence upload endpoint refused: ${describeUploadEndpointRejection(endpoint)}`,
 		);
 	}
-	const authType = config.authType ?? "bearer";
-	const authHeaders =
-		authType === "api-key"
-			? { "x-api-key": config.token }
-			: { Authorization: `Bearer ${config.token}` };
+	const authHeaders = { "x-api-key": config.token };
 	const fetchImplementation = config.fetch ?? globalThis.fetch;
 	const operationTimeout = config.operationTimeoutMs
 		? AbortSignal.timeout(config.operationTimeoutMs)
@@ -318,61 +456,35 @@ function buildObject(
 function extractObservedSkills(
 	session: Pick<IngestSessionInput, "content" | "subagents">,
 ): readonly string[] {
-	const contents = [
-		session.content,
-		...(session.subagents ?? []).map((subagent) => subagent.content),
-	];
-	const skills = new Set<string>();
-	for (const content of contents) {
-		for (const line of content.split("\n")) {
-			if (!line.trim()) continue;
-			try {
-				collectObservedSkills(JSON.parse(line), skills);
-			} catch {
-				// A malformed record makes negative skill-use conclusions unsafe. The
-				// manifest therefore always declares partial usage evidence.
-			}
-		}
-	}
-	return [...skills].sort();
+	return [
+		...new Set(
+			[
+				session.content,
+				...(session.subagents ?? []).map((agent) => agent.content),
+			].flatMap(extractTranscriptSkills),
+		),
+	].sort();
 }
 
-function collectObservedSkills(value: unknown, skills: Set<string>): void {
-	if (Array.isArray(value)) {
-		for (const item of value) collectObservedSkills(item, skills);
-		return;
-	}
-	if (!isRecord(value)) return;
-	const name = typeof value.name === "string" ? value.name : undefined;
-	const input = isRecord(value.input) ? value.input : undefined;
-	if (name?.split(/\.|__/u).at(-1)?.toLowerCase() === "skill") {
-		const skill = input?.skill;
-		if (typeof skill === "string" && skill.trim()) skills.add(skill.trim());
-	}
-	const path = input?.file_path ?? input?.path;
-	if (typeof path === "string") {
-		const match = /(?:^|\/)([^/]+)\/SKILL(?:\.md)?$/iu.exec(
-			path.replaceAll("\\", "/"),
-		);
-		if (match?.[1]) skills.add(match[1]);
-	}
-	for (const nested of Object.values(value))
-		collectObservedSkills(nested, skills);
-}
+type CoverageItem = RepositoryEvidenceInitInput["coverage"][number];
+type CoverageStatus = CoverageItem["status"];
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+const DIFF_COMMAND_NAMES: Readonly<Record<GitDiff["kind"], string>> = {
+	staged: "staged-diff",
+	"working-tree": "working-diff",
+};
+const DIFF_LABELS: Readonly<Record<GitDiff["kind"], string>> = {
+	staged: "Staged diff",
+	"working-tree": "Working-tree diff",
+};
 
-function buildCoverage(bundle: LocalContextBundle) {
+function buildCoverage(
+	bundle: LocalContextBundle,
+	transcriptDelivery: TranscriptDeliveryState,
+): RepositoryEvidenceInitInput["coverage"] {
 	const facets = bundle.manifest.contextIndex.facets;
 	return [
-		coverage(
-			"git-state",
-			bundle.manifest.git.status === "available"
-				? null
-				: "Git state unavailable",
-		),
+		buildGitStateCoverage(bundle),
 		coverageFromFacets(
 			"effective-instructions",
 			facets.filter((facet) =>
@@ -392,20 +504,143 @@ function buildCoverage(bundle: LocalContextBundle) {
 			"package-configuration",
 			facets.filter((facet) => facet.kind === "package-context"),
 		),
-		coverage(
-			"task-delta",
-			bundle.manifest.git.status === "available"
-				? null
-				: "Git diff unavailable",
-		),
+		buildTaskDeltaCoverage(bundle),
 		coverage(
 			"referenced-evidence",
 			bundle.manifest.coverage.errors.length === 0
 				? null
 				: "Some explicitly referenced evidence could not be captured",
 		),
-		coverage("transcript-watermark", null),
+		buildTranscriptCoverage(transcriptDelivery),
 	];
+}
+
+function buildGitStateCoverage(bundle: LocalContextBundle): CoverageItem {
+	const snapshot = bundle.manifest.git;
+	if (snapshot.status !== "available") {
+		return incompleteCoverage("git-state", "unavailable", [
+			`Git state unavailable: ${snapshot.detail}`,
+		]);
+	}
+	const diffCommands = new Set(Object.values(DIFF_COMMAND_NAMES));
+	const failedCommands = snapshot.errors
+		.map(getGitErrorCommand)
+		.filter((name) => !diffCommands.has(name));
+	const truncatedSections = snapshot.truncatedSections.filter(
+		(name) => !diffCommands.has(name),
+	);
+	return incompleteCoverage("git-state", "partial", [
+		...(failedCommands.length > 0
+			? [`Git commands failed: ${failedCommands.join(", ")}`]
+			: []),
+		...(truncatedSections.length > 0
+			? [`Git output truncated: ${truncatedSections.join(", ")}`]
+			: []),
+		...getConsistencyReasons(bundle),
+	]);
+}
+
+function buildTaskDeltaCoverage(bundle: LocalContextBundle): CoverageItem {
+	const snapshot = bundle.manifest.git;
+	if (snapshot.status !== "available") {
+		return incompleteCoverage("task-delta", "unavailable", [
+			`Git diff unavailable: ${snapshot.detail}`,
+		]);
+	}
+	const outcomes = snapshot.diffs.map((diff) =>
+		describeDiffOutcome(diff, snapshot),
+	);
+	const missing = outcomes.filter((outcome) => outcome.kind === "missing");
+	const reasons = outcomes.flatMap((outcome) =>
+		outcome.kind === "ok" ? [] : [outcome.reason],
+	);
+	const status: CoverageStatus =
+		missing.length > 0 && missing.length === outcomes.length
+			? "unavailable"
+			: "partial";
+	return incompleteCoverage("task-delta", status, [
+		...reasons,
+		...getConsistencyReasons(bundle),
+	]);
+}
+
+type DiffOutcome =
+	| { readonly kind: "ok" }
+	| { readonly kind: "partial"; readonly reason: string }
+	| { readonly kind: "missing"; readonly reason: string };
+
+function describeDiffOutcome(
+	diff: GitDiff,
+	snapshot: GitRepositorySnapshot,
+): DiffOutcome {
+	const label = DIFF_LABELS[diff.kind];
+	const command = DIFF_COMMAND_NAMES[diff.kind];
+	if (diff.omissionReason === "empty") return { kind: "ok" };
+	const failure = snapshot.errors.find(
+		(error) => getGitErrorCommand(error) === command,
+	);
+	if (failure !== undefined) {
+		return {
+			kind: "missing",
+			reason: `${label} unavailable: ${failure}`,
+		};
+	}
+	if (
+		diff.truncated ||
+		diff.omissionReason === "truncated" ||
+		snapshot.truncatedSections.includes(command)
+	) {
+		return {
+			kind: "missing",
+			reason: `${label} exceeded the capture output limit and was omitted`,
+		};
+	}
+	if (diff.blobId === null) {
+		return {
+			kind: "missing",
+			reason: `${label} omitted: ${diff.omissionReason ?? "unknown reason"}`,
+		};
+	}
+	if (diff.containsBinaryChanges) {
+		return {
+			kind: "partial",
+			reason: `${label} includes binary changes whose content is not captured`,
+		};
+	}
+	return { kind: "ok" };
+}
+
+function getConsistencyReasons(bundle: LocalContextBundle): readonly string[] {
+	switch (bundle.manifest.consistency.status) {
+		case "stable":
+			return [];
+		case "concurrent-change":
+			return ["Repository changed while it was being captured"];
+		case "unavailable":
+			return ["Capture consistency could not be verified"];
+	}
+}
+
+function buildTranscriptCoverage(
+	delivery: TranscriptDeliveryState,
+): CoverageItem {
+	switch (delivery.status) {
+		case "complete":
+			return coverage("transcript-watermark", null);
+		case "deferred":
+			return incompleteCoverage("transcript-watermark", "partial", [
+				`Transcript delivery is bounded; ${delivery.remainingBytes} bytes remain for later captures`,
+			]);
+		case "blocked":
+			return incompleteCoverage("transcript-watermark", "unavailable", [
+				`Transcript record at byte ${delivery.recordStartByte} (${delivery.recordBytes} bytes) exceeds the delivery byte budget`,
+			]);
+	}
+}
+
+function getGitErrorCommand(error: string): string {
+	const separator = error.indexOf(":");
+	return separator < 0 ? error : error.slice(0, separator);
 }
 
 function coverageFromFacets(
@@ -423,8 +658,20 @@ function coverageFromFacets(
 	);
 }
 
-function coverage(area: RepositoryEvidenceCoverageArea, reason: string | null) {
+function coverage(
+	area: RepositoryEvidenceCoverageArea,
+	reason: string | null,
+): CoverageItem {
 	return reason === null
-		? ({ area, reason: null, status: "complete" } as const)
-		: ({ area, reason, status: "partial" } as const);
+		? { area, reason: null, status: "complete" }
+		: incompleteCoverage(area, "partial", [reason]);
+}
+
+function incompleteCoverage(
+	area: RepositoryEvidenceCoverageArea,
+	status: Exclude<CoverageStatus, "complete">,
+	reasons: readonly string[],
+): CoverageItem {
+	if (reasons.length === 0) return { area, reason: null, status: "complete" };
+	return { area, reason: reasons.join("; ").slice(0, 500), status };
 }

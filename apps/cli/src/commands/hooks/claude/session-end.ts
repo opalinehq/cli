@@ -1,5 +1,6 @@
 import { getLogger } from "@logtape/logtape";
 import { buildCommand } from "@stricli/core";
+import { ensureSessionStartHook } from "../../../internal/agent-adapters/adapters/claude-code/settings.js";
 import {
 	claudeCodeAdapter,
 	type SessionFile,
@@ -48,6 +49,20 @@ async function runSessionEnd(): Promise<undefined | Error> {
 		const input = JSON.parse(raw) as HookInput;
 		if (!input.session_id || !input.transcript_path) return;
 		const hookReceivedAt = new Date().toISOString();
+		try {
+			const paths = new Set([
+				claudeCodeAdapter.getHookConfigPath({ global: true }),
+				claudeCodeAdapter.getHookConfigPath({ projectPath: input.cwd }),
+			]);
+			for (const path of paths) {
+				if (ensureSessionStartHook(path))
+					logger.info("Added the missing Claude Code SessionStart hook");
+			}
+		} catch (error) {
+			logger.warn("Could not add the SessionStart hook: {error}", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 		const gitInfo = await getGitInfo(input.cwd);
 		const repository = resolveUploadRepositoryIdentity(input.cwd, gitInfo);
 		if (
