@@ -44,3 +44,13 @@ function getInsecureEndpointEnvironmentValue(): string | undefined {
 		process.env[LEGACY_INSECURE_ENDPOINT_ENV_VAR]
 	);
 }
+
+export function normalizeRepositoryEvidenceEndpoint(endpoint: string): string {
+	const url = new URL(endpoint);
+	url.hash = "";
+	url.search = "";
+	url.pathname = url.pathname.replace(/\/{2,}/gu, "/");
+	if (url.pathname.length > 1)
+		url.pathname = url.pathname.replace(/\/+$/gu, "");
+	return url.toString();
+}

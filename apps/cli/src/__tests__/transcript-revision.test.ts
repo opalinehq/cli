@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES } from "../contracts/index.js";
 import {
+	hasValidTranscriptRevisionIntegrity,
+	isTranscriptRevisionManifest,
 	planTranscriptRevision,
 	type TranscriptRevisionScope,
 } from "../lib/transcript-revision.js";
@@ -335,3 +337,51 @@ function buildJsonl(
 	}
 	return Buffer.concat(records);
 }
+
+describe("transcript revision manifest validation", () => {
+	// biome-ignore lint/suspicious/noExplicitAny: tests corrupt stored JSON.
+	async function planStored(planScope: unknown): Promise<any> {
+		const plan = await planTranscriptRevision({
+			content: new TextEncoder().encode('{"ordinal":0}\n{"ordinal":1}\n'),
+			previous: undefined,
+			scope: planScope as TranscriptRevisionScope,
+			terminal: false,
+		});
+		return JSON.parse(JSON.stringify(plan.manifest));
+	}
+
+	test("accepts a stored manifest", async () => {
+		expect(isTranscriptRevisionManifest(await planStored(scope))).toBe(true);
+	});
+
+	test.each([
+		["an unknown provider", { ...scope, provider: "cursor" }],
+		["a missing session id", { ...scope, sessionId: undefined }],
+		["a numeric actor id", { ...scope, actorId: 1 }],
+	])(
+		"rejects a hash-consistent manifest with %s in the scope",
+		async (_name, badScope) => {
+			const stored = await planStored(badScope);
+
+			expect(hasValidTranscriptRevisionIntegrity(stored)).toBe(true);
+			expect(isTranscriptRevisionManifest(stored)).toBe(false);
+		},
+	);
+
+	test.each([
+		["a chunk without a hash", { sha256: undefined }],
+		["a chunk with a string offset", { startByte: "0" }],
+	])("rejects a manifest with %s", async (_name, chunkPatch) => {
+		const stored = await planStored(scope);
+		stored.chunks[0] = { ...stored.chunks[0], ...chunkPatch };
+
+		expect(isTranscriptRevisionManifest(stored)).toBe(false);
+	});
+
+	test("rejects a manifest with a malformed watermark", async () => {
+		const stored = await planStored(scope);
+		stored.watermark = { byteOffset: 0, recordCount: 0 };
+
+		expect(isTranscriptRevisionManifest(stored)).toBe(false);
+	});
+});

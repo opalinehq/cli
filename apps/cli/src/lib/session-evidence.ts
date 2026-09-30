@@ -31,7 +31,6 @@ import {
 } from "./repository-discovery.js";
 import {
 	deferPendingRepositoryEvidence,
-	normalizeRepositoryEvidenceEndpoint,
 	readPendingRepositoryEvidence,
 	writePendingRepositoryEvidence,
 } from "./repository-evidence-pending.js";
@@ -58,7 +57,10 @@ import {
 	readTranscriptRevision,
 	type TranscriptRevisionDeliveryScope,
 } from "./transcript-revision-store.js";
-import { allowsInsecureEndpointFromEnv } from "./upload-endpoint.js";
+import {
+	allowsInsecureEndpointFromEnv,
+	normalizeRepositoryEvidenceEndpoint,
+} from "./upload-endpoint.js";
 
 type EvidenceLifecycle = "start" | "resume" | "checkpoint" | "end";
 

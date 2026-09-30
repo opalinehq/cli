@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import { open } from "node:fs/promises";
+import { z } from "zod";
 import {
 	REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES,
 	REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES,
+	SourceSchema,
 } from "../contracts/index.js";
 
 export const TRANSCRIPT_MAX_CHUNK_BYTES = REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES;
@@ -39,6 +41,47 @@ export interface TranscriptRevisionManifest {
 	readonly terminal: boolean;
 	readonly version: 1;
 	readonly watermark: TranscriptWatermark;
+}
+
+const TranscriptRevisionManifestSchema = z.object({
+	chunks: z.array(
+		z.object({
+			endByte: z.number(),
+			recordCount: z.number(),
+			sha256: z.string(),
+			startByte: z.number(),
+		}),
+	),
+	generation: z.number(),
+	parentRevisionId: z.string().optional(),
+	revisionId: z.string(),
+	scope: z.object({
+		actorId: z.string(),
+		provider: SourceSchema,
+		providerInstanceId: z.string(),
+		sessionId: z.string(),
+	}),
+	terminal: z.boolean(),
+	version: z.literal(1),
+	watermark: z.object({
+		byteOffset: z.number(),
+		lastOrdinal: z.number().optional(),
+		prefixSha256: z.string(),
+		recordCount: z.number(),
+	}),
+});
+
+/**
+ * Hashes the original value, not the parsed output, because the parsed output
+ * does not keep the stored key order.
+ */
+export function isTranscriptRevisionManifest(
+	value: unknown,
+): value is TranscriptRevisionManifest {
+	return (
+		TranscriptRevisionManifestSchema.safeParse(value).success &&
+		hasValidTranscriptRevisionIntegrity(value as TranscriptRevisionManifest)
+	);
 }
 
 export interface PlannedTranscriptChunk extends TranscriptChunkReference {

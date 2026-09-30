@@ -22,8 +22,11 @@ import type {
 	BuiltRepositoryEvidenceUpload,
 	RepositoryEvidenceBytes,
 } from "./repository-evidence-upload.js";
-import type { TranscriptRevisionManifest } from "./transcript-revision.js";
-import { hasValidTranscriptRevisionIntegrity } from "./transcript-revision.js";
+import {
+	isTranscriptRevisionManifest,
+	type TranscriptRevisionManifest,
+} from "./transcript-revision.js";
+import { normalizeRepositoryEvidenceEndpoint } from "./upload-endpoint.js";
 
 const PENDING_VERSION = 4;
 const UNSCOPED_PENDING_VERSION = 3;
@@ -431,35 +434,6 @@ async function quarantineUnscopedPending(configDir: string): Promise<number> {
 		}
 	}
 	return names.length;
-}
-
-export function normalizeRepositoryEvidenceEndpoint(endpoint: string): string {
-	const url = new URL(endpoint);
-	url.hash = "";
-	url.search = "";
-	url.pathname = url.pathname.replace(/\/{2,}/gu, "/");
-	if (url.pathname.length > 1)
-		url.pathname = url.pathname.replace(/\/+$/gu, "");
-	return url.toString();
-}
-
-function isTranscriptRevisionManifest(
-	value: unknown,
-): value is TranscriptRevisionManifest {
-	if (typeof value !== "object" || value === null) return false;
-	const record = value as Partial<TranscriptRevisionManifest>;
-	return (
-		record.version === 1 &&
-		typeof record.revisionId === "string" &&
-		typeof record.generation === "number" &&
-		typeof record.terminal === "boolean" &&
-		typeof record.scope === "object" &&
-		record.scope !== null &&
-		Array.isArray(record.chunks) &&
-		typeof record.watermark === "object" &&
-		record.watermark !== null &&
-		hasValidTranscriptRevisionIntegrity(record as TranscriptRevisionManifest)
-	);
 }
 
 function pendingDirectory(configDir: string): string {
