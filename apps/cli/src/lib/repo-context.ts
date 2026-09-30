@@ -1,7 +1,10 @@
 import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import type { RepositoryEvidenceRemoteHint } from "../contracts/index.js";
+import {
+	REPOSITORY_EVIDENCE_MAX_OBJECTS,
+	type RepositoryEvidenceRemoteHint,
+} from "../contracts/index.js";
 import {
 	type AdditionalContextRoot,
 	collectLocalContextBundle,
@@ -31,6 +34,7 @@ import { resolveRepositoryEvidenceLocalIdentity } from "./repository-evidence-id
 
 const MAX_ADDITIONAL_CONTEXT_ROOTS = 16;
 const CONTEXT_ROOT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
+const SESSION_EVIDENCE_RESERVED_OBJECTS = 4;
 
 interface RepositoryConfigBoundary {
 	readonly canonicalRepositoryRoot: string;
@@ -131,6 +135,7 @@ export async function collectSessionRepositoryContext(input: {
 	readonly lifecycle: Exclude<RepositoryCaptureLifecycle, "manual">;
 	readonly organizationId: string;
 	readonly repositoryPath: string;
+	readonly deadlineAt?: number;
 }): Promise<SessionRepositoryContextCapture> {
 	const resolvedContext = await resolveRepositoryContext(input.repositoryPath);
 	const context: RepositoryContext = {
@@ -193,6 +198,8 @@ export async function collectSessionRepositoryContext(input: {
 			limits: {
 				...defaults.limits,
 				maxCommits: 10,
+				maxBlobs:
+					REPOSITORY_EVIDENCE_MAX_OBJECTS - SESSION_EVIDENCE_RESERVED_OBJECTS,
 				maxContentBytesPerFile: 512 * 1024,
 				maxContentBytesPerRoot: 4 * 1024 * 1024,
 				maxDepthPerRoot: 24,
@@ -205,8 +212,10 @@ export async function collectSessionRepositoryContext(input: {
 			},
 			parentCapture,
 		},
-		createLocalContextSourceEnv(),
+		createLocalContextSourceEnv(input.deadlineAt),
 	);
+	if (input.deadlineAt !== undefined && Date.now() >= input.deadlineAt)
+		throw new Error("Repository context capture exceeded its time budget.");
 	const candidate = createRepositoryBundleCandidate(bundle);
 	const stored = await writeRepositoryBundle(
 		candidate,

@@ -23,6 +23,7 @@ export interface LocalContextCollectionLimits {
 	readonly maxDepthPerRoot: number;
 	readonly maxEntriesPerRoot: number;
 	readonly maxTotalEntries: number;
+	readonly maxBlobs: number;
 	readonly maxContentBytesPerFile: number;
 	readonly maxContentBytesPerRoot: number;
 	readonly maxTotalContentBytes: number;
@@ -76,7 +77,13 @@ export interface BoundedHashResult {
 export interface LocalContextFileSystem {
 	realpath(path: string): Promise<string>;
 	lstat(path: string): Promise<FileSystemStat>;
-	readDirectory(path: string): Promise<readonly FileSystemEntry[]>;
+	readDirectory(
+		path: string,
+		maxEntries: number,
+	): Promise<{
+		readonly entries: FileSystemEntry[];
+		readonly complete: boolean;
+	}>;
 	readFileBounded(path: string, maxBytes: number): Promise<BoundedReadResult>;
 	hashFileBounded(path: string, maxBytes: number): Promise<BoundedHashResult>;
 	readLink(path: string): Promise<string>;
@@ -196,6 +203,7 @@ export type FileContent =
 				| "read-error"
 				| "secret-filter-failure"
 				| "secret-filter-budget"
+				| "blob-count-cap"
 				| "not-file";
 			readonly detail: string | null;
 	  };
@@ -356,6 +364,7 @@ export type ContextIndexResourceAccess =
 				| "high-risk-path"
 				| "secret-filter-failure"
 				| "secret-filter-budget"
+				| "blob-count-cap"
 				| "not-file";
 	  };
 
@@ -469,6 +478,7 @@ export interface GitDiff {
 		| "truncated"
 		| "secret-filter-failure"
 		| "secret-filter-budget"
+		| "blob-count-cap"
 		| null;
 }
 

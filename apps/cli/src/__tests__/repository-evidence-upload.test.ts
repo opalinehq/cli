@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ok as assert } from "node:assert";
+import { execFileSync } from "node:child_process";
 import {
 	mkdir,
 	mkdtemp,
@@ -14,13 +15,17 @@ import { join } from "node:path";
 import {
 	REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES,
 	REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES,
+	REPOSITORY_EVIDENCE_MAX_OBJECTS,
 	RepositoryEvidenceCommitInputSchema,
 	RepositoryEvidenceInitInputSchema,
 } from "../contracts/index.js";
 import {
 	assessContextSkillUse,
+	collectLocalContextBundle,
+	createLocalContextSourceEnv,
 	type GitDiff,
 	type GitRepositorySnapshot,
+	getDefaultLocalContextCollectionOptions,
 	type LocalContextBundle,
 } from "../internal/local-context-source/index.js";
 import { FILTER_VERSION } from "../internal/secret-filter/index.js";
@@ -44,6 +49,7 @@ import {
 	getTranscriptDeliveryBudget,
 	uploadRepositoryEvidence,
 } from "../lib/repository-evidence-upload.js";
+import { isPendingRepositoryEvidenceAutoUploadAllowed } from "../lib/session-evidence.js";
 import {
 	continueAcceptedTranscript,
 	persistTranscriptSource,
@@ -64,6 +70,296 @@ const scope: TranscriptRevisionScope = {
 };
 
 describe("repository evidence upload building", () => {
+	test("reserves manifest and transcript slots for a repository with 4096 distinct blobs", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "opaline-protocol-count-"));
+		try {
+			await Promise.all(
+				Array.from({ length: REPOSITORY_EVIDENCE_MAX_OBJECTS }, (_, index) =>
+					writeFile(
+						join(directory, `file-${index}.txt`),
+						`distinct content ${index}`,
+					),
+				),
+			);
+			const defaults = getDefaultLocalContextCollectionOptions();
+			const bundle = await collectLocalContextBundle(
+				directory,
+				{
+					...defaults,
+					capturePolicy: "session-evidence",
+					limits: {
+						...defaults.limits,
+						maxBlobs: REPOSITORY_EVIDENCE_MAX_OBJECTS - 4,
+					},
+				},
+				createLocalContextSourceEnv(),
+			);
+			const content = '{"ordinal":0}\n';
+			const plan = await planTranscriptRevision({
+				content: new TextEncoder().encode(content),
+				previous: undefined,
+				scope,
+				terminal: true,
+			});
+			const upload = buildUploadFor(bundle, plan, content);
+			expect(upload.input.objects.length).toBeLessThanOrEqual(
+				REPOSITORY_EVIDENCE_MAX_OBJECTS,
+			);
+			expect(bundle.manifest.coverage.omittedContentFiles).toBe(4);
+			expect(bundle.manifest.coverage.limitsReached).toContain("maxBlobs");
+			expect(
+				upload.input.objects.some(
+					(object) => object.kind === "context-manifest",
+				),
+			).toBe(true);
+			expect(
+				upload.input.objects.some(
+					(object) => object.kind === "transcript-chunk",
+				),
+			).toBe(true);
+			expect(
+				RepositoryEvidenceInitInputSchema.safeParse(upload.input).success,
+			).toBe(true);
+		} finally {
+			await rm(directory, { force: true, recursive: true });
+		}
+	}, 30_000);
+
+	test("automatic retry policy reloads repository and source settings and fails closed for unscoped evidence", async () => {
+		const configDir = await mkdtemp(join(tmpdir(), "opaline-evidence-off-"));
+		try {
+			const content = '{"ordinal":0}\n';
+			const plan = await planTranscriptRevision({
+				content: new TextEncoder().encode(content),
+				previous: undefined,
+				scope,
+				terminal: true,
+			});
+			const pending = {
+				endpoint: "https://example.com/rpc",
+				transcriptRevision: plan.manifest,
+				upload: buildUploadFor(makeBundle(), plan, content),
+				repositorySelection: {
+					repoKey: "repo-a",
+					legacyKeys: ["legacy-a"],
+					source: "codex" as const,
+				},
+			};
+			const save = (
+				repositories: Record<string, { label: string; sources: string[] }>,
+			) =>
+				writeFile(
+					join(configDir, "auto-upload.json"),
+					JSON.stringify({ version: 1, repositories }),
+				);
+			expect(
+				isPendingRepositoryEvidenceAutoUploadAllowed(pending, configDir),
+			).toBe(true);
+			await save({ "repo-a": { label: "A", sources: ["codex"] } });
+			expect(
+				isPendingRepositoryEvidenceAutoUploadAllowed(pending, configDir),
+			).toBe(true);
+			await save({
+				"repo-a": { label: "A", sources: [] },
+				"legacy-a": { label: "Legacy A", sources: ["codex"] },
+			});
+			expect(
+				isPendingRepositoryEvidenceAutoUploadAllowed(pending, configDir),
+			).toBe(false);
+			await save({ "repo-a": { label: "A", sources: ["claude_code"] } });
+			expect(
+				isPendingRepositoryEvidenceAutoUploadAllowed(pending, configDir),
+			).toBe(false);
+			await save({ "legacy-a": { label: "Legacy A", sources: ["codex"] } });
+			expect(
+				isPendingRepositoryEvidenceAutoUploadAllowed(pending, configDir),
+			).toBe(true);
+			expect(
+				isPendingRepositoryEvidenceAutoUploadAllowed(
+					{ ...pending, repositorySelection: undefined },
+					configDir,
+				),
+			).toBe(false);
+		} finally {
+			await rm(configDir, { force: true, recursive: true });
+		}
+	});
+
+	test("an enabled repository's hook does not retry another repository's OFF evidence", async () => {
+		const fixture = await createCliFixture("claude_code");
+		const configDir = join(fixture.home, ".rudel");
+		const deliveries: ReturnType<
+			typeof RepositoryEvidenceInitInputSchema.parse
+		>[] = [];
+		const uploadReceiptId = "00000000-0000-4000-8000-000000000010";
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				const { json } = await request.json();
+				if (new URL(request.url).pathname.endsWith("/init")) {
+					const input = RepositoryEvidenceInitInputSchema.parse(json);
+					deliveries.push(input);
+					return Response.json({
+						json: {
+							expiresAt: "2027-01-01T00:00:00.000Z",
+							missingObjects: [],
+							partSizeBytes: 8 * 1024 * 1024,
+							protocol: input.protocol,
+							reusedObjectIds: input.objects.map((object) => object.objectId),
+							uploadReceiptId,
+						},
+					});
+				}
+				RepositoryEvidenceCommitInputSchema.parse(json);
+				const input = deliveries.at(-1);
+				assert(input);
+				return Response.json({
+					json: {
+						acceptedAt: "2026-09-30T00:00:00.000Z",
+						contextId: input.capture.contextId,
+						manifestObjectId: input.manifestObjectId,
+						protocol: input.protocol,
+						receiptId: "00000000-0000-4000-8000-000000000011",
+						status: "accepted",
+						storedObjectIds: input.objects.map((object) => object.objectId),
+						uploadReceiptId,
+					},
+				});
+			},
+		});
+		try {
+			execFileSync("git", ["init", "--quiet", fixture.projectPath]);
+			const repositoryRoot = execFileSync(
+				"git",
+				["-C", fixture.projectPath, "rev-parse", "--show-toplevel"],
+				{ encoding: "utf8" },
+			).trim();
+			const apiBaseUrl = `http://127.0.0.1:${server.port}`;
+			const content = '{"ordinal":0}\n';
+			const plan = await planTranscriptRevision({
+				content: new TextEncoder().encode(content),
+				previous: undefined,
+				scope,
+				terminal: true,
+			});
+			await writePendingRepositoryEvidence(
+				{
+					endpoint: `${apiBaseUrl}/rpc`,
+					transcriptRevision: plan.manifest,
+					upload: buildUploadFor(makeBundle(), plan, content),
+					repositorySelection: {
+						repoKey: "repo-a",
+						legacyKeys: [],
+						source: "codex",
+					},
+				},
+				configDir,
+			);
+			await writeFile(
+				join(configDir, "credentials.json"),
+				JSON.stringify({
+					apiBaseUrl,
+					authType: "api-key",
+					token: "test",
+					user: {
+						id: scope.actorId,
+						email: "test@example.invalid",
+						name: "Test",
+					},
+				}),
+			);
+			await writeFile(
+				join(configDir, "projects.json"),
+				JSON.stringify({
+					projects: { [repositoryRoot]: { organizationId: "org" } },
+				}),
+			);
+			await writeFile(
+				join(configDir, "auto-upload.json"),
+				JSON.stringify({
+					version: 1,
+					repositories: {
+						"repo-a": { label: "A", sources: [] },
+						[`path-raw:${repositoryRoot}`]: {
+							label: "B",
+							sources: ["claude_code"],
+						},
+					},
+				}),
+			);
+			const result = await runCli(
+				["hooks", "claude", "session-start"],
+				fixture,
+				{
+					stdin: JSON.stringify({
+						cwd: fixture.projectPath,
+						session_id: fixture.sessionId,
+						transcript_path: fixture.transcriptPath,
+					}),
+					env: {
+						OPALINE_ALLOW_INSECURE_ENDPOINT: "1",
+						RUDEL_ALLOW_INSECURE_ENDPOINT: "1",
+					},
+				},
+			);
+			expect(result.exitCode).toBe(0);
+			expect(deliveries.map((delivery) => delivery.session.sessionId)).toEqual([
+				fixture.sessionId,
+			]);
+			const [remaining] = await readPendingRepositoryEvidence(configDir);
+			expect(remaining?.repositorySelection?.repoKey).toBe("repo-a");
+		} finally {
+			server.stop(true);
+			await rm(fixture.home, { force: true, recursive: true });
+		}
+	});
+
+	test("retains retry repository selection and filters disabled candidates before applying the item limit", async () => {
+		const configDir = await mkdtemp(join(tmpdir(), "opaline-retry-selection-"));
+		try {
+			const content = '{"ordinal":0}\n';
+			const plan = await planTranscriptRevision({
+				content: new TextEncoder().encode(content),
+				previous: undefined,
+				scope,
+				terminal: true,
+			});
+			const selection = {
+				repoKey: "repo-a",
+				legacyKeys: ["legacy-a"],
+				source: "codex" as const,
+			};
+			await writePendingRepositoryEvidence(
+				{
+					endpoint: "https://example.com/rpc",
+					transcriptRevision: plan.manifest,
+					upload: buildUploadFor(makeBundle(), plan, content),
+					repositorySelection: selection,
+				},
+				configDir,
+			);
+			const [restored] = await readPendingRepositoryEvidence(configDir);
+			expect(restored?.repositorySelection).toEqual(selection);
+			await expect(
+				readPendingRepositoryEvidence(configDir, {
+					isEligible: () => {
+						throw new Error("Invalid automatic upload settings");
+					},
+				}),
+			).rejects.toThrow("Invalid automatic upload settings");
+			expect(await readPendingRepositoryEvidence(configDir)).toHaveLength(1);
+			expect(
+				await readPendingRepositoryEvidence(configDir, {
+					maxItems: 1,
+					isEligible: () => false,
+				}),
+			).toEqual([]);
+		} finally {
+			await rm(configDir, { force: true, recursive: true });
+		}
+	});
+
 	test.each([undefined, "bearer"] as const)(
 		"refuses unsupported evidence auth %s before contacting the API",
 		async (authType) => {
@@ -333,6 +629,11 @@ describe("repository evidence upload building", () => {
 		for (const chunk of plan.newChunks)
 			expect(chunk.bytes.buffer.byteLength).toBe(chunk.bytes.byteLength);
 		const initial = {
+			repositorySelection: {
+				repoKey: "repo-a",
+				legacyKeys: [],
+				source: "codex" as const,
+			},
 			endpoint: "https://opaline.so/rpc",
 			transcriptRevision: plan.manifest,
 			upload: buildUploadFor(makeBundle(), plan, content),
@@ -346,6 +647,7 @@ describe("repository evidence upload building", () => {
 		for (let attempts = 0; attempts < 10; attempts++) {
 			const [pending] = await readPendingRepositoryEvidence(configDir);
 			if (!pending) break;
+			expect(pending.repositorySelection).toEqual(initial.repositorySelection);
 			deliveries++;
 			terminal = pending.transcriptRevision.terminal;
 			bytes.push(

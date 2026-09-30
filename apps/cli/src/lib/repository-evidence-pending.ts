@@ -37,6 +37,11 @@ export const DEFAULT_PENDING_REPOSITORY_EVIDENCE_QUOTA: PendingRepositoryEvidenc
 	{ maxFiles: 200, maxTotalBytes: 512 * 1024 * 1024 };
 
 export interface PendingRepositoryEvidence {
+	readonly repositorySelection?: {
+		readonly repoKey: string;
+		readonly legacyKeys: readonly string[];
+		readonly source: "claude_code" | "codex";
+	};
 	readonly continuation?: {
 		readonly sourceId: string;
 		readonly terminal: boolean;
@@ -71,6 +76,7 @@ export async function writePendingRepositoryEvidence(
 	await assertPendingQuota(directory, path, pending, quota);
 	const temporary = `${path}.${randomUUID()}.tmp`;
 	const value = {
+		repositorySelection: pending.repositorySelection,
 		continuation: pending.continuation,
 		version: PENDING_VERSION,
 		endpoint: pending.endpoint,
@@ -137,6 +143,7 @@ export async function readPendingRepositoryEvidence(
 		readonly endpoint?: string;
 		readonly excludeOperationIds?: ReadonlySet<string>;
 		readonly maxItems?: number;
+		readonly isEligible?: (pending: PendingRepositoryEvidence) => boolean;
 		readonly onError?: (error: unknown) => void;
 		readonly onWarning?: (warning: Error) => void;
 	} = {},
@@ -177,12 +184,9 @@ export async function readPendingRepositoryEvidence(
 			if (isErrorCode(error, "ENOENT")) continue;
 			throw error;
 		}
+		let value: PendingRepositoryEvidence;
 		try {
-			const value = parsePending(text, options.actorId, options.endpoint);
-			if (options.excludeOperationIds?.has(value.upload.input.operationId)) {
-				continue;
-			}
-			pending.push(value);
+			value = parsePending(text, options.actorId, options.endpoint);
 		} catch (error) {
 			if (error instanceof IncompatiblePendingFilterError) {
 				await abandonPendingRepositoryCapture(error.pending, configDir);
@@ -193,7 +197,12 @@ export async function readPendingRepositoryEvidence(
 			await quarantinePending(entry.path, directory);
 			if (!options.onError) throw error;
 			options.onError(error);
+			continue;
 		}
+		if (options.excludeOperationIds?.has(value.upload.input.operationId))
+			continue;
+		if (options.isEligible && !options.isEligible(value)) continue;
+		pending.push(value);
 	}
 	return pending;
 }
@@ -293,6 +302,28 @@ function parsePending(
 		throw invalidPending();
 	}
 	const input = RepositoryEvidenceInitInputSchema.parse(record.input);
+	let repositorySelection: PendingRepositoryEvidence["repositorySelection"];
+	if (record.repositorySelection !== undefined) {
+		const selection = record.repositorySelection;
+		if (
+			typeof selection !== "object" ||
+			selection === null ||
+			!("repoKey" in selection) ||
+			typeof selection.repoKey !== "string" ||
+			!selection.repoKey ||
+			!("legacyKeys" in selection) ||
+			!Array.isArray(selection.legacyKeys) ||
+			!selection.legacyKeys.every((key: unknown) => typeof key === "string") ||
+			!("source" in selection) ||
+			selection.source !== input.session.source
+		)
+			throw invalidPending();
+		repositorySelection = {
+			repoKey: selection.repoKey,
+			legacyKeys: selection.legacyKeys,
+			source: input.session.source,
+		};
+	}
 	let continuation: PendingRepositoryEvidence["continuation"];
 	if (record.continuation !== undefined) {
 		const value = record.continuation;
@@ -339,6 +370,7 @@ function parsePending(
 	if (objects.size !== input.objects.length) throw invalidPending();
 	assertInitialRevisionClosure(record.transcriptRevision, objects);
 	const pending = {
+		repositorySelection,
 		continuation,
 		endpoint: normalizeRepositoryEvidenceEndpoint(record.endpoint),
 		transcriptRevision: record.transcriptRevision,

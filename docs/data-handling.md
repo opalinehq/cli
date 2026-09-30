@@ -32,6 +32,8 @@ Automatic-upload hooks also capture repository context: Git state and safe patch
 
 Evidence objects are limited to 64 MiB, with at most 128 MiB per delivery and reserved manifest headroom. Large transcript tails are retained privately in the CLI configuration directory and continue through `opaline upload --retry`, including after a terminal hook or a CLI restart. Pending captures and continuation sources have bounded disk quotas; accepted or abandoned repository-spool captures can be retired under quota pressure, but unsent captures are preserved.
 
+Hook evidence capture uses a shared 20-second capture-and-delivery budget. Transcript filtering is streamed, with a 32 MiB aggregate input and filtered-materialization limit and at most 256 streams; exceeding these limits or the aggregate secret-redaction safety budget skips the sidecar without disabling the independent transcript uploader. Directory enumeration is incremental and bounded by the remaining entry budget. Context collection reserves manifest/transcript slots within the 4,096-object protocol limit and reports omitted blobs as partial coverage. Automatic retries recheck the queued capture's repository and source against current OFF settings; older captures without a repository-selection identity are not automatically retried when repository settings are managed.
+
 Pending evidence created with a different known-secret filter version is quarantined with a warning rather than uploaded. Recollect the session with the current CLI to apply the current filter. Repository-context delivery is separate from the full session upload; an evidence-storage outage does not prevent that session upload.
 
 ## Usage analytics

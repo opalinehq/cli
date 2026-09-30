@@ -16,6 +16,7 @@ export interface BlobStore {
 	readonly blobs: Map<string, ContextBlob>;
 	readonly parentBlobIds: ReadonlySet<string>;
 	readonly parentCaptureId: string | null;
+	readonly maxBlobs: number;
 }
 
 export type SanitizedBlobResult =
@@ -29,17 +30,22 @@ export type SanitizedBlobResult =
 	  }
 	| {
 			readonly status: "failure";
-			readonly reason: "secret-filter-failure" | "secret-filter-budget";
+			readonly reason:
+				| "secret-filter-failure"
+				| "secret-filter-budget"
+				| "blob-count-cap";
 			readonly detail: string;
 	  };
 
 export function createBlobStore(
 	parentCapture: ParentCaptureReference | null,
+	maxBlobs: number,
 ): BlobStore {
 	return {
 		blobs: new Map(),
 		parentBlobIds: new Set(parentCapture?.blobIds ?? []),
 		parentCaptureId: parentCapture?.id ?? null,
+		maxBlobs,
 	};
 }
 
@@ -68,6 +74,13 @@ export function addSanitizedTextBlob(
 		const blobId = `sha256:${digest}`;
 		const reused = store.parentBlobIds.has(blobId);
 		if (!reused && !store.blobs.has(blobId)) {
+			if (store.blobs.size >= store.maxBlobs)
+				return {
+					status: "failure",
+					reason: "blob-count-cap",
+					detail:
+						"Context blob omitted to reserve protocol object-count headroom.",
+				};
 			store.blobs.set(blobId, {
 				id: blobId,
 				algorithm: "sha256",

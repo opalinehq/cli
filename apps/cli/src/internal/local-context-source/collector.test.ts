@@ -32,6 +32,86 @@ afterAll(async () => {
 });
 
 describe("local context collection from a real Git worktree", () => {
+	test("reports truncated directory coverage even when retained entries are excluded", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "opaline-excluded-budget-"));
+		TEST_DIRECTORIES.push(directory);
+		const names = Array.from(
+			{ length: 30 },
+			(_, index) => `excluded-${index}.txt`,
+		);
+		await Promise.all(
+			names.map((name) => writeFile(join(directory, name), "content")),
+		);
+		const defaults = getDefaultLocalContextCollectionOptions();
+		const bundle = await collectLocalContextBundle(
+			directory,
+			{
+				...defaults,
+				excludedPathPrefixes: names,
+				limits: { ...defaults.limits, maxEntriesPerRoot: 3 },
+			},
+			fixedEnvironment(),
+		);
+		expect(bundle.manifest.entries).toHaveLength(0);
+		expect(bundle.manifest.coverage.excludedPaths).toHaveLength(3);
+		expect(bundle.manifest.coverage.limitsReached).toContain(
+			"maxEntriesPerRoot",
+		);
+		expect(bundle.manifest.roots[0]?.status).toBe("limit-reached");
+	});
+
+	test("checks the capture deadline before filesystem collection", async () => {
+		await expect(
+			createLocalContextSourceEnv(Date.now() - 1).fileSystem.readDirectory(
+				"/missing-budget-directory",
+				3,
+			),
+		).rejects.toThrow("time budget");
+	});
+
+	test("bounds directory enumeration before retaining and sorting entries", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "opaline-wide-directory-"));
+		TEST_DIRECTORIES.push(directory);
+		await Promise.all(
+			Array.from({ length: 30 }, (_, index) =>
+				writeFile(join(directory, `file-${index}.txt`), "content"),
+			),
+		);
+		const result = await createLocalContextSourceEnv().fileSystem.readDirectory(
+			directory,
+			3,
+		);
+		expect(result.entries).toHaveLength(3);
+		expect(result.complete).toBe(false);
+	});
+
+	test("reports object-count omissions without discarding the capture", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "opaline-blob-budget-"));
+		TEST_DIRECTORIES.push(directory);
+		await Promise.all(
+			Array.from({ length: 6 }, (_, index) =>
+				writeFile(
+					join(directory, `file-${index}.txt`),
+					`distinct content ${index}`,
+				),
+			),
+		);
+		const defaults = getDefaultLocalContextCollectionOptions();
+		const bundle = await collectLocalContextBundle(
+			directory,
+			{
+				...defaults,
+				capturePolicy: "session-evidence",
+				limits: { ...defaults.limits, maxBlobs: 2 },
+			},
+			fixedEnvironment(),
+		);
+		expect(bundle.blobs).toHaveLength(2);
+		expect(bundle.manifest.coverage.limitsReached).toContain("maxBlobs");
+		expect(bundle.manifest.coverage.omittedContentFiles).toBe(4);
+		expect(bundle.manifest.coverage.partial).toBe(true);
+	});
+
 	test("rejects invalid additional-root paths and enum values", () => {
 		const defaults = getDefaultLocalContextCollectionOptions();
 		const validRoot = {

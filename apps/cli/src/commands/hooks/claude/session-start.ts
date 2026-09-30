@@ -1,8 +1,11 @@
-import { readFile } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { getLogger } from "@logtape/logtape";
 import { buildCommand } from "@stricli/core";
 import type { IngestSessionInput } from "../../../contracts/index.js";
-import { claudeCodeAdapter } from "../../../internal/agent-adapters/index.js";
+import {
+	claudeCodeAdapter,
+	type FileBackedUploadRequest,
+} from "../../../internal/agent-adapters/index.js";
 import { isRepositoryAutoUploadAllowed } from "../../../lib/auto-upload-config.js";
 import { loadCredentials } from "../../../lib/credentials.js";
 import { getGitInfo } from "../../../lib/git-info.js";
@@ -58,25 +61,34 @@ async function runSessionStart(): Promise<undefined> {
 			);
 			return;
 		}
-		const materializationStartedAt = new Date().toISOString();
-		let content = "";
+		let transcriptExists = true;
 		try {
-			content = await readFile(input.transcript_path, "utf8");
+			await stat(input.transcript_path);
 		} catch (error) {
 			if (!isMissingPath(error)) throw error;
+			transcriptExists = false;
 		}
-		const requestMaterializedAt = {
-			completedAt: new Date().toISOString(),
-			startedAt: materializationStartedAt,
-		};
-		const request: IngestSessionInput = {
-			content,
+		const metadata: FileBackedUploadRequest["metadata"] = {
 			organizationId,
 			projectPath: input.cwd,
 			sessionId: input.session_id,
 			source: "claude_code",
 			upload_mode: "hook",
 		};
+		const request: IngestSessionInput | FileBackedUploadRequest =
+			transcriptExists
+				? {
+						kind: "file",
+						metadata,
+						subagentDiscovery: {
+							omittedCount: null,
+							reason: "SessionStart did not discover child transcripts",
+							status: "unavailable",
+						},
+						subagents: [],
+						transcriptPath: input.transcript_path,
+					}
+				: { ...metadata, content: "" };
 		const receipt = await captureAndUploadSessionEvidence({
 			credentials,
 			hookReceivedAt,
@@ -84,7 +96,6 @@ async function runSessionStart(): Promise<undefined> {
 			onWarning: (warning) => logger.warn("{warning}", { warning }),
 			organizationId,
 			request,
-			requestMaterializedAt,
 			terminalTranscript: false,
 		});
 		logger.info(

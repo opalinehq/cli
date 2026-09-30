@@ -4,16 +4,31 @@ import type {
 	FileBackedUploadRequest,
 	FileBackedUploadSubagentDiscovery,
 } from "../internal/agent-adapters/index.js";
-import { filterSessionTextFields } from "../internal/secret-filter/index.js";
+import { getRedactionBudgetAnomaly } from "../internal/secret-filter/index.js";
 import { getApiBaseOverride } from "./api-target.js";
+import {
+	isRepositoryAutoUploadAllowed,
+	loadAutoUploadConfig,
+} from "./auto-upload-config.js";
 import type { Credentials } from "./credentials.js";
+import {
+	cleanupStagedUpload,
+	createFilteredUploadSources,
+	stageFilteredUpload,
+} from "./filtered-upload-staging.js";
+import { getGitInfo } from "./git-info.js";
 import { getConfigDir } from "./local-state.js";
 import { collectSessionRepositoryContext } from "./repo-context.js";
 import {
 	createRepositorySpoolBinding,
 	createRepositorySpoolEnv,
+	markRepositorySpoolCaptureAbandoned,
 	markRepositorySpoolCaptureAccepted,
 } from "./repo-spool.js";
+import {
+	getLegacyRepositoryKey,
+	resolveUploadRepositoryIdentity,
+} from "./repository-discovery.js";
 import {
 	deferPendingRepositoryEvidence,
 	normalizeRepositoryEvidenceEndpoint,
@@ -48,6 +63,7 @@ import { allowsInsecureEndpointFromEnv } from "./upload-endpoint.js";
 type EvidenceLifecycle = "start" | "resume" | "checkpoint" | "end";
 
 const EVIDENCE_DELIVERY_BUDGET_MS = 20_000;
+export const EVIDENCE_TRANSCRIPT_INPUT_MAX_BYTES = 32 * 1024 * 1024;
 
 export async function captureAndUploadSessionEvidence(input: {
 	readonly credentials: Credentials;
@@ -62,6 +78,7 @@ export async function captureAndUploadSessionEvidence(input: {
 	};
 	readonly terminalTranscript: boolean;
 }): Promise<{ readonly contextId: string; readonly receiptId: string }> {
+	const deadlineAt = Date.now() + EVIDENCE_DELIVERY_BUDGET_MS;
 	if (!input.credentials.user) {
 		throw new Error("Repository evidence requires an authenticated CLI user.");
 	}
@@ -72,34 +89,42 @@ export async function captureAndUploadSessionEvidence(input: {
 	const materialized = await materializeEvidenceRequest(
 		input.request,
 		input.requestMaterializedAt,
+		configDir,
+		deadlineAt,
 	);
 	const request = materialized.request;
-	const filtered = filterSessionTextFields({
-		content: request.content,
-		subagents: request.subagents,
-	});
-	const contextCapture = await collectSessionRepositoryContext({
-		accountId: input.credentials.user.id,
-		endpoint,
-		lifecycle: input.lifecycle,
-		organizationId: input.organizationId,
-		repositoryPath: request.projectPath,
-	});
-	const scope = {
-		actorId: input.credentials.user.id,
-		provider: request.source,
-		providerInstanceId: contextCapture.context.localIdentity.installationId,
-		sessionId: request.sessionId,
-	} as const;
-	const deliveryScope: TranscriptRevisionDeliveryScope = {
-		endpoint,
-		organizationId: input.organizationId,
-		transcriptScope: scope,
-	};
-	const previous = await readTranscriptRevision(deliveryScope);
-	const sourceId = await persistTranscriptSource(filtered.content, configDir);
+	const sourceId = materialized.sourceId;
 	let hasPending = false;
+	let contextCapture:
+		| Awaited<ReturnType<typeof collectSessionRepositoryContext>>
+		| undefined;
 	try {
+		contextCapture = await collectSessionRepositoryContext({
+			accountId: input.credentials.user.id,
+			endpoint,
+			lifecycle: input.lifecycle,
+			organizationId: input.organizationId,
+			repositoryPath: request.projectPath,
+			deadlineAt,
+		});
+		const scope = {
+			actorId: input.credentials.user.id,
+			provider: request.source,
+			providerInstanceId: contextCapture.context.localIdentity.installationId,
+			sessionId: request.sessionId,
+		} as const;
+		const deliveryScope: TranscriptRevisionDeliveryScope = {
+			endpoint,
+			organizationId: input.organizationId,
+			transcriptScope: scope,
+		};
+		const previous = await readTranscriptRevision(deliveryScope);
+		const gitInfo = await getGitInfo(request.projectPath);
+		const repository = resolveUploadRepositoryIdentity(
+			request.projectPath,
+			gitInfo,
+		);
+		assertCaptureBudget(deadlineAt);
 		const transcriptRevision = await planTranscriptRevisionFile({
 			path: transcriptSourcePath(configDir, sourceId),
 			limits: {
@@ -109,7 +134,7 @@ export async function captureAndUploadSessionEvidence(input: {
 			scope,
 			terminal: input.terminalTranscript,
 		});
-		const firstActionAt = findFirstTranscriptTimestamp(filtered.content);
+		const firstActionAt = findFirstTranscriptTimestamp(request.content);
 		const timing = getFirstActionTiming(
 			input.lifecycle,
 			firstActionAt,
@@ -126,7 +151,7 @@ export async function captureAndUploadSessionEvidence(input: {
 			},
 			opalineSessionId: request.sessionId,
 			source: request.source,
-			streams: applyFilteredContent(materialized.streams, filtered),
+			streams: materialized.streams,
 			terminal: input.terminalTranscript,
 			transcriptRevision: transcriptRevision.manifest,
 		});
@@ -139,16 +164,17 @@ export async function captureAndUploadSessionEvidence(input: {
 			firstActionBasis: timing.firstActionBasis,
 			firstActionRelationship: timing.firstActionRelationship,
 			organizationId: input.organizationId,
-			session: {
-				...request,
-				content: filtered.content,
-				subagents: filtered.subagents ? [...filtered.subagents] : undefined,
-			},
+			session: request,
 			terminalTranscript: input.terminalTranscript,
 			transcriptLastEventAt: attribution.streams[0]?.prefix.lastEventAt ?? null,
 			transcriptRevision,
 		});
 		const currentPending = {
+			repositorySelection: {
+				repoKey: repository.repoKey,
+				legacyKeys: [getLegacyRepositoryKey(request.projectPath, gitInfo)],
+				source: request.source,
+			},
 			continuation: { sourceId, terminal: input.terminalTranscript },
 			endpoint,
 			transcriptRevision: transcriptRevision.manifest,
@@ -161,9 +187,9 @@ export async function captureAndUploadSessionEvidence(input: {
 					: `Transcript evidence for session ${request.sessionId} is blocked by a ${transcriptRevision.delivery.recordBytes}-byte record that exceeds the delivery limit.`,
 			);
 		}
+		assertCaptureBudget(deadlineAt);
 		await writePendingRepositoryEvidence(currentPending, configDir);
 		hasPending = true;
-		const deadlineAt = Date.now() + EVIDENCE_DELIVERY_BUDGET_MS;
 		const receipt = await uploadWithBoundedRetries(upload, input.credentials, {
 			deadlineAt,
 			endpoint,
@@ -199,8 +225,17 @@ export async function captureAndUploadSessionEvidence(input: {
 			receiptId: receipt.receiptId,
 		};
 	} finally {
-		if (!hasPending)
+		if (!hasPending) {
 			await rm(transcriptSourcePath(configDir, sourceId), { force: true });
+			if (contextCapture) {
+				await markRepositorySpoolCaptureAbandoned(
+					contextCapture.context.binding,
+					contextCapture.stored.capture.captureId,
+					"local-context",
+					contextCapture.context.spoolEnv,
+				);
+			}
+		}
 	}
 }
 
@@ -282,11 +317,15 @@ async function retryOnePendingRepositoryEvidence(
 		actorId,
 		endpoint,
 		maxItems: 1,
+		isEligible: (pending) =>
+			isPendingRepositoryEvidenceAutoUploadAllowed(pending, configDir),
 		onError: (error) => failures.push(error),
 		onWarning: (warning) => onWarning?.(warning.message),
 	})) {
 		try {
 			await uploadWithBoundedRetries(pending.upload, credentials, {
+				canUpload: () =>
+					isPendingRepositoryEvidenceAutoUploadAllowed(pending, configDir),
 				deadlineAt,
 				endpoint: pending.endpoint,
 			});
@@ -298,11 +337,32 @@ async function retryOnePendingRepositoryEvidence(
 			);
 			await continueAcceptedTranscript(pending, configDir);
 		} catch (error) {
+			if (error instanceof RepositoryAutoUploadDisabledError) continue;
 			failures.push(error);
 			await deferPendingRepositoryEvidence(pending, configDir);
 		}
 	}
 	return failures[0];
+}
+
+class RepositoryAutoUploadDisabledError extends Error {
+	constructor() {
+		super("Automatic retry skipped because repository uploads are OFF.");
+	}
+}
+
+export function isPendingRepositoryEvidenceAutoUploadAllowed(
+	pending: Awaited<ReturnType<typeof readPendingRepositoryEvidence>>[number],
+	configDir: string,
+): boolean {
+	const selection = pending.repositorySelection;
+	if (!selection) return loadAutoUploadConfig(configDir) === null;
+	return isRepositoryAutoUploadAllowed(
+		selection.repoKey,
+		selection.source,
+		selection.legacyKeys,
+		configDir,
+	);
 }
 
 async function markPendingRepositoryCaptureAccepted(
@@ -330,6 +390,7 @@ async function uploadWithBoundedRetries(
 		readonly allowInsecureEndpoint?: boolean;
 		readonly deadlineAt?: number;
 		readonly endpoint?: string;
+		readonly canUpload?: () => boolean;
 	} = {},
 ) {
 	const apiBase = getApiBaseOverride() ?? credentials.apiBaseUrl;
@@ -342,6 +403,8 @@ async function uploadWithBoundedRetries(
 	};
 	let lastError: unknown;
 	for (let attempt = 1; attempt <= 3; attempt++) {
+		if (overrides.canUpload && !overrides.canUpload())
+			throw new RepositoryAutoUploadDisabledError();
 		const remainingMs = overrides.deadlineAt
 			? overrides.deadlineAt - Date.now()
 			: undefined;
@@ -387,88 +450,93 @@ async function materializeEvidenceRequest(
 	requestMaterializedAt:
 		| { readonly completedAt: string; readonly startedAt: string }
 		| undefined,
+	configDir: string,
+	deadlineAt: number,
 ): Promise<{
 	readonly childDiscovery: FileBackedUploadSubagentDiscovery;
 	readonly request: IngestSessionInput;
 	readonly streams: readonly SessionAttributionSourceStream[];
+	readonly sourceId: string;
 }> {
-	if (!isFileBackedEvidenceRequest(request)) {
-		const now = new Date().toISOString();
-		const materializedAt = requestMaterializedAt ?? {
-			completedAt: now,
-			startedAt: now,
-		};
-		return {
-			childDiscovery: {
-				omittedCount: null,
-				reason: "In-memory hook input did not include a child stream directory",
-				status: "unavailable",
-			},
-			request,
-			streams: [
-				{
-					content: request.content,
-					declaredAgentId: null,
-					materializedAt,
-					role: "root",
-				},
-			],
-		};
-	}
-	const [root, subagents] = await Promise.all([
-		readMaterializedStream(request.transcriptPath, null, "root"),
-		Promise.all(
-			request.subagents.map((subagent) =>
-				readMaterializedStream(subagent.path, subagent.agentId, "child"),
-			),
-		),
-	]);
-	return {
-		childDiscovery: request.subagentDiscovery,
-		request: {
-			...request.metadata,
-			content: root.content,
-			subagents:
-				subagents.length > 0
-					? subagents.map((subagent) => ({
-							agentId: subagent.declaredAgentId ?? "",
-							content: subagent.content,
-						}))
-					: undefined,
-		},
-		streams: [root, ...subagents],
-	};
-}
-
-async function readMaterializedStream(
-	path: string,
-	declaredAgentId: string | null,
-	role: "root" | "child",
-): Promise<SessionAttributionSourceStream> {
 	const startedAt = new Date().toISOString();
-	const content = await readFile(path, "utf8");
-	return {
-		content,
-		declaredAgentId,
-		materializedAt: {
-			completedAt: new Date().toISOString(),
-			startedAt,
+	if ((request.subagents?.length ?? 0) >= 256)
+		throw new Error("Transcript capture exceeded its source-count budget.");
+	const staged = await stageFilteredUpload(
+		createFilteredUploadSources(request),
+		{
+			deadlineAt,
+			maxInputBytes: EVIDENCE_TRANSCRIPT_INPUT_MAX_BYTES,
+			includeEmptySubagents: true,
 		},
-		role,
-	};
+	);
+	try {
+		const anomaly = getRedactionBudgetAnomaly(
+			staged.redactedBytes,
+			staged.inputBytes,
+			staged.redactions,
+		);
+		if (anomaly)
+			throw new Error(
+				`Transcript redaction exceeded the safety budget for rules: ${anomaly.ruleIds.join(", ")}`,
+			);
+		if (staged.aggregateBytes > EVIDENCE_TRANSCRIPT_INPUT_MAX_BYTES)
+			throw new Error(
+				"Filtered transcript evidence exceeded its materialization budget.",
+			);
+		const streams: SessionAttributionSourceStream[] = [];
+		for (const object of staged.objects) {
+			assertCaptureBudget(deadlineAt);
+			streams.push({
+				content: await readFile(object.path, {
+					encoding: "utf8",
+					signal: AbortSignal.timeout(Math.max(1, deadlineAt - Date.now())),
+				}),
+				declaredAgentId: object.kind === "main" ? null : object.agentId,
+				materializedAt: requestMaterializedAt ?? {
+					startedAt,
+					completedAt: new Date().toISOString(),
+				},
+				role: object.kind === "main" ? "root" : "child",
+			});
+		}
+		assertCaptureBudget(deadlineAt);
+		const main = staged.objects[0];
+		if (!main) throw new Error("Missing filtered root transcript.");
+		const sourceId = await persistTranscriptSource(
+			{ path: main.path },
+			configDir,
+			deadlineAt,
+		);
+		return {
+			childDiscovery: isFileBackedEvidenceRequest(request)
+				? request.subagentDiscovery
+				: {
+						omittedCount: null,
+						reason:
+							"In-memory hook input did not include a child stream directory",
+						status: "unavailable",
+					},
+			request: {
+				...staged.metadata,
+				content: streams[0]?.content ?? "",
+				subagents:
+					streams.length > 1
+						? streams.slice(1).map((stream) => ({
+								agentId: stream.declaredAgentId ?? "",
+								content: stream.content,
+							}))
+						: undefined,
+			},
+			streams,
+			sourceId,
+		};
+	} finally {
+		await cleanupStagedUpload(staged);
+	}
 }
 
-function applyFilteredContent(
-	streams: readonly SessionAttributionSourceStream[],
-	filtered: ReturnType<typeof filterSessionTextFields>,
-): readonly SessionAttributionSourceStream[] {
-	return streams.map((stream, index) => ({
-		...stream,
-		content:
-			index === 0
-				? filtered.content
-				: (filtered.subagents?.[index - 1]?.content ?? ""),
-	}));
+function assertCaptureBudget(deadlineAt: number): void {
+	if (Date.now() >= deadlineAt) throw deliveryBudgetExceeded();
 }
 
 function getAttributionHookKind(

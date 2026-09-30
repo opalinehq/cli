@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, open, readdir, readlink, realpath } from "node:fs/promises";
+import { lstat, open, opendir, readlink, realpath } from "node:fs/promises";
 import type {
 	BoundedHashResult,
 	BoundedReadResult,
@@ -14,23 +14,59 @@ import type {
 
 const HASH_CHUNK_BYTES = 1024 * 1024;
 
-export function createLocalContextSourceEnv(): LocalContextSourceEnv {
+export function createLocalContextSourceEnv(
+	deadlineAt?: number,
+): LocalContextSourceEnv {
 	return {
-		fileSystem: createNodeFileSystem(),
-		git: createNodeGitRunner(),
+		fileSystem: createNodeFileSystem(deadlineAt),
+		git: {
+			run: async (directory, args, maxBytes, timeoutMs) => {
+				checkDeadline(deadlineAt);
+				const result = await runGitCommand(
+					directory,
+					args,
+					maxBytes,
+					deadlineAt === undefined
+						? timeoutMs
+						: Math.max(1, Math.min(timeoutMs, deadlineAt - Date.now())),
+				);
+				checkDeadline(deadlineAt);
+				return result;
+			},
+		},
 		now: () => new Date(),
 		createCaptureId: randomUUID,
 	};
 }
 
-export function createNodeFileSystem(): LocalContextFileSystem {
+export function createNodeFileSystem(
+	deadlineAt?: number,
+): LocalContextFileSystem {
 	return {
-		realpath,
-		lstat: getFileSystemStat,
-		readDirectory: getDirectoryEntries,
-		readFileBounded,
-		hashFileBounded,
-		readLink: readlink,
+		realpath: withDeadline((path: string) => realpath(path), deadlineAt),
+		lstat: withDeadline(getFileSystemStat, deadlineAt),
+		readDirectory: (path, maxEntries) =>
+			getDirectoryEntries(path, maxEntries, deadlineAt),
+		readFileBounded: withDeadline(readFileBounded, deadlineAt),
+		hashFileBounded: withDeadline(hashFileBounded, deadlineAt),
+		readLink: withDeadline((path: string) => readlink(path), deadlineAt),
+	};
+}
+
+function checkDeadline(deadlineAt: number | undefined): void {
+	if (deadlineAt !== undefined && Date.now() >= deadlineAt)
+		throw new Error("Repository context capture exceeded its time budget.");
+}
+
+function withDeadline<Arguments extends unknown[], Result>(
+	operation: (...args: Arguments) => Promise<Result>,
+	deadlineAt: number | undefined,
+): (...args: Arguments) => Promise<Result> {
+	return async (...args) => {
+		checkDeadline(deadlineAt);
+		const result = await operation(...args);
+		checkDeadline(deadlineAt);
+		return result;
 	};
 }
 
@@ -56,18 +92,35 @@ async function getFileSystemStat(path: string): Promise<FileSystemStat> {
 
 async function getDirectoryEntries(
 	path: string,
-): Promise<readonly FileSystemEntry[]> {
-	const entries = await readdir(path, { withFileTypes: true });
-	return entries.map((entry) => ({
-		name: entry.name,
-		kind: entry.isFile()
-			? "file"
-			: entry.isDirectory()
-				? "directory"
-				: entry.isSymbolicLink()
-					? "symlink"
-					: "other",
-	}));
+	maxEntries: number,
+	deadlineAt: number | undefined,
+): Promise<{
+	readonly entries: FileSystemEntry[];
+	readonly complete: boolean;
+}> {
+	checkDeadline(deadlineAt);
+	const directory = await opendir(path);
+	const entries: FileSystemEntry[] = [];
+	try {
+		while (true) {
+			checkDeadline(deadlineAt);
+			const entry = await directory.read();
+			if (!entry) return { entries, complete: true };
+			if (entries.length >= maxEntries) return { entries, complete: false };
+			entries.push({
+				name: entry.name,
+				kind: entry.isFile()
+					? "file"
+					: entry.isDirectory()
+						? "directory"
+						: entry.isSymbolicLink()
+							? "symlink"
+							: "other",
+			});
+		}
+	} finally {
+		await directory.close();
+	}
 }
 
 async function readFileBounded(

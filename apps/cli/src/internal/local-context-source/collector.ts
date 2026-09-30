@@ -32,7 +32,10 @@ export async function collectLocalContextBundle(
 		throw new Error("The capture ID provider returned an empty value.");
 	}
 	const requestedRoot = resolve(repositoryRoot);
-	const blobStore = createBlobStore(options.parentCapture);
+	const blobStore = createBlobStore(
+		options.parentCapture,
+		options.limits.maxBlobs,
+	);
 	const git = await collectGitSnapshot(
 		requestedRoot,
 		options.limits,

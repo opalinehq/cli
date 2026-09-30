@@ -22,6 +22,7 @@ export const DEFAULT_LOCAL_CONTEXT_COLLECTION_LIMITS: LocalContextCollectionLimi
 		maxDepthPerRoot: 64,
 		maxEntriesPerRoot: 50_000,
 		maxTotalEntries: 100_000,
+		maxBlobs: 100_000,
 		maxContentBytesPerFile: 2 * 1024 * 1024,
 		maxContentBytesPerRoot: 64 * 1024 * 1024,
 		maxTotalContentBytes: 128 * 1024 * 1024,

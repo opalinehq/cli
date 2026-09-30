@@ -56,6 +56,7 @@ interface PendingDirectory {
 }
 
 interface MutableRootCoverage {
+	enumeratedEntries: number;
 	discoveredEntries: number;
 	fileCount: number;
 	directoryCount: number;
@@ -72,6 +73,7 @@ interface MutableRootCoverage {
 }
 
 interface MutableAggregate {
+	totalEnumeratedEntries: number;
 	totalEntries: number;
 	contentBudgetBytes: number;
 	hashBudgetBytes: number;
@@ -120,6 +122,7 @@ export async function collectFileSystemContext(
 	const excludedPaths: ExcludedPath[] = [];
 	const errors: CoverageError[] = [];
 	const aggregate: MutableAggregate = {
+		totalEnumeratedEntries: 0,
 		totalEntries: 0,
 		contentBudgetBytes: 0,
 		hashBudgetBytes: 0,
@@ -318,9 +321,33 @@ async function discoverRootEntries(
 			coverage.excludedPaths += 1;
 			continue;
 		}
-		let children: readonly FileSystemEntry[];
+		const remainingEntries = Math.min(
+			options.limits.maxEntriesPerRoot - coverage.enumeratedEntries,
+			options.limits.maxTotalEntries - aggregate.totalEnumeratedEntries,
+		);
+		const entryLimit =
+			coverage.enumeratedEntries >= options.limits.maxEntriesPerRoot
+				? "maxEntriesPerRoot"
+				: "maxTotalEntries";
+		if (remainingEntries <= 0) {
+			coverage.limitsReached.add(entryLimit);
+			return discovered;
+		}
+		let children: FileSystemEntry[];
+		let complete: boolean;
 		try {
-			children = await fileSystem.readDirectory(directory.absolutePath);
+			({ entries: children, complete } = await fileSystem.readDirectory(
+				directory.absolutePath,
+				remainingEntries,
+			));
+			coverage.enumeratedEntries += children.length;
+			aggregate.totalEnumeratedEntries += children.length;
+			if (!complete)
+				coverage.limitsReached.add(
+					coverage.enumeratedEntries >= options.limits.maxEntriesPerRoot
+						? "maxEntriesPerRoot"
+						: "maxTotalEntries",
+				);
 		} catch (error) {
 			pushFileSystemError(
 				errors,
@@ -332,7 +359,7 @@ async function discoverRootEntries(
 			);
 			continue;
 		}
-		for (const child of [...children].sort((left, right) =>
+		for (const child of children.sort((left, right) =>
 			compareStrings(left.name, right.name),
 		)) {
 			if (
@@ -772,6 +799,8 @@ async function buildRegularFileEntry(
 			blobStore,
 		);
 		if (sanitized.status === "failure") {
+			if (sanitized.reason === "blob-count-cap")
+				coverage.limitsReached.add("maxBlobs");
 			coverage.omittedContentFiles += 1;
 			aggregate.omittedBytes += entry.stat.size;
 			return {
@@ -1017,6 +1046,7 @@ function createMutableRootCoverage(): MutableRootCoverage {
 		omittedContentFiles: 0,
 		excludedPaths: 0,
 		limitsReached: new Set(),
+		enumeratedEntries: 0,
 	};
 }
 
