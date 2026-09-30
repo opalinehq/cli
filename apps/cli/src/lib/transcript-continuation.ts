@@ -24,11 +24,10 @@ export async function persistTranscriptSource(
 ): Promise<string> {
 	const directory = join(configDir, "repository-evidence-sources");
 	await mkdir(directory, { recursive: true, mode: 0o700 });
-	await removeOrphanedTranscriptSources(directory, configDir);
-	const names = await readdir(directory);
+	const sources = await removeOrphanedTranscriptSources(directory, configDir);
 	let used = 0;
-	for (const name of names) used += (await stat(join(directory, name))).size;
-	if (names.length >= 200)
+	for (const source of sources) used += source.size;
+	if (sources.length >= 200)
 		throw new Error("Transcript continuation source quota exceeded");
 	const sourceId = randomUUID();
 	const path = transcriptSourcePath(configDir, sourceId);
@@ -55,25 +54,24 @@ export async function persistTranscriptSource(
 async function removeOrphanedTranscriptSources(
 	directory: string,
 	configDir: string,
-): Promise<void> {
+): Promise<readonly { readonly name: string; readonly size: number }[]> {
 	const cutoff = Date.now() - ORPHANED_SOURCE_MIN_AGE_MS;
-	const candidates: { readonly name: string; readonly sourceId: string }[] = [];
+	const sources = [];
 	for (const name of await readdir(directory)) {
-		const sourceId = SOURCE_FILE_NAME.exec(name)?.[1];
-		if (!sourceId) continue;
-		try {
-			if ((await stat(join(directory, name))).mtimeMs < cutoff)
-				candidates.push({ name, sourceId });
-		} catch (error) {
-			if (!isErrorCode(error, "ENOENT")) throw error;
-		}
+		const { mtimeMs, size } = await stat(join(directory, name));
+		sources.push({ aged: mtimeMs < cutoff, name, size });
 	}
-	if (candidates.length === 0) return;
+	if (!sources.some((source) => source.aged)) return sources;
 	const referenced = await readPendingTranscriptSourceIds(configDir);
-	if (!referenced) return;
-	for (const { name, sourceId } of candidates)
-		if (!referenced.has(sourceId))
-			await rm(join(directory, name), { force: true });
+	if (!referenced) return sources;
+	const kept = [];
+	for (const source of sources) {
+		const sourceId = SOURCE_FILE_NAME.exec(source.name)?.[1];
+		if (source.aged && sourceId && !referenced.has(sourceId))
+			await rm(join(directory, source.name), { force: true });
+		else kept.push(source);
+	}
+	return kept;
 }
 
 async function* readTranscriptSource(
@@ -161,12 +159,4 @@ export function transcriptSourcePath(
 	if (!/^[0-9a-f-]{36}$/.test(sourceId))
 		throw new Error("Invalid transcript source ID");
 	return join(configDir, "repository-evidence-sources", `${sourceId}.jsonl`);
-}
-
-function isErrorCode(error: unknown, code: string): boolean {
-	return (
-		error instanceof Error &&
-		"code" in error &&
-		(error as { readonly code?: unknown }).code === code
-	);
 }
