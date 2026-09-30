@@ -31,7 +31,6 @@ import {
 } from "./repository-discovery.js";
 import {
 	deferPendingRepositoryEvidence,
-	normalizeRepositoryEvidenceEndpoint,
 	readPendingRepositoryEvidence,
 	writePendingRepositoryEvidence,
 } from "./repository-evidence-pending.js";
@@ -55,6 +54,7 @@ import {
 import { planTranscriptRevisionFile } from "./transcript-revision.js";
 import {
 	advanceTranscriptRevision,
+	normalizeRepositoryEvidenceEndpoint,
 	readTranscriptRevision,
 	type TranscriptRevisionDeliveryScope,
 } from "./transcript-revision-store.js";

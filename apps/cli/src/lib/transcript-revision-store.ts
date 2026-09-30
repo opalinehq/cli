@@ -15,7 +15,10 @@ import type {
 	TranscriptRevisionManifest,
 	TranscriptRevisionScope,
 } from "./transcript-revision.js";
-import { hasValidTranscriptRevisionIntegrity } from "./transcript-revision.js";
+import {
+	hasValidTranscriptRevisionIntegrity,
+	isTranscriptRevisionManifest,
+} from "./transcript-revision.js";
 
 const STORE_VERSION = 2;
 const LOCK_POLL_MS = 25;
@@ -139,7 +142,7 @@ export function getTranscriptRevisionPathKey(
 	return createHash("sha256")
 		.update(
 			JSON.stringify({
-				endpoint: normalizeEndpoint(deliveryScope.endpoint),
+				endpoint: normalizeRepositoryEvidenceEndpoint(deliveryScope.endpoint),
 				organizationId: deliveryScope.organizationId,
 				transcriptScope: deliveryScope.transcriptScope,
 			}),
@@ -308,7 +311,7 @@ function isNewerRevision(
 	);
 }
 
-function normalizeEndpoint(endpoint: string): string {
+export function normalizeRepositoryEvidenceEndpoint(endpoint: string): string {
 	const url = new URL(endpoint);
 	url.hash = "";
 	url.search = "";
@@ -316,49 +319,6 @@ function normalizeEndpoint(endpoint: string): string {
 	if (url.pathname.length > 1)
 		url.pathname = url.pathname.replace(/\/+$/gu, "");
 	return url.toString();
-}
-
-function isTranscriptRevisionManifest(
-	value: unknown,
-): value is TranscriptRevisionManifest {
-	if (typeof value !== "object" || value === null) return false;
-	const record = value as Record<string, unknown>;
-	if (
-		record.version !== 1 ||
-		typeof record.revisionId !== "string" ||
-		typeof record.generation !== "number" ||
-		typeof record.terminal !== "boolean" ||
-		!Array.isArray(record.chunks) ||
-		typeof record.scope !== "object" ||
-		record.scope === null ||
-		typeof record.watermark !== "object" ||
-		record.watermark === null
-	) {
-		return false;
-	}
-	const scope = record.scope as Record<string, unknown>;
-	const watermark = record.watermark as Record<string, unknown>;
-	return (
-		typeof scope.actorId === "string" &&
-		(scope.provider === "claude_code" || scope.provider === "codex") &&
-		typeof scope.providerInstanceId === "string" &&
-		typeof scope.sessionId === "string" &&
-		typeof watermark.byteOffset === "number" &&
-		typeof watermark.prefixSha256 === "string" &&
-		typeof watermark.recordCount === "number" &&
-		record.chunks.every(isChunkReference)
-	);
-}
-
-function isChunkReference(value: unknown): boolean {
-	if (typeof value !== "object" || value === null) return false;
-	const record = value as Record<string, unknown>;
-	return (
-		typeof record.startByte === "number" &&
-		typeof record.endByte === "number" &&
-		typeof record.recordCount === "number" &&
-		typeof record.sha256 === "string"
-	);
 }
 
 function sameScope(

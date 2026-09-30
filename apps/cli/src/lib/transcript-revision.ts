@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { open } from "node:fs/promises";
+import { z } from "zod";
 import {
 	REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES,
 	REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES,
@@ -39,6 +40,45 @@ export interface TranscriptRevisionManifest {
 	readonly terminal: boolean;
 	readonly version: 1;
 	readonly watermark: TranscriptWatermark;
+}
+
+const TranscriptRevisionManifestSchema = z.object({
+	chunks: z.array(
+		z.object({
+			endByte: z.number(),
+			recordCount: z.number(),
+			sha256: z.string(),
+			startByte: z.number(),
+		}),
+	),
+	generation: z.number(),
+	parentRevisionId: z.string().optional(),
+	revisionId: z.string(),
+	scope: z.object({
+		actorId: z.string(),
+		provider: z.enum(["claude_code", "codex"]),
+		providerInstanceId: z.string(),
+		sessionId: z.string(),
+	}),
+	terminal: z.boolean(),
+	version: z.literal(1),
+	watermark: z.object({
+		byteOffset: z.number(),
+		lastOrdinal: z.number().optional(),
+		prefixSha256: z.string(),
+		recordCount: z.number(),
+	}),
+});
+
+/**
+ * Checks the shape only. The caller must also check
+ * `hasValidTranscriptRevisionIntegrity`, which hashes the original value
+ * because the schema output does not keep the stored key order.
+ */
+export function isTranscriptRevisionManifest(
+	value: unknown,
+): value is TranscriptRevisionManifest {
+	return TranscriptRevisionManifestSchema.safeParse(value).success;
 }
 
 export interface PlannedTranscriptChunk extends TranscriptChunkReference {
