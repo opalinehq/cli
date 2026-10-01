@@ -9,10 +9,22 @@ export function filterContextMetadata<Value>(value: Value): Value {
 		if (typeof current === "string") {
 			const cached = filteredStrings.get(current);
 			if (cached !== undefined) return cached;
-			const filtered = filterKnownSecrets(current, redactSecret)
-				.text.split(/([/\\])/u)
-				.map((segment) => filterKnownSecrets(segment, redactSecret).text)
-				.join("");
+			// Text rules need token boundaries, which names and paths lack
+			// (`<token>.md`, `.claude/skills/<token>.guide/`, `host:<token>.git`).
+			// Filter the whole string, then each path segment (keeps dotted
+			// secrets such as JWTs whole), then each piece of a segment.
+			const filterPieces = (text: string, separators: RegExp): string =>
+				text
+					.split(separators)
+					.map((piece) => filterKnownSecrets(piece, redactSecret).text)
+					.join("");
+			const filtered = filterPieces(
+				filterPieces(
+					filterKnownSecrets(current, redactSecret).text,
+					/([/\\])/u,
+				),
+				/([.:@\s])/u,
+			);
 			filteredStrings.set(current, filtered);
 			return filtered;
 		}

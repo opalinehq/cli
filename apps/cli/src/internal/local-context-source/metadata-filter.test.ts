@@ -97,3 +97,21 @@ test("preserves whole-string secret filtering when a secret contains path separa
 		`[REDACTED:private-key:${createHash("sha256").update(key).digest("hex").slice(0, 12)}]`,
 	);
 });
+
+test("filters tokens followed by a suffix in names, paths and remote hints", () => {
+	const token = `npm_${"b".repeat(36)}`;
+	const marker = `[REDACTED:npm-access-token:${createHash("sha256").update(token).digest("hex").slice(0, 12)}]`;
+	const filtered = filterContextMetadata({
+		document: `docs/${token}.md`,
+		skill: `.claude/skills/${token}.guide/SKILL.md`,
+		remoteHint: `git@github.com:fixture/${token}.guide.git`,
+		windowsPath: `C:\\repo\\${token}.md`,
+	});
+	expect(JSON.stringify(filtered)).not.toContain(token);
+	expect(filtered.document).toBe(`docs/${marker}.md`);
+	expect(filtered.skill).toBe(`.claude/skills/${marker}.guide/SKILL.md`);
+	expect(filtered.remoteHint).toBe(
+		`git@github.com:fixture/${marker}.guide.git`,
+	);
+	expect(filterContextMetadata(filtered)).toEqual(filtered);
+});
