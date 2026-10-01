@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.10.0...opaline-cli@0.11.0) (2026-10-01)
+
+
+### Features
+
+* add automatic repository sidecar capture ([#494](https://github.com/opalinehq/cli/issues/494)) ([7aeb5b2](https://github.com/opalinehq/cli/commit/7aeb5b22136538e24dc04fa3094b0d8c6288e377))
+
 ## [0.10.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.9.0...opaline-cli@0.10.0) (2026-09-18)
 
 
