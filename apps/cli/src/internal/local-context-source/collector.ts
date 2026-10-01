@@ -11,6 +11,7 @@ import {
 import { buildContextIndex } from "./context-index.js";
 import { collectFileSystemContext } from "./filesystem-collector.js";
 import { checkGitConsistency, collectGitSnapshot } from "./git-collector.js";
+import { filterContextMetadata } from "./metadata-filter.js";
 import { validateLocalContextCollectionOptions } from "./options.js";
 import {
 	type AggregateCoverage,
@@ -153,13 +154,14 @@ export async function collectLocalContextBundle(
 			rawContentIncluded: false,
 		},
 	};
+	const filteredManifest = filterContextMetadata(manifest);
 	return options.capturePolicy === "session-evidence"
 		? boundSessionManifest(
-				manifest,
+				filteredManifest,
 				blobs,
-				new Set(options.observedSkillNames ?? []),
+				new Set(filterContextMetadata(options.observedSkillNames ?? [])),
 			)
-		: { manifest, blobs };
+		: { manifest: filteredManifest, blobs };
 }
 
 function boundSessionManifest(

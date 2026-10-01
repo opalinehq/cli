@@ -204,7 +204,10 @@ function getEntryAccess(entry: ContextEntry): ContextIndexResourceAccess {
 			return { status: "reference-only", reason: "git-object" };
 		case "omitted":
 			if (entry.content.reason === "metadata-only") {
-				return { status: "reference-only", reason: "metadata-only" };
+				return { status: "truncated", reason: "file-content-cap" };
+			}
+			if (entry.content.reason === "blob-count-cap") {
+				return { status: "truncated", reason: "total-content-cap" };
 			}
 			if (entry.content.reason === "read-error") {
 				return { status: "denied", reason: "read-error" };

@@ -14,6 +14,8 @@ import {
 import { buildRepositoryEvidenceUpload } from "../../lib/repository-evidence-upload.js";
 import { planTranscriptRevision } from "../../lib/transcript-revision.js";
 import { extractObservedSkills } from "../../lib/transcript-skills.js";
+import { filterKnownSecrets } from "../secret-filter/index.js";
+import { buildRepositoryEvidenceIndexRow } from "./__fixtures__/athena-evidence-index.js";
 import { addSanitizedTextBlob, createBlobStore } from "./blob-store.js";
 import { collectLocalContextBundle } from "./collector.js";
 import { createLocalContextSourceEnv } from "./node-env.js";
@@ -172,6 +174,14 @@ test("bounds a clean canary-shaped capture without uploading skill resources or 
 	});
 	const wireManifest = upload.objects.get(upload.input.manifestObjectId);
 	if (!wireManifest) throw new Error("Missing manifest object");
+	expect(() =>
+		buildRepositoryEvidenceIndexRow(
+			upload.input,
+			JSON.parse(new TextDecoder().decode(wireManifest.bytes)),
+			new Date("2026-10-01T00:00:00Z"),
+			"fixture-user",
+		),
+	).not.toThrow();
 	const binding = await createRepositorySpoolBinding({
 		accountId: "fixture-user",
 		apiBaseUrl: "https://example.invalid",
@@ -266,6 +276,271 @@ async function createSmallFixture(files: Readonly<Record<string, string>>) {
 	}
 	return directory;
 }
+
+async function buildTestUpload(bundle: LocalContextBundle) {
+	const content = '{"type":"event_msg","payload":{"type":"task_complete"}}\n';
+	const transcriptRevision = await planTranscriptRevision({
+		content: new TextEncoder().encode(content),
+		previous: undefined,
+		scope: {
+			actorId: "fixture-user",
+			provider: "codex",
+			providerInstanceId: "fixture-codex",
+			sessionId: "fixture-session",
+		},
+		terminal: true,
+	});
+	return buildRepositoryEvidenceUpload({
+		bundle,
+		captureLifecycle: "end",
+		context: {
+			localIdentity: {
+				installationId: "11111111-1111-4111-8111-111111111111",
+				repositoryId: `local-repository:${"a".repeat(64)}`,
+				worktreeId: `local-worktree:${"b".repeat(64)}`,
+			},
+			remoteHint: null,
+		},
+		firstActionAt: null,
+		firstActionBasis: "unavailable",
+		firstActionRelationship: "unknown",
+		organizationId: "fixture-workspace",
+		session: { content, sessionId: "fixture-session", source: "codex" },
+		terminalTranscript: true,
+		transcriptLastEventAt: null,
+		transcriptRevision,
+	});
+}
+
+test("generated hash-only and blob-limited resources pass the production Athena indexer", async () => {
+	const directory = await createSmallFixture({
+		"AGENTS.md": "Root instructions\n",
+		"nested/CLAUDE.md": "Nested instructions\n",
+		".claude/skills/demo/SKILL.md": "Skill definition\n",
+		"package.json": '{"name":"fixture"}',
+	});
+	for (const args of [
+		["init", "-q"],
+		["add", "."],
+		[
+			"-c",
+			"user.name=Fixture",
+			"-c",
+			"user.email=fixture@example.com",
+			"commit",
+			"-qm",
+			"Indexer fixture",
+		],
+	])
+		execFileSync("git", args, { cwd: directory });
+	const defaults = getDefaultLocalContextCollectionOptions();
+	const bundle = await collectLocalContextBundle(
+		directory,
+		{
+			...defaults,
+			capturePolicy: "session-evidence",
+			limits: { ...defaults.limits, maxBlobs: 1 },
+		},
+		createLocalContextSourceEnv(),
+	);
+	expect(fileEntry(bundle, "repository", "package.json").content).toMatchObject(
+		{
+			status: "omitted",
+			reason: "metadata-only",
+		},
+	);
+	expect(
+		fileEntry(bundle, "repository", "nested/CLAUDE.md").content,
+	).toMatchObject({
+		status: "omitted",
+		reason: "blob-count-cap",
+	});
+	const upload = await buildTestUpload(bundle);
+	const object = upload.objects.get(upload.input.manifestObjectId);
+	if (!object) throw new Error("Missing manifest object");
+	const manifest = JSON.parse(new TextDecoder().decode(object.bytes));
+	const row = buildRepositoryEvidenceIndexRow(
+		upload.input,
+		manifest,
+		new Date("2026-10-01T00:00:00Z"),
+		"fixture-user",
+	);
+	expect(row.coverage_status).toBe("partial");
+	expect(row.available_skills).toEqual(["demo"]);
+	expect(
+		row.context_facets.find((facet) => facet[0] === "package-context")?.[4],
+	).toBe("truncated");
+	expect(manifest.localContext.coverage.truncated.omittedBlobs).toBe(2);
+});
+
+test("reserves top-level instruction content ahead of 300 nested instruction files", async () => {
+	const rootPaths = [
+		"AGENTS.md",
+		"AGENTS.override.md",
+		"CLAUDE.md",
+		"CLAUDE.local.md",
+		".claude/CLAUDE.md",
+		".codex/AGENTS.md",
+		".agents/AGENTS.md",
+		"GEMINI.md",
+		".github/copilot-instructions.md",
+	];
+	const files = Object.fromEntries([
+		...rootPaths.map((path) => [path, `Root instructions for ${path}\n`]),
+		...Array.from({ length: 300 }, (_, index) => [
+			`.claude/nested-${String(index).padStart(3, "0")}/CLAUDE.md`,
+			`Nested instructions ${index}\n`,
+		]),
+	]);
+	const directory = await createSmallFixture(files);
+	const bundle = await collectLocalContextBundle(
+		directory,
+		{
+			...getDefaultLocalContextCollectionOptions(),
+			capturePolicy: "session-evidence",
+		},
+		createLocalContextSourceEnv(),
+	);
+	for (const path of rootPaths) {
+		const entry = fileEntry(bundle, "repository", path);
+		expect(entry.content.status).toBe("available");
+		if (entry.content.status !== "available")
+			throw new Error("Missing instructions");
+		expect(
+			bundle.blobs.find((blob) => blob.id === entry.content.blobId)?.content,
+		).toBe(files[path]);
+	}
+	expect(bundle.blobs).toHaveLength(256);
+	expect(bundle.manifest.coverage.truncated?.omittedBlobs).toBeGreaterThan(0);
+});
+
+test("keeps Claude and Codex agent-definition Markdown but not skill-resource Markdown", async () => {
+	const agentPaths = [
+		".claude/agents/reviewer.md",
+		".codex/agents/reviewer.md",
+		".agents/agents/reviewer.md",
+	];
+	const directory = await createSmallFixture({
+		...Object.fromEntries(
+			agentPaths.map((path) => [path, `Agent configuration ${path}\n`]),
+		),
+		".claude/skills/demo/SKILL.md": "Skill definition\n",
+		".claude/skills/demo/.claude/agents/resource.md":
+			"Excluded skill resource\n",
+		".claude/docs/readme.md": "Ordinary documentation\n",
+	});
+	const bundle = await collectLocalContextBundle(
+		directory,
+		{
+			...getDefaultLocalContextCollectionOptions(),
+			capturePolicy: "session-evidence",
+		},
+		createLocalContextSourceEnv(),
+	);
+	for (const path of agentPaths) {
+		const entry = fileEntry(bundle, "repository", path);
+		expect(entry.content.status).toBe("available");
+		if (entry.content.status !== "available")
+			throw new Error("Missing agent definition");
+		expect(
+			bundle.blobs.find((blob) => blob.id === entry.content.blobId)?.content,
+		).toBe(`Agent configuration ${path}\n`);
+	}
+	for (const path of [
+		".claude/skills/demo/.claude/agents/resource.md",
+		".claude/docs/readme.md",
+	]) {
+		expect(fileEntry(bundle, "repository", path).content).toMatchObject({
+			status: "omitted",
+			reason: "metadata-only",
+		});
+	}
+});
+
+test.each(["delta", "session-evidence"] as const)(
+	"redacts GitHub tokens in exported filenames, directory names and every path reference (%s)",
+	async (capturePolicy) => {
+		const token = `ghp_${"AbCdEf0123456789".repeat(3).slice(0, 36)}`;
+		const redactedToken = filterKnownSecrets(token).text;
+		expect(redactedToken).not.toBe(token);
+		const paths = [
+			`docs/${token}.md`,
+			`${token}/AGENTS.md`,
+			`.claude/skills/${token}/SKILL.md`,
+		];
+		const directory = await createSmallFixture({
+			...Object.fromEntries(
+				paths.map((path, index) => [path, `Fixture content ${index}\n`]),
+			),
+			[`${token}/node_modules/excluded.md`]: "Excluded dependency\n",
+		});
+		execFileSync("git", ["init", "-q"], { cwd: directory });
+		execFileSync("git", ["add", "."], { cwd: directory });
+		const bundle = await collectLocalContextBundle(
+			directory,
+			{
+				...getDefaultLocalContextCollectionOptions(),
+				capturePolicy,
+			},
+			createLocalContextSourceEnv(),
+		);
+		expect(JSON.stringify(bundle)).not.toContain(token);
+		for (const path of paths) {
+			const exportedPath = filterKnownSecrets(path).text;
+			const entry = fileEntry(bundle, "repository", exportedPath);
+			expect(entry.name).toBe(exportedPath.split("/").at(-1) ?? "");
+			expect(bundle.manifest.documents.markdown).toContainEqual({
+				rootId: "repository",
+				path: exportedPath,
+			});
+			if (bundle.manifest.git.status !== "available")
+				throw new Error("Missing Git snapshot");
+			expect(
+				bundle.manifest.git.statusEntries.some(
+					(status) => status.path === exportedPath,
+				),
+			).toBe(true);
+		}
+		const skill = bundle.manifest.contextIndex.skills[0];
+		expect(skill?.name).toBe(redactedToken);
+		expect(skill?.definitions[0]?.path).toBe(
+			`.claude/skills/${redactedToken}/SKILL.md`,
+		);
+		expect(
+			bundle.manifest.contextIndex.facets.flatMap((facet) => facet.resources),
+		).toContainEqual({
+			rootId: "repository",
+			path: `${redactedToken}/AGENTS.md`,
+			access: { status: "readable" },
+		});
+		expect(
+			bundle.manifest.coverage.excludedPaths.some(
+				(entry) => entry.path === `${redactedToken}/node_modules`,
+			),
+		).toBe(true);
+		const upload = await buildTestUpload(bundle);
+		const object = upload.objects.get(upload.input.manifestObjectId);
+		if (!object) throw new Error("Missing manifest object");
+		const wireManifest = new TextDecoder().decode(object.bytes);
+		expect(wireManifest).not.toContain(token);
+		const indexed = buildRepositoryEvidenceIndexRow(
+			upload.input,
+			JSON.parse(wireManifest),
+			new Date("2026-10-01T00:00:00Z"),
+			"fixture-user",
+		);
+		expect(indexed.available_skills).toEqual([redactedToken]);
+		const legacyUpload = await buildTestUpload({
+			...bundle,
+			manifest: JSON.parse(
+				JSON.stringify(bundle.manifest).replaceAll(redactedToken, token),
+			),
+		});
+		expect(legacyUpload.input.manifestObjectId).toBe(
+			upload.input.manifestObjectId,
+		);
+	},
+);
 
 function fileEntry(
 	bundle: LocalContextBundle,

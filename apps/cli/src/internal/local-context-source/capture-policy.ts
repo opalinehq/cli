@@ -18,10 +18,20 @@ export function getSessionContentPriority(
 	if (categories.includes("skill-resource")) return 4;
 	if (
 		rootId === "repository" &&
-		/^(?:agents|claude)(?:\.[^.]+)?\.md$/iu.test(basename(path))
+		(categories.includes("instruction") ||
+			/^(?:agents|claude)(?:\.[^.]+)?\.md$/iu.test(basename(path)))
 	) {
-		return 0;
+		return /^(?:[^/]+|\.(?:claude|codex|agents|cursor|github)\/[^/]+)$/iu.test(
+			path,
+		)
+			? -1
+			: 0;
 	}
+	if (
+		categories.includes("agent-config") &&
+		/(?:^|\/)\.(?:claude|codex|agents|cursor)\/agents\/[^/]+\.md$/iu.test(path)
+	)
+		return 3;
 	if (categories.includes("markdown")) return 4;
 	if (
 		(categories.includes("agent-config") ||

@@ -360,17 +360,12 @@ export type ContextIndexResourceAccess =
 				| "total-content-cap";
 	  }
 	| {
-			readonly status: "reference-only";
-			readonly reason: "metadata-only";
-	  }
-	| {
 			readonly status: "unavailable";
 			readonly reason:
 				| "binary"
 				| "high-risk-path"
 				| "secret-filter-failure"
 				| "secret-filter-budget"
-				| "blob-count-cap"
 				| "not-file";
 	  };
 

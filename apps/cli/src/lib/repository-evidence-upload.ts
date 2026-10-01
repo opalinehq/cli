@@ -22,6 +22,7 @@ import {
 	type GitRepositorySnapshot,
 	type LocalContextBundle,
 } from "../internal/local-context-source/index.js";
+import { filterContextMetadata } from "../internal/local-context-source/metadata-filter.js";
 import { FILTER_VERSION } from "../internal/secret-filter/index.js";
 import type { RepositoryContext } from "./repo-context.js";
 import {
@@ -101,7 +102,9 @@ export function buildRepositoryEvidenceUpload(
 	},
 	limits: RepositoryEvidenceDeliveryLimits = {},
 ): BuiltRepositoryEvidenceUpload {
-	const observedSkills = extractObservedSkills(input.session);
+	const observedSkills = filterContextMetadata(
+		extractObservedSkills(input.session),
+	);
 	const skillAssessments = assessContextSkillUse(
 		input.bundle.manifest.contextIndex.skills,
 		input.captureLifecycle === "start"
@@ -112,7 +115,7 @@ export function buildRepositoryEvidenceUpload(
 					scope: { kind: "session", id: input.session.sessionId },
 				},
 	);
-	const manifestValue = {
+	const manifestValue = filterContextMetadata({
 		attribution: input.attribution,
 		contextIndex: {
 			facets: input.bundle.manifest.contextIndex.facets,
@@ -121,7 +124,7 @@ export function buildRepositoryEvidenceUpload(
 		localContext: input.bundle.manifest,
 		protocol: REPOSITORY_EVIDENCE_PROTOCOL,
 		transcriptRevision: input.transcriptRevision.manifest,
-	};
+	});
 	const manifestBytes = new TextEncoder().encode(JSON.stringify(manifestValue));
 	const manifest = buildObject(
 		manifestBytes,
