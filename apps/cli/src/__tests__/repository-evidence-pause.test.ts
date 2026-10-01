@@ -361,6 +361,36 @@ test.each(["init", "commit"])(
 	},
 );
 
+test("a disabled capture does not hold the hook for the full spool lock timeout", async () => {
+	const fixture = await createCliFixture("claude_code");
+	const config = join(fixture.home, ".rudel");
+	const lock = join(config, "repo-context-spool", "v2", ".write-lock");
+	const stub = startEvidenceStub(
+		"EVIDENCE_CAPTURE_DISABLED",
+		"init",
+		async () => {
+			await mkdir(lock);
+			await writeFile(join(lock, "owner"), `${process.pid}:test`);
+		},
+	);
+	try {
+		await prepareEvidenceFixture(fixture, stub.loopbackBase);
+		const startedAt = Date.now();
+		expect((await runHook(fixture)).exitCode).toBe(0);
+		expect(Date.now() - startedAt).toBeLessThan(10_000);
+		expect(readRepositoryEvidencePauseUntil(config)).toBeDefined();
+		expect(
+			await readdir(join(config, "repository-evidence-pending", "v4")),
+		).toEqual([]);
+		expect(
+			await readFile(join(config, "logs", "hook-upload.log"), "utf8"),
+		).toContain("Could not discard disabled repository evidence capture");
+	} finally {
+		stub.server.stop(true);
+		await rm(fixture.home, { recursive: true, force: true });
+	}
+}, 30_000);
+
 test("a disabled pending retry still discards its evidence when the config directory becomes unwritable", async () => {
 	const fixture = await createCliFixture("claude_code");
 	const config = join(fixture.home, ".rudel");
