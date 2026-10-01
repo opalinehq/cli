@@ -10,6 +10,7 @@ import {
 	REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES,
 	REPOSITORY_EVIDENCE_PROTOCOL,
 	type RepositoryEvidenceCapture,
+	type RepositoryEvidenceCommitInput,
 	type RepositoryEvidenceCommitOutput,
 	type RepositoryEvidenceCoverageArea,
 	type RepositoryEvidenceInitInput,
@@ -357,50 +358,74 @@ export async function uploadRepositoryEvidence(
 	});
 	const client: ContractRouterClient<typeof contract> = createORPCClient(link);
 	const initialized = await client.repositoryEvidence.init(upload.input);
-	const completed = [];
-	for (const remoteObject of initialized.missingObjects) {
-		const local = upload.objects.get(remoteObject.objectId);
-		if (!local) {
-			throw new Error(
-				`Server requested evidence object ${remoteObject.objectId}, but its bytes are not in the local capture.`,
-			);
-		}
-		const parts = [];
-		let offset = 0;
-		for (const part of remoteObject.parts) {
-			const bytes = local.bytes.slice(offset, offset + part.byteLength);
-			if (bytes.byteLength !== part.byteLength) {
+	const completed: RepositoryEvidenceCommitInput["objects"] =
+		initialized.missingObjects.map((object) => ({
+			objectId: object.objectId,
+			objectKey: object.objectKey,
+			parts: [],
+			uploadId: object.uploadId,
+		}));
+	function* uploadParts() {
+		for (const [
+			objectIndex,
+			remoteObject,
+		] of initialized.missingObjects.entries()) {
+			const local = upload.objects.get(remoteObject.objectId);
+			if (!local) {
 				throw new Error(
-					`Evidence object ${remoteObject.objectId} is shorter than its upload plan.`,
+					`Server requested evidence object ${remoteObject.objectId}, but its bytes are not in the local capture.`,
 				);
 			}
-			const response = await boundedFetch(part.uploadUrl, {
-				body: bytes,
-				headers: part.headers,
-				method: "PUT",
-			});
-			if (!response.ok) {
-				throw new RepositoryEvidenceHttpError(response.status);
+			let offset = 0;
+			for (const [partIndex, part] of remoteObject.parts.entries()) {
+				if (offset + part.byteLength > local.bytes.byteLength) {
+					throw new Error(
+						`Evidence object ${remoteObject.objectId} is shorter than its upload plan.`,
+					);
+				}
+				yield { local, offset, part, partIndex, objectIndex };
+				offset += part.byteLength;
 			}
-			const etag = response.headers.get("etag");
-			if (!etag) {
-				throw new Error("Evidence object upload did not return an ETag.");
+			if (offset !== local.bytes.byteLength) {
+				throw new Error(
+					`Evidence object ${remoteObject.objectId} is longer than its upload plan.`,
+				);
 			}
-			parts.push({ etag, partNumber: part.partNumber });
-			offset += part.byteLength;
 		}
-		if (offset !== local.bytes.byteLength) {
-			throw new Error(
-				`Evidence object ${remoteObject.objectId} is longer than its upload plan.`,
-			);
-		}
-		completed.push({
-			objectId: remoteObject.objectId,
-			objectKey: remoteObject.objectKey,
-			parts,
-			uploadId: remoteObject.uploadId,
-		});
 	}
+	const queuedParts = uploadParts();
+	let failed = false;
+	const workers = Array.from({ length: 6 }, async () => {
+		try {
+			while (!failed) {
+				operationTimeout?.throwIfAborted();
+				const next = queuedParts.next();
+				if (next.done) return;
+				const { local, offset, part, partIndex, objectIndex } = next.value;
+				const response = await boundedFetch(part.uploadUrl, {
+					body: local.bytes.slice(offset, offset + part.byteLength),
+					headers: part.headers,
+					method: "PUT",
+				});
+				if (!response.ok) {
+					throw new RepositoryEvidenceHttpError(response.status);
+				}
+				const etag = response.headers.get("etag");
+				if (!etag) {
+					throw new Error("Evidence object upload did not return an ETag.");
+				}
+				const object = completed[objectIndex];
+				if (object)
+					object.parts[partIndex] = { etag, partNumber: part.partNumber };
+			}
+		} catch (error) {
+			failed = true;
+			throw error;
+		}
+	});
+	const results = await Promise.allSettled(workers);
+	const failure = results.find((result) => result.status === "rejected");
+	if (failure?.status === "rejected") throw failure.reason;
 	return client.repositoryEvidence.commit({
 		objects: completed,
 		organizationId: upload.input.organizationId,

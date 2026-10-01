@@ -7,7 +7,6 @@ import {
 	rename,
 	rm,
 	stat,
-	utimes,
 	writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
@@ -27,6 +26,7 @@ import { hasValidTranscriptRevisionIntegrity } from "./transcript-revision.js";
 
 const PENDING_VERSION = 4;
 const UNSCOPED_PENDING_VERSION = 3;
+const RETRY_BACKOFF_MINUTES = [5, 15, 60, 240] as const;
 
 export interface PendingRepositoryEvidenceQuota {
 	readonly maxFiles: number;
@@ -37,6 +37,8 @@ export const DEFAULT_PENDING_REPOSITORY_EVIDENCE_QUOTA: PendingRepositoryEvidenc
 	{ maxFiles: 200, maxTotalBytes: 512 * 1024 * 1024 };
 
 export interface PendingRepositoryEvidence {
+	readonly next_attempt_at?: number;
+	readonly retry_attempts?: number;
 	readonly repositorySelection?: {
 		readonly repoKey: string;
 		readonly legacyKeys: readonly string[];
@@ -76,6 +78,8 @@ export async function writePendingRepositoryEvidence(
 	await assertPendingQuota(directory, path, pending, quota);
 	const temporary = `${path}.${randomUUID()}.tmp`;
 	const value = {
+		next_attempt_at: pending.next_attempt_at,
+		retry_attempts: pending.retry_attempts,
 		repositorySelection: pending.repositorySelection,
 		continuation: pending.continuation,
 		version: PENDING_VERSION,
@@ -141,6 +145,7 @@ export async function readPendingRepositoryEvidence(
 	options: {
 		readonly actorId?: string;
 		readonly endpoint?: string;
+		readonly sessionId?: string;
 		readonly excludeOperationIds?: ReadonlySet<string>;
 		readonly maxItems?: number;
 		readonly isEligible?: (pending: PendingRepositoryEvidence) => boolean;
@@ -184,9 +189,14 @@ export async function readPendingRepositoryEvidence(
 			if (isErrorCode(error, "ENOENT")) continue;
 			throw error;
 		}
-		let value: PendingRepositoryEvidence;
+		let value: PendingRepositoryEvidence | undefined;
 		try {
-			value = parsePending(text, options.actorId, options.endpoint);
+			value = parsePending(
+				text,
+				options.actorId,
+				options.endpoint,
+				options.sessionId,
+			);
 		} catch (error) {
 			if (error instanceof IncompatiblePendingFilterError) {
 				await abandonPendingRepositoryCapture(error.pending, configDir);
@@ -199,6 +209,7 @@ export async function readPendingRepositoryEvidence(
 			options.onError(error);
 			continue;
 		}
+		if (!value) continue;
 		if (options.excludeOperationIds?.has(value.upload.input.operationId))
 			continue;
 		if (options.isEligible && !options.isEligible(value)) continue;
@@ -243,16 +254,25 @@ export async function deferPendingRepositoryEvidence(
 	pending: PendingRepositoryEvidence,
 	configDir: string,
 ): Promise<void> {
-	const now = new Date();
 	try {
-		await utimes(
-			join(pendingDirectory(configDir), pendingFileName(pending)),
-			now,
-			now,
-		);
+		await stat(join(pendingDirectory(configDir), pendingFileName(pending)));
 	} catch (error) {
 		if (!isErrorCode(error, "ENOENT")) throw error;
+		return;
 	}
+	const retryAttempts = Math.min(
+		(pending.retry_attempts ?? 0) + 1,
+		RETRY_BACKOFF_MINUTES.length,
+	);
+	const minutes = RETRY_BACKOFF_MINUTES[retryAttempts - 1] ?? 240;
+	await writePendingRepositoryEvidence(
+		{
+			...pending,
+			retry_attempts: retryAttempts,
+			next_attempt_at: Date.now() + minutes * 60_000,
+		},
+		configDir,
+	);
 }
 
 export async function removePendingRepositoryEvidence(
@@ -289,10 +309,27 @@ function parsePending(
 	text: string,
 	actorId: string | undefined,
 	endpoint: string | undefined,
-): PendingRepositoryEvidence {
+	sessionId: string | undefined,
+): PendingRepositoryEvidence | undefined {
 	const value: unknown = JSON.parse(text);
 	if (typeof value !== "object" || value === null) throw invalidPending();
 	const record = value as Record<string, unknown>;
+	if (sessionId !== undefined) {
+		const input = record.input as
+			| { session?: { sessionId?: unknown } }
+			| undefined;
+		if (input?.session?.sessionId !== sessionId) return undefined;
+	}
+	if (
+		(record.next_attempt_at !== undefined &&
+			(!Number.isSafeInteger(record.next_attempt_at) ||
+				Number(record.next_attempt_at) < 0)) ||
+		(record.retry_attempts !== undefined &&
+			(!Number.isSafeInteger(record.retry_attempts) ||
+				Number(record.retry_attempts) < 0 ||
+				Number(record.retry_attempts) > RETRY_BACKOFF_MINUTES.length))
+	)
+		throw invalidPending();
 	if (
 		record.version !== PENDING_VERSION ||
 		typeof record.endpoint !== "string" ||
@@ -370,6 +407,8 @@ function parsePending(
 	if (objects.size !== input.objects.length) throw invalidPending();
 	assertInitialRevisionClosure(record.transcriptRevision, objects);
 	const pending = {
+		next_attempt_at: record.next_attempt_at as number | undefined,
+		retry_attempts: record.retry_attempts as number | undefined,
 		repositorySelection,
 		continuation,
 		endpoint: normalizeRepositoryEvidenceEndpoint(record.endpoint),

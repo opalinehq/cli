@@ -409,7 +409,10 @@ test("an unknown code defers as before; paused pending captures are unchanged, t
 	try {
 		await prepareEvidenceFixture(fixture, stub.loopbackBase);
 		expect((await runHook(fixture)).exitCode).toBe(0);
-		expect((await runHook(fixture)).exitCode).toBe(0);
+		expect(
+			(await runHook({ ...fixture, sessionId: `${fixture.sessionId}-second` }))
+				.exitCode,
+		).toBe(0);
 		const config = join(fixture.home, ".rudel");
 		const pendingDir = join(config, "repository-evidence-pending", "v4");
 		const pendingNames = await readdir(pendingDir);

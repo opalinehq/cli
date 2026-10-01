@@ -69,6 +69,364 @@ const scope: TranscriptRevisionScope = {
 	sessionId: "session-1",
 };
 
+describe("repository evidence delivery", () => {
+	test.each(["http", "etag", "timeout"])(
+		"stops dequeuing and settles in-flight parts before rejecting a %s failure",
+		async (failure) => {
+			const content = '{"ordinal":0}\n';
+			const plan = await planTranscriptRevision({
+				content: new TextEncoder().encode(content),
+				previous: undefined,
+				scope,
+				terminal: true,
+			});
+			const upload = buildUploadFor(makeBundle(), plan, content);
+			const object = upload.objects.get(upload.input.manifestObjectId);
+			assert(object);
+			let active = 0;
+			let started = 0;
+			let aborted = 0;
+			let commits = 0;
+			const fetchImplementation = (async (input, init) => {
+				const request = new Request(input, init);
+				if (request.method === "PUT") {
+					active++;
+					started++;
+					try {
+						if (started === 1 && failure !== "timeout") {
+							return new Response(null, {
+								status: failure === "http" ? 503 : 200,
+							});
+						}
+						await new Promise<void>((resolve, reject) => {
+							const timer = setTimeout(
+								resolve,
+								failure === "timeout" ? 1000 : 10,
+							);
+							request.signal.addEventListener(
+								"abort",
+								() => {
+									clearTimeout(timer);
+									aborted++;
+									reject(request.signal.reason);
+								},
+								{ once: true },
+							);
+						});
+						return new Response(null, { headers: { etag: "etag" } });
+					} finally {
+						active--;
+					}
+				}
+				if (new URL(request.url).pathname.endsWith("/init")) {
+					return Response.json({
+						json: {
+							expiresAt: "2027-01-01T00:00:00.000Z",
+							missingObjects: [
+								{
+									...object.descriptor,
+									objectKey: "manifest",
+									uploadId: "manifest",
+									parts: Array.from({ length: 12 }, (_, index) => {
+										const byteLength =
+											index === 11 ? object.bytes.byteLength - 11 : 1;
+										return {
+											byteLength,
+											headers: { "Content-Length": String(byteLength) },
+											partNumber: index + 1,
+											uploadUrl: `https://example.com/parts/${index + 1}`,
+										};
+									}),
+								},
+							],
+							partSizeBytes: 8 * 1024 * 1024,
+							protocol: upload.input.protocol,
+							reusedObjectIds: [],
+							uploadReceiptId: "00000000-0000-4000-8000-000000000010",
+						},
+					});
+				}
+				commits++;
+				return Response.json({ json: evidenceAccepted(upload.input) });
+			}) as typeof fetch;
+			await expect(
+				uploadRepositoryEvidence(upload, {
+					allowInsecureEndpoint: false,
+					authType: "api-key",
+					endpoint: "https://example.com/rpc",
+					fetch: fetchImplementation,
+					operationTimeoutMs: 25,
+					token: "test",
+				}),
+			).rejects.toThrow(
+				failure === "http"
+					? "HTTP 503"
+					: failure === "etag"
+						? "ETag"
+						: "timed out",
+			);
+			expect(started).toBe(6);
+			expect(active).toBe(0);
+			expect(commits).toBe(0);
+			if (failure === "timeout") expect(aborted).toBe(6);
+		},
+	);
+
+	test("uploads 72 objects concurrently with at most six parts in flight and ordered commit parts", async () => {
+		const content = Array.from(
+			{ length: 71 },
+			(_, ordinal) => `{"text":"${String(ordinal).padStart(3, "0")}"}\n`,
+		).join("");
+		const plan = await planTranscriptRevision({
+			content: new TextEncoder().encode(content),
+			limits: { maxChunkBytes: 15 },
+			previous: undefined,
+			scope,
+			terminal: true,
+		});
+		const upload = buildUploadFor(makeBundle(), plan, content);
+		expect(upload.objects.size).toBe(72);
+		let active = 0;
+		let peak = 0;
+		let uploaded = 0;
+		let committed = false;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				const pathname = new URL(request.url).pathname;
+				if (request.method === "PUT") {
+					active++;
+					peak = Math.max(peak, active);
+					try {
+						const [, , objectIndex, partNumber] = pathname.split("/");
+						const object = [...upload.objects.values()][Number(objectIndex)];
+						assert(object);
+						const offset = Math.floor(object.bytes.byteLength / 2);
+						const expected =
+							Number(partNumber) === 1
+								? object.bytes.slice(0, offset)
+								: object.bytes.slice(offset);
+						expect(new Uint8Array(await request.arrayBuffer())).toEqual(
+							expected,
+						);
+						await Bun.sleep(Number(partNumber) === 1 ? 12 : 2);
+						uploaded++;
+						return new Response(null, {
+							headers: { etag: `part-${partNumber}` },
+						});
+					} finally {
+						active--;
+					}
+				}
+				if (pathname.endsWith("/init")) {
+					return Response.json({
+						json: {
+							expiresAt: "2027-01-01T00:00:00.000Z",
+							missingObjects: [...upload.objects.values()].map(
+								(object, objectIndex) => ({
+									...object.descriptor,
+									objectKey: `object-${objectIndex}`,
+									uploadId: `upload-${objectIndex}`,
+									parts: [1, 2].map((partNumber) => {
+										const half = Math.floor(object.bytes.byteLength / 2);
+										const byteLength =
+											partNumber === 1 ? half : object.bytes.byteLength - half;
+										return {
+											byteLength,
+											partNumber,
+											headers: { "Content-Length": String(byteLength) },
+											uploadUrl: `${new URL(request.url).origin}/parts/${objectIndex}/${partNumber}`,
+										};
+									}),
+								}),
+							),
+							partSizeBytes: 8 * 1024 * 1024,
+							protocol: upload.input.protocol,
+							reusedObjectIds: [],
+							uploadReceiptId: "00000000-0000-4000-8000-000000000010",
+						},
+					});
+				}
+				const { json } = await request.json();
+				const commit = RepositoryEvidenceCommitInputSchema.parse(json);
+				expect(active).toBe(0);
+				expect(uploaded).toBe(144);
+				expect(commit.objects).toHaveLength(72);
+				for (const object of commit.objects) {
+					expect(object.parts).toEqual([
+						{ etag: "part-1", partNumber: 1 },
+						{ etag: "part-2", partNumber: 2 },
+					]);
+				}
+				committed = true;
+				return Response.json({ json: evidenceAccepted(upload.input) });
+			},
+		});
+		try {
+			await uploadRepositoryEvidence(upload, {
+				allowInsecureEndpoint: true,
+				authType: "api-key",
+				endpoint: `http://127.0.0.1:${server.port}/rpc`,
+				token: "test",
+			});
+			expect(committed).toBe(true);
+			expect(peak).toBe(6);
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	test("persists the backoff across hooks, retries only when due, and leaves transcript delivery unchanged", async () => {
+		const fixture = await createCliFixture("claude_code");
+		const configDir = join(fixture.home, ".rudel");
+		const deliveries: ReturnType<
+			typeof RepositoryEvidenceInitInputSchema.parse
+		>[] = [];
+		let transcripts = 0;
+		let failEvidence = true;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				const pathname = new URL(request.url).pathname;
+				const { json } = await request.json();
+				if (pathname.endsWith("/init")) {
+					const input = RepositoryEvidenceInitInputSchema.parse(json);
+					deliveries.push(input);
+					if (failEvidence) return new Response("unavailable", { status: 400 });
+					return Response.json({
+						json: {
+							expiresAt: "2027-01-01T00:00:00.000Z",
+							missingObjects: [],
+							partSizeBytes: 8 * 1024 * 1024,
+							protocol: input.protocol,
+							reusedObjectIds: input.objects.map((object) => object.objectId),
+							uploadReceiptId: "00000000-0000-4000-8000-000000000010",
+						},
+					});
+				}
+				if (pathname.endsWith("/commit")) {
+					const input = deliveries.at(-1);
+					assert(input);
+					return Response.json({ json: evidenceAccepted(input) });
+				}
+				transcripts++;
+				return Response.json({
+					json: { success: true, sessionId: fixture.sessionId },
+				});
+			},
+		});
+		try {
+			execFileSync("git", ["init", "--quiet", fixture.projectPath]);
+			const repositoryRoot = execFileSync(
+				"git",
+				["-C", fixture.projectPath, "rev-parse", "--show-toplevel"],
+				{ encoding: "utf8" },
+			).trim();
+			await writeFile(
+				join(configDir, "credentials.json"),
+				JSON.stringify({
+					apiBaseUrl: `http://127.0.0.1:${server.port}`,
+					authType: "api-key",
+					token: "test",
+					user: {
+						id: scope.actorId,
+						email: "test@example.invalid",
+						name: "Test",
+					},
+				}),
+			);
+			await writeFile(
+				join(configDir, "projects.json"),
+				JSON.stringify({
+					projects: { [repositoryRoot]: { organizationId: "org" } },
+				}),
+			);
+			const preload = join(fixture.home, "clock.ts");
+			await writeFile(
+				preload,
+				"Date.now = () => Number(process.env.OPALINE_TEST_NOW);\n",
+			);
+			let now = Date.now();
+			const hook = (
+				sessionId = fixture.sessionId,
+				lifecycle = "session-start",
+			) =>
+				runCli(["hooks", "claude", lifecycle], fixture, {
+					preload,
+					stdin: JSON.stringify({
+						cwd: fixture.projectPath,
+						session_id: sessionId,
+						transcript_path: fixture.transcriptPath,
+						hook_event_name: "SessionEnd",
+						reason: "other",
+					}),
+					env: {
+						OPALINE_TEST_NOW: String(now),
+						OPALINE_ALLOW_INSECURE_ENDPOINT: "1",
+						RUDEL_ALLOW_INSECURE_ENDPOINT: "1",
+					},
+				});
+			let operationId: string | undefined;
+			for (const [index, minutes] of [5, 15, 60, 240, 240].entries()) {
+				expect((await hook()).exitCode).toBe(0);
+				const [pending] = await readPendingRepositoryEvidence(configDir);
+				assert(pending);
+				const value = pending;
+				expect(value.next_attempt_at).toBe(now + minutes * 60_000);
+				expect(value.retry_attempts).toBe(Math.min(index + 1, 4));
+				operationId ??= pending.upload.input.operationId;
+				expect(pending.upload.input.operationId).toBe(operationId);
+				const requests = deliveries.length;
+				now = (value.next_attempt_at ?? now) - 1;
+				expect((await hook()).exitCode).toBe(0);
+				expect(deliveries).toHaveLength(requests);
+				now = value.next_attempt_at ?? now;
+			}
+			failEvidence = false;
+			expect((await hook()).exitCode).toBe(0);
+			expect(await readPendingRepositoryEvidence(configDir)).toEqual([]);
+			failEvidence = true;
+			expect((await hook()).exitCode).toBe(0);
+			const [reset] = await readPendingRepositoryEvidence(configDir);
+			expect(reset).toMatchObject({
+				next_attempt_at: now + 5 * 60_000,
+				retry_attempts: 1,
+			});
+			const requests = deliveries.length;
+			expect((await hook(fixture.sessionId, "session-end")).exitCode).toBe(0);
+			expect(transcripts).toBe(1);
+			expect(deliveries).toHaveLength(requests);
+			expect((await hook("new-session")).exitCode).toBe(0);
+			expect(deliveries).toHaveLength(requests + 1);
+			expect(deliveries.at(-1)?.session.sessionId).toBe("new-session");
+			failEvidence = false;
+			expect((await hook("successful-new-session")).exitCode).toBe(0);
+			expect(deliveries).toHaveLength(requests + 2);
+			expect(await readPendingRepositoryEvidence(configDir)).toHaveLength(2);
+		} finally {
+			server.stop(true);
+			await rm(fixture.home, { force: true, recursive: true });
+		}
+	}, 60_000);
+});
+
+function evidenceAccepted(
+	input: ReturnType<typeof RepositoryEvidenceInitInputSchema.parse>,
+) {
+	return {
+		acceptedAt: "2026-10-01T00:00:00.000Z",
+		contextId: input.capture.contextId,
+		manifestObjectId: input.manifestObjectId,
+		protocol: input.protocol,
+		receiptId: "00000000-0000-4000-8000-000000000011",
+		status: "accepted",
+		storedObjectIds: input.objects.map((object) => object.objectId),
+		uploadReceiptId: "00000000-0000-4000-8000-000000000010",
+	};
+}
+
 describe("repository evidence upload building", () => {
 	test("bounds content and reserves manifest and transcript slots for 4096 configs", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "opaline-protocol-count-"));
@@ -644,7 +1002,11 @@ describe("repository evidence upload building", () => {
 			continuation: { sourceId, terminal: true },
 		};
 		await writePendingRepositoryEvidence(initial, configDir);
-		await continueAcceptedTranscript(initial, configDir, 65);
+		await deferPendingRepositoryEvidence(initial, configDir);
+		const [deferred] = await readPendingRepositoryEvidence(configDir);
+		assert(deferred);
+		expect(deferred.retry_attempts).toBe(1);
+		await continueAcceptedTranscript(deferred, configDir, 65);
 		const bytes = [...plan.newChunks.map((chunk) => chunk.bytes)];
 		let deliveries = 1;
 		let terminal = false;
@@ -652,6 +1014,8 @@ describe("repository evidence upload building", () => {
 			const [pending] = await readPendingRepositoryEvidence(configDir);
 			if (!pending) break;
 			expect(pending.repositorySelection).toEqual(initial.repositorySelection);
+			expect(pending.next_attempt_at).toBeUndefined();
+			expect(pending.retry_attempts).toBeUndefined();
 			deliveries++;
 			terminal = pending.transcriptRevision.terminal;
 			bytes.push(

@@ -98,6 +98,31 @@ export async function captureAndUploadSessionEvidence(input: {
 	const configDir = getConfigDir();
 	const apiBase = getApiBaseOverride() ?? input.credentials.apiBaseUrl;
 	const endpoint = normalizeRepositoryEvidenceEndpoint(`${apiBase}/rpc`);
+	const metadata =
+		"kind" in input.request ? input.request.metadata : input.request;
+	const [existingPending] = await readPendingRepositoryEvidence(configDir, {
+		actorId: input.credentials.user.id,
+		endpoint,
+		sessionId: metadata.sessionId,
+		maxItems: 1,
+		isEligible: (pending) =>
+			pending.upload.input.session.source === metadata.source &&
+			pending.upload.input.organizationId === input.organizationId,
+		onWarning: (warning) => input.onWarning?.(warning.message),
+	});
+	if (existingPending) {
+		const error = await retryOnePendingRepositoryEvidence(
+			input.credentials,
+			input.credentials.user.id,
+			endpoint,
+			configDir,
+			deadlineAt,
+			input.onWarning,
+			existingPending.upload.input.operationId,
+		);
+		if (error !== undefined) throw error;
+		return undefined;
+	}
 	const materialized = await materializeEvidenceRequest(
 		input.request,
 		input.requestMaterializedAt,
@@ -220,6 +245,7 @@ export async function captureAndUploadSessionEvidence(input: {
 			configDir,
 		);
 		await continueAcceptedTranscript(currentPending, configDir);
+		currentPending = undefined;
 		let pendingError: unknown;
 		try {
 			pendingError = await retryOnePendingRepositoryEvidence(
@@ -247,6 +273,9 @@ export async function captureAndUploadSessionEvidence(input: {
 				input.onWarning,
 			);
 			return undefined;
+		}
+		if (hasPending && currentPending) {
+			await deferPendingRepositoryEvidence(currentPending, configDir);
 		}
 		throw error;
 	} finally {
@@ -346,6 +375,7 @@ async function retryOnePendingRepositoryEvidence(
 	configDir: string,
 	deadlineAt: number,
 	onWarning: ((message: string) => void) | undefined,
+	operationId?: string,
 ): Promise<unknown | undefined> {
 	if (
 		Date.now() >= deadlineAt ||
@@ -358,6 +388,9 @@ async function retryOnePendingRepositoryEvidence(
 		endpoint,
 		maxItems: 1,
 		isEligible: (pending) =>
+			(operationId === undefined ||
+				pending.upload.input.operationId === operationId) &&
+			(pending.next_attempt_at ?? 0) <= Date.now() &&
 			isPendingRepositoryEvidenceAutoUploadAllowed(pending, configDir),
 		onError: (error) => failures.push(error),
 		onWarning: (warning) => onWarning?.(warning.message),

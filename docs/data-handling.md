@@ -38,6 +38,8 @@ Top-level repository instructions, including `.claude/CLAUDE.md` and equivalent 
 
 Pending evidence created with a different known-secret filter version is quarantined with a warning rather than uploaded. Recollect the session with the current CLI to apply the current filter. Repository-context delivery is separate from the full session upload; an evidence-storage outage does not prevent that session upload.
 
+Evidence object parts upload with at most six parts in flight within the existing delivery budget. Failed or deferred deliveries persist their next retry time in the pending capture, backing off for 5, 15, 60, then at most 240 minutes. Hooks skip captures that are not yet due and reuse pending captures for the same session rather than starting a new delivery. A new session still attempts its first capture immediately. Successful delivery clears the backoff, including for any remaining evidence continuation. Explicit `upload --retry` can retry pending evidence immediately; transcript-upload retries are unchanged.
+
 ## Usage analytics
 
 Usage analytics are separate from session uploads. Official releases include PostHog capture configuration for a limited set of events:
