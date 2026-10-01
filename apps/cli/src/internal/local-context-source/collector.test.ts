@@ -88,10 +88,11 @@ describe("local context collection from a real Git worktree", () => {
 	test("reports object-count omissions without discarding the capture", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "opaline-blob-budget-"));
 		TEST_DIRECTORIES.push(directory);
+		await mkdir(join(directory, ".claude"));
 		await Promise.all(
 			Array.from({ length: 6 }, (_, index) =>
 				writeFile(
-					join(directory, `file-${index}.txt`),
+					join(directory, ".claude", `config-${index}.json`),
 					`distinct content ${index}`,
 				),
 			),
@@ -442,8 +443,19 @@ describe("local context collection from a real Git worktree", () => {
 
 		expect(agents.content.status).toBe("available");
 		expect(skill.content.status).toBe("available");
-		expect(packageContext.content.status).toBe("available");
-		expect(unrelated.content.status).toBe("git-object");
+		expect(packageContext.content).toMatchObject({
+			status: "omitted",
+			reason: "metadata-only",
+		});
+		expect(unrelated.content).toMatchObject({
+			status: "omitted",
+			reason: "metadata-only",
+		});
+		expect(unrelated.hash).toMatchObject({
+			status: "available",
+			algorithm: "sha256",
+			scope: "source",
+		});
 		expect(
 			bundle.manifest.contextIndex.facets.find(
 				(facet) =>
@@ -750,7 +762,7 @@ describe("local context collection from a real Git worktree", () => {
 			}
 			for (const path of safePaths) {
 				expect(getFile(bundle, "repository", path).content.status).toBe(
-					"available",
+					capturePolicy === "delta" ? "available" : "omitted",
 				);
 			}
 		},

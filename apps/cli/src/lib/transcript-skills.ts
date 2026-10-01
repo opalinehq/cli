@@ -1,3 +1,17 @@
+export function extractObservedSkills(session: {
+	readonly content: string;
+	readonly subagents?: readonly { readonly content: string }[];
+}): readonly string[] {
+	return [
+		...new Set(
+			[
+				session.content,
+				...(session.subagents ?? []).map((agent) => agent.content),
+			].flatMap(extractTranscriptSkills),
+		),
+	].sort();
+}
+
 export function extractTranscriptSkills(content: string): readonly string[] {
 	let codex = false;
 	for (const type of recordTypes(content)) {

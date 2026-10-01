@@ -32,7 +32,7 @@ import type {
 	TranscriptDeliveryState,
 	TranscriptRevisionPlan,
 } from "./transcript-revision.js";
-import { extractTranscriptSkills } from "./transcript-skills.js";
+import { extractObservedSkills } from "./transcript-skills.js";
 import { describeUploadEndpointRejection } from "./upload-endpoint.js";
 
 export interface RepositoryEvidenceBytes {
@@ -132,12 +132,17 @@ export function buildRepositoryEvidenceUpload(
 	const objects = new Map<string, RepositoryEvidenceBytes>([
 		[manifest.descriptor.objectId, manifest],
 	]);
+	const diffBlobIds = new Set(
+		input.bundle.manifest.git.status === "available"
+			? input.bundle.manifest.git.diffs.map((diff) => diff.blobId)
+			: [],
+	);
 	for (const blob of input.bundle.blobs) {
 		const bytes = new TextEncoder().encode(blob.content);
 		if (bytes.byteLength === 0) continue;
 		const object = buildObject(
 			bytes,
-			"source-blob",
+			diffBlobIds.has(blob.id) ? "git-diff" : "source-blob",
 			"text/plain; charset=utf-8",
 			input.bundle.manifest.transport.secretFilterVersion,
 		);
@@ -451,19 +456,6 @@ function buildObject(
 			sha256,
 		},
 	};
-}
-
-function extractObservedSkills(
-	session: Pick<IngestSessionInput, "content" | "subagents">,
-): readonly string[] {
-	return [
-		...new Set(
-			[
-				session.content,
-				...(session.subagents ?? []).map((agent) => agent.content),
-			].flatMap(extractTranscriptSkills),
-		),
-	].sort();
 }
 
 type CoverageItem = RepositoryEvidenceInitInput["coverage"][number];

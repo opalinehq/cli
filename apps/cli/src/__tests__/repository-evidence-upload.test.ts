@@ -70,13 +70,14 @@ const scope: TranscriptRevisionScope = {
 };
 
 describe("repository evidence upload building", () => {
-	test("reserves manifest and transcript slots for a repository with 4096 distinct blobs", async () => {
+	test("bounds content and reserves manifest and transcript slots for 4096 configs", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "opaline-protocol-count-"));
 		try {
+			await mkdir(join(directory, ".claude"));
 			await Promise.all(
 				Array.from({ length: REPOSITORY_EVIDENCE_MAX_OBJECTS }, (_, index) =>
 					writeFile(
-						join(directory, `file-${index}.txt`),
+						join(directory, ".claude", `config-${index}.json`),
 						`distinct content ${index}`,
 					),
 				),
@@ -105,7 +106,10 @@ describe("repository evidence upload building", () => {
 			expect(upload.input.objects.length).toBeLessThanOrEqual(
 				REPOSITORY_EVIDENCE_MAX_OBJECTS,
 			);
-			expect(bundle.manifest.coverage.omittedContentFiles).toBe(4);
+			expect(bundle.blobs.length).toBeLessThanOrEqual(256);
+			expect(
+				bundle.manifest.coverage.omittedContentFiles,
+			).toBeGreaterThanOrEqual(4096 - 256);
 			expect(bundle.manifest.coverage.limitsReached).toContain("maxBlobs");
 			expect(
 				upload.input.objects.some(

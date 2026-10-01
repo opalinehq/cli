@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { basename, dirname, relative, resolve, sep } from "node:path";
 import type { BlobStore } from "./blob-store.js";
 import { addSanitizedTextBlob } from "./blob-store.js";
+import { getSessionContentPriority } from "./capture-policy.js";
 import {
 	type GitCollectionResult,
 	getGitFileProvenance,
@@ -32,6 +33,7 @@ import type {
 } from "./types.js";
 
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+const NO_OBSERVED_SKILLS: ReadonlySet<string> = new Set();
 
 interface RootSpec {
 	readonly id: string;
@@ -118,7 +120,6 @@ export async function collectFileSystemContext(
 			.sort((left, right) => compareStrings(left.id, right.id)),
 	];
 	const entries: ContextEntry[] = [];
-	const roots: ContextRootManifest[] = [];
 	const excludedPaths: ExcludedPath[] = [];
 	const errors: CoverageError[] = [];
 	const aggregate: MutableAggregate = {
@@ -133,20 +134,95 @@ export async function collectFileSystemContext(
 		omittedBytes: 0,
 	};
 
+	const collectedRoots = [];
 	for (const rootSpec of rootSpecs) {
-		const result = await collectRoot(
-			rootSpec,
-			options,
-			fileSystem,
-			git,
-			blobStore,
-			aggregate,
-			excludedPaths,
-			errors,
+		collectedRoots.push(
+			await discoverRoot(
+				rootSpec,
+				options,
+				fileSystem,
+				git,
+				aggregate,
+				excludedPaths,
+				errors,
+			),
 		);
-		roots.push(result.root);
-		entries.push(...result.entries);
 	}
+	const observedSkills = new Set(options.observedSkillNames ?? []);
+	const files = [];
+	for (const [rootOrder, result] of collectedRoots.entries()) {
+		for (const entry of result.discovered) {
+			const categories = classifyContextPath(
+				entry.path,
+				result.skillDirectories,
+				result.root.scope,
+			);
+			if (entry.stat.kind === "file") {
+				files.push({ result, entry, categories, rootOrder });
+			} else {
+				entries.push(
+					await buildNonFileEntry(
+						result.root,
+						entry,
+						result.skillDirectories,
+						fileSystem,
+						git,
+						options,
+						errors,
+					),
+				);
+			}
+		}
+	}
+	files.sort((left, right) =>
+		options.capturePolicy === "session-evidence"
+			? getSessionContentPriority(
+					left.entry.rootId,
+					left.entry.path,
+					left.categories,
+					observedSkills,
+				) -
+					getSessionContentPriority(
+						right.entry.rootId,
+						right.entry.path,
+						right.categories,
+						observedSkills,
+					) ||
+				compareStrings(
+					`${left.entry.rootId}\0${left.entry.path}`,
+					`${right.entry.rootId}\0${right.entry.path}`,
+				)
+			: left.rootOrder - right.rootOrder ||
+				getContentPriority(left.categories) -
+					getContentPriority(right.categories) ||
+				compareStrings(left.entry.path, right.entry.path),
+	);
+	for (const file of files) {
+		entries.push(
+			await buildRegularFileEntry(
+				file.result.root,
+				file.entry,
+				file.categories,
+				options,
+				fileSystem,
+				git,
+				blobStore,
+				aggregate,
+				file.result.coverage,
+				errors,
+			),
+		);
+	}
+	const roots = collectedRoots.map((result) =>
+		buildRootManifest(
+			result.root,
+			result.status ??
+				(result.coverage.limitsReached.size > 0
+					? "limit-reached"
+					: "collected"),
+			result.coverage,
+		),
+	);
 
 	return {
 		roots,
@@ -173,18 +249,20 @@ export async function collectFileSystemContext(
 	};
 }
 
-async function collectRoot(
+async function discoverRoot(
 	rootSpec: RootSpec,
 	options: LocalContextCollectionOptions,
 	fileSystem: LocalContextFileSystem,
 	git: GitCollectionResult,
-	blobStore: BlobStore,
 	aggregate: MutableAggregate,
 	excludedPaths: ExcludedPath[],
 	errors: CoverageError[],
 ): Promise<{
-	readonly root: ContextRootManifest;
-	readonly entries: readonly ContextEntry[];
+	readonly root: RootSpec;
+	readonly status: "missing" | "inaccessible" | null;
+	readonly discovered: readonly DiscoveredEntry[];
+	readonly skillDirectories: readonly string[];
+	readonly coverage: MutableRootCoverage;
 }> {
 	const coverage = createMutableRootCoverage();
 	const canonicalRoot = await resolveRoot(
@@ -195,8 +273,11 @@ async function collectRoot(
 	);
 	if (canonicalRoot.status !== "available") {
 		return {
-			root: buildRootManifest(rootSpec, canonicalRoot.status, coverage),
-			entries: [],
+			root: rootSpec,
+			status: canonicalRoot.status,
+			discovered: [],
+			skillDirectories: [],
+			coverage,
 		};
 	}
 
@@ -214,27 +295,12 @@ async function collectRoot(
 	const skillDirectories = findSkillDirectories(
 		discovered.map((entry) => entry.path),
 	);
-	const builtEntries = await buildEntries(
-		{ ...rootSpec, absolutePath: canonicalRoot.path },
+	return {
+		root: { ...rootSpec, absolutePath: canonicalRoot.path },
+		status: null,
 		discovered,
 		skillDirectories,
-		options,
-		fileSystem,
-		git,
-		blobStore,
-		aggregate,
 		coverage,
-		errors,
-	);
-	const status =
-		coverage.limitsReached.size > 0 ? "limit-reached" : "collected";
-	return {
-		root: buildRootManifest(
-			{ ...rootSpec, absolutePath: canonicalRoot.path },
-			status,
-			coverage,
-		),
-		entries: builtEntries,
 	};
 }
 
@@ -525,66 +591,6 @@ function addUndiscoveredSubmodules(
 	}
 }
 
-async function buildEntries(
-	root: RootSpec,
-	discovered: readonly DiscoveredEntry[],
-	skillDirectories: readonly string[],
-	options: LocalContextCollectionOptions,
-	fileSystem: LocalContextFileSystem,
-	git: GitCollectionResult,
-	blobStore: BlobStore,
-	aggregate: MutableAggregate,
-	coverage: MutableRootCoverage,
-	errors: CoverageError[],
-): Promise<readonly ContextEntry[]> {
-	const nonFiles = discovered.filter((entry) => entry.stat.kind !== "file");
-	const files = discovered
-		.filter((entry) => entry.stat.kind === "file")
-		.map((entry) => ({
-			entry,
-			categories: classifyContextPath(entry.path, skillDirectories, root.scope),
-		}))
-		.sort(
-			(left, right) =>
-				getContentPriority(left.categories) -
-					getContentPriority(right.categories) ||
-				compareStrings(left.entry.path, right.entry.path),
-		);
-	const entries: ContextEntry[] = [];
-	for (const entry of nonFiles.sort((left, right) =>
-		compareStrings(left.path, right.path),
-	)) {
-		entries.push(
-			await buildNonFileEntry(
-				root,
-				entry,
-				skillDirectories,
-				fileSystem,
-				git,
-				options,
-				errors,
-			),
-		);
-	}
-	for (const file of files) {
-		entries.push(
-			await buildRegularFileEntry(
-				root,
-				file.entry,
-				file.categories,
-				options,
-				fileSystem,
-				git,
-				blobStore,
-				aggregate,
-				coverage,
-				errors,
-			),
-		);
-	}
-	return entries;
-}
-
 async function buildNonFileEntry(
 	root: RootSpec,
 	entry: DiscoveredEntry,
@@ -684,7 +690,7 @@ async function buildRegularFileEntry(
 	const indexEntry =
 		root.id === "repository" ? git.indexEntries.get(entry.path) : undefined;
 	if (
-		shouldReuseGitObject(options.capturePolicy, categories) &&
+		options.capturePolicy === "delta" &&
 		git.canReuseGitObjects &&
 		indexEntry !== undefined &&
 		indexEntry.stage === 0 &&
@@ -716,6 +722,33 @@ async function buildRegularFileEntry(
 				commit: git.headCommit,
 				sourceByteLength: entry.stat.size,
 			},
+		};
+	}
+
+	if (
+		options.capturePolicy === "session-evidence" &&
+		getSessionContentPriority(
+			root.id,
+			entry.path,
+			categories,
+			NO_OBSERVED_SKILLS,
+		) >= 4
+	) {
+		coverage.omittedContentFiles += 1;
+		aggregate.omittedBytes += entry.stat.size;
+		return {
+			...base,
+			kind: "file",
+			size: entry.stat.size,
+			hash: await hashOmittedContent(
+				entry,
+				fileSystem,
+				coverage,
+				aggregate,
+				options,
+				errors,
+			),
+			content: { status: "omitted", reason: "metadata-only", detail: null },
 		};
 	}
 
@@ -801,13 +834,26 @@ async function buildRegularFileEntry(
 		if (sanitized.status === "failure") {
 			if (sanitized.reason === "blob-count-cap")
 				coverage.limitsReached.add("maxBlobs");
+			if (sanitized.reason === "total-content-cap")
+				coverage.limitsReached.add("maxTotalContentBytes");
 			coverage.omittedContentFiles += 1;
 			aggregate.omittedBytes += entry.stat.size;
 			return {
 				...base,
 				kind: "file",
 				size: entry.stat.size,
-				hash: { status: "omitted", reason: "read-error" },
+				hash:
+					sanitized.reason === "blob-count-cap" ||
+					sanitized.reason === "total-content-cap"
+						? await hashOmittedContent(
+								entry,
+								fileSystem,
+								coverage,
+								aggregate,
+								options,
+								errors,
+							)
+						: { status: "omitted", reason: "read-error" },
 				content: {
 					status: "omitted",
 					reason: sanitized.reason,
@@ -855,25 +901,6 @@ async function buildRegularFileEntry(
 			},
 		};
 	}
-}
-
-function shouldReuseGitObject(
-	policy: LocalContextCollectionOptions["capturePolicy"],
-	categories: readonly ContextFileCategory[],
-): boolean {
-	if (policy === "delta") return true;
-	return !categories.some((category) =>
-		[
-			"instruction",
-			"skill-definition",
-			"skill-resource",
-			"plan-candidate",
-			"agent-config",
-			"mcp-config",
-			"hook-config",
-			"package-context",
-		].includes(category),
-	);
 }
 
 function buildAvailableContent(

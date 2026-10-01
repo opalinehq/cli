@@ -17,6 +17,8 @@ export interface BlobStore {
 	readonly parentBlobIds: ReadonlySet<string>;
 	readonly parentCaptureId: string | null;
 	readonly maxBlobs: number;
+	readonly maxBytes: number;
+	materializedBytes: number;
 }
 
 export type SanitizedBlobResult =
@@ -33,19 +35,23 @@ export type SanitizedBlobResult =
 			readonly reason:
 				| "secret-filter-failure"
 				| "secret-filter-budget"
-				| "blob-count-cap";
+				| "blob-count-cap"
+				| "total-content-cap";
 			readonly detail: string;
 	  };
 
 export function createBlobStore(
 	parentCapture: ParentCaptureReference | null,
 	maxBlobs: number,
+	maxBytes = Number.POSITIVE_INFINITY,
 ): BlobStore {
 	return {
 		blobs: new Map(),
 		parentBlobIds: new Set(parentCapture?.blobIds ?? []),
 		parentCaptureId: parentCapture?.id ?? null,
 		maxBlobs,
+		maxBytes,
+		materializedBytes: 0,
 	};
 }
 
@@ -81,6 +87,14 @@ export function addSanitizedTextBlob(
 					detail:
 						"Context blob omitted to reserve protocol object-count headroom.",
 				};
+			if (store.materializedBytes + bytes.byteLength > store.maxBytes) {
+				return {
+					status: "failure",
+					reason: "total-content-cap",
+					detail: "Context blob omitted to bound capture bytes.",
+				};
+			}
+			store.materializedBytes += bytes.byteLength;
 			store.blobs.set(blobId, {
 				id: blobId,
 				algorithm: "sha256",

@@ -203,6 +203,9 @@ function getEntryAccess(entry: ContextEntry): ContextIndexResourceAccess {
 		case "git-object":
 			return { status: "reference-only", reason: "git-object" };
 		case "omitted":
+			if (entry.content.reason === "metadata-only") {
+				return { status: "reference-only", reason: "metadata-only" };
+			}
 			if (entry.content.reason === "read-error") {
 				return { status: "denied", reason: "read-error" };
 			}

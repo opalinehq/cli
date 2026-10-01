@@ -43,6 +43,7 @@ export interface LocalContextCollectionOptions {
 	readonly excludedPathPrefixes: readonly string[];
 	readonly capturePolicy: "delta" | "session-evidence";
 	readonly parentCapture: ParentCaptureReference | null;
+	readonly observedSkillNames?: readonly string[];
 }
 
 export interface ParentCaptureReference {
@@ -204,6 +205,7 @@ export type FileContent =
 				| "secret-filter-failure"
 				| "secret-filter-budget"
 				| "blob-count-cap"
+				| "metadata-only"
 				| "not-file";
 			readonly detail: string | null;
 	  };
@@ -358,6 +360,10 @@ export type ContextIndexResourceAccess =
 				| "total-content-cap";
 	  }
 	| {
+			readonly status: "reference-only";
+			readonly reason: "metadata-only";
+	  }
+	| {
 			readonly status: "unavailable";
 			readonly reason:
 				| "binary"
@@ -479,6 +485,7 @@ export interface GitDiff {
 		| "secret-filter-failure"
 		| "secret-filter-budget"
 		| "blob-count-cap"
+		| "total-content-cap"
 		| null;
 }
 
@@ -507,6 +514,12 @@ export interface GitUnavailableSnapshot {
 export type GitSnapshot = GitRepositorySnapshot | GitUnavailableSnapshot;
 
 export interface AggregateCoverage {
+	readonly truncated?: {
+		readonly omittedBlobs: number;
+		readonly omittedEntries: number;
+		readonly omittedMetadata?: number;
+		readonly reason: "capture-limit";
+	};
 	readonly discoveredEntries: number;
 	readonly inventoryBytes: number;
 	readonly contentFiles: number;

@@ -66,6 +66,7 @@ import {
 	readTranscriptRevision,
 	type TranscriptRevisionDeliveryScope,
 } from "./transcript-revision-store.js";
+import { extractObservedSkills } from "./transcript-skills.js";
 import { allowsInsecureEndpointFromEnv } from "./upload-endpoint.js";
 
 type EvidenceLifecycle = "start" | "resume" | "checkpoint" | "end";
@@ -118,6 +119,7 @@ export async function captureAndUploadSessionEvidence(input: {
 			organizationId: input.organizationId,
 			repositoryPath: request.projectPath,
 			deadlineAt,
+			observedSkillNames: extractObservedSkills(request),
 		});
 		const scope = {
 			actorId: input.credentials.user.id,

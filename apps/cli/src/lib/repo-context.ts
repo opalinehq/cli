@@ -1,10 +1,11 @@
 import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import type { RepositoryEvidenceRemoteHint } from "../contracts/index.js";
 import {
-	REPOSITORY_EVIDENCE_MAX_OBJECTS,
-	type RepositoryEvidenceRemoteHint,
-} from "../contracts/index.js";
+	SESSION_CONTEXT_MAX_BLOB_BYTES,
+	SESSION_CONTEXT_MAX_BLOBS,
+} from "../internal/local-context-source/capture-policy.js";
 import {
 	type AdditionalContextRoot,
 	collectLocalContextBundle,
@@ -34,7 +35,6 @@ import { resolveRepositoryEvidenceLocalIdentity } from "./repository-evidence-id
 
 const MAX_ADDITIONAL_CONTEXT_ROOTS = 16;
 const CONTEXT_ROOT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
-const SESSION_EVIDENCE_RESERVED_OBJECTS = 4;
 
 interface RepositoryConfigBoundary {
 	readonly canonicalRepositoryRoot: string;
@@ -136,6 +136,7 @@ export async function collectSessionRepositoryContext(input: {
 	readonly organizationId: string;
 	readonly repositoryPath: string;
 	readonly deadlineAt?: number;
+	readonly observedSkillNames?: readonly string[];
 }): Promise<SessionRepositoryContextCapture> {
 	const resolvedContext = await resolveRepositoryContext(input.repositoryPath);
 	const context: RepositoryContext = {
@@ -188,6 +189,7 @@ export async function collectSessionRepositoryContext(input: {
 			...defaults,
 			additionalRoots,
 			capturePolicy: "session-evidence",
+			observedSkillNames: input.observedSkillNames,
 			excludedPathPrefixes:
 				configBoundary.excludedPathPrefix === null
 					? defaults.excludedPathPrefixes
@@ -198,15 +200,14 @@ export async function collectSessionRepositoryContext(input: {
 			limits: {
 				...defaults.limits,
 				maxCommits: 10,
-				maxBlobs:
-					REPOSITORY_EVIDENCE_MAX_OBJECTS - SESSION_EVIDENCE_RESERVED_OBJECTS,
+				maxBlobs: SESSION_CONTEXT_MAX_BLOBS,
 				maxContentBytesPerFile: 512 * 1024,
 				maxContentBytesPerRoot: 4 * 1024 * 1024,
 				maxDepthPerRoot: 24,
 				maxEntriesPerRoot: 20_000,
 				maxHashBytesPerFile: 32 * 1024 * 1024,
 				maxHashBytesPerRoot: 128 * 1024 * 1024,
-				maxTotalContentBytes: 12 * 1024 * 1024,
+				maxTotalContentBytes: SESSION_CONTEXT_MAX_BLOB_BYTES,
 				maxTotalEntries: 30_000,
 				maxTotalHashBytes: 256 * 1024 * 1024,
 			},
