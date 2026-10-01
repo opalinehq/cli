@@ -33,7 +33,6 @@ import type {
 } from "./types.js";
 
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
-const NO_OBSERVED_SKILLS: ReadonlySet<string> = new Set();
 
 interface RootSpec {
 	readonly id: string;
@@ -203,6 +202,7 @@ export async function collectFileSystemContext(
 				file.result.root,
 				file.entry,
 				file.categories,
+				observedSkills,
 				options,
 				fileSystem,
 				git,
@@ -666,6 +666,7 @@ async function buildRegularFileEntry(
 	root: RootSpec,
 	entry: DiscoveredEntry,
 	categories: readonly ContextFileCategory[],
+	observedSkills: ReadonlySet<string>,
 	options: LocalContextCollectionOptions,
 	fileSystem: LocalContextFileSystem,
 	git: GitCollectionResult,
@@ -731,7 +732,7 @@ async function buildRegularFileEntry(
 			root.id,
 			entry.path,
 			categories,
-			NO_OBSERVED_SKILLS,
+			observedSkills,
 		) >= 4
 	) {
 		coverage.omittedContentFiles += 1;

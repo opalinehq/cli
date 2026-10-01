@@ -424,45 +424,79 @@ describe("local context collection from a real Git worktree", () => {
 		expect(serializeLocalContextBundle(bundle)).toBe(JSON.stringify(bundle));
 	});
 
-	test("session evidence materializes effective context while keeping unrelated tracked source as Git references", async () => {
-		const fixture = await createRepositoryFixture();
-		const options = {
-			...getFixtureOptions(fixture),
-			capturePolicy: "session-evidence" as const,
-		};
-		const bundle = await collectLocalContextBundle(
-			fixture.repository,
-			options,
-			fixedEnvironment(),
-		);
+	test.each([
+		{ observedSkillNames: undefined },
+		{ observedSkillNames: [] },
+		{ observedSkillNames: ["demo"] },
+		{ observedSkillNames: ["DEMO"] },
+	])(
+		"session evidence only materializes skills observed by exact name (%j)",
+		async ({ observedSkillNames }) => {
+			const fixture = await createRepositoryFixture();
+			const options = {
+				...getFixtureOptions(fixture),
+				capturePolicy: "session-evidence" as const,
+				observedSkillNames,
+			};
+			const bundle = await collectLocalContextBundle(
+				fixture.repository,
+				options,
+				fixedEnvironment(),
+			);
 
-		const agents = getFile(bundle, "repository", "AGENTS.md");
-		const skill = getFile(bundle, "repository", ".claude/skills/demo/SKILL.md");
-		const packageContext = getFile(bundle, "repository", "package.json");
-		const unrelated = getFile(bundle, "repository", "README.md");
+			const agents = getFile(bundle, "repository", "AGENTS.md");
+			const skill = getFile(
+				bundle,
+				"repository",
+				".claude/skills/demo/SKILL.md",
+			);
+			const packageContext = getFile(bundle, "repository", "package.json");
+			const unrelated = getFile(bundle, "repository", "README.md");
 
-		expect(agents.content.status).toBe("available");
-		expect(skill.content.status).toBe("available");
-		expect(packageContext.content).toMatchObject({
-			status: "omitted",
-			reason: "metadata-only",
-		});
-		expect(unrelated.content).toMatchObject({
-			status: "omitted",
-			reason: "metadata-only",
-		});
-		expect(unrelated.hash).toMatchObject({
-			status: "available",
-			algorithm: "sha256",
-			scope: "source",
-		});
-		expect(
-			bundle.manifest.contextIndex.facets.find(
-				(facet) =>
-					facet.rootId === "repository" && facet.kind === "agents-instructions",
-			)?.resources[0]?.access,
-		).toEqual({ status: "readable" });
-	});
+			expect(agents.content.status).toBe("available");
+			for (const definition of [
+				skill,
+				getFile(bundle, "user-skills", "demo/SKILL.md"),
+			]) {
+				if (observedSkillNames?.includes("demo")) {
+					expect(definition.content.status).toBe("available");
+				} else {
+					expect(definition.content).toMatchObject({
+						status: "omitted",
+						reason: "metadata-only",
+					});
+				}
+				expect(definition.hash).toMatchObject({
+					status: "available",
+					algorithm: "sha256",
+					scope: observedSkillNames?.includes("demo") ? "stored" : "source",
+				});
+			}
+			expect(
+				getFile(bundle, "user-skills", "cached-plugin/skill/SKILL.md").content,
+			).toMatchObject({ status: "omitted", reason: "metadata-only" });
+			expect(packageContext.content).toMatchObject({
+				status: "omitted",
+				reason: "metadata-only",
+			});
+			expect(unrelated.content).toMatchObject({
+				status: "omitted",
+				reason: "metadata-only",
+			});
+			expect(unrelated.hash).toMatchObject({
+				status: "available",
+				algorithm: "sha256",
+				scope: "source",
+			});
+			expect(
+				bundle.manifest.contextIndex.facets.find(
+					(facet) =>
+						facet.rootId === "repository" &&
+						facet.kind === "agents-instructions",
+				)?.resources[0]?.access,
+			).toEqual({ status: "readable" });
+		},
+	);
 
 	test("reuses parent blobs across incremental captures", async () => {
 		const fixture = await createRepositoryFixture();

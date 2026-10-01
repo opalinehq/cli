@@ -235,9 +235,18 @@ test("bounds a clean canary-shaped capture without uploading skill resources or 
 		"maxManifestEntries",
 	);
 	expect(bundle.manifest.coverage.limitsReached).toContain("maxManifestBytes");
-	expect(bundle.manifest.coverage.contentFiles).toBe(124);
-	expect(bundle.manifest.contextIndex.skills).toHaveLength(120);
-	expect(bundle.blobs).toHaveLength(124);
+	expect(bundle.manifest.coverage.contentFiles).toBe(2);
+	expect(bundle.manifest.contextIndex.skills.length).toBeGreaterThan(0);
+	for (const entry of bundle.manifest.entries) {
+		if (entry.kind !== "file" || !entry.categories.includes("skill-definition"))
+			continue;
+		expect(entry.content).toMatchObject({
+			status: "omitted",
+			reason: "metadata-only",
+		});
+		expect(entry.hash.status).toBe("available");
+	}
+	expect(bundle.blobs).toHaveLength(2);
 	const resources = bundle.manifest.entries.filter(
 		(entry) =>
 			entry.kind === "file" &&
@@ -384,7 +393,7 @@ test("generated hash-only and blob-limited resources pass the production Athena 
 	expect(
 		row.context_facets.find((facet) => facet[0] === "package-context")?.[4],
 	).toBe("truncated");
-	expect(manifest.localContext.coverage.truncated.omittedBlobs).toBe(2);
+	expect(manifest.localContext.coverage.truncated.omittedBlobs).toBe(1);
 });
 
 test("reserves top-level instruction content ahead of 300 nested instruction files", async () => {
@@ -392,7 +401,7 @@ test("reserves top-level instruction content ahead of 300 nested instruction fil
 		"AGENTS.md",
 		"AGENTS.override.md",
 		"CLAUDE.md",
-		"CLAUDE.local.md",
+		"CLAUDE.project.md",
 		".claude/CLAUDE.md",
 		".codex/AGENTS.md",
 		".agents/AGENTS.md",
@@ -469,6 +478,129 @@ test("keeps Claude and Codex agent-definition Markdown but not skill-resource Ma
 			reason: "metadata-only",
 		});
 	}
+});
+
+test("personal instructions, MCP files and agent settings are hash-only even when they contain unknown tokens", async () => {
+	const metadataPaths = [
+		"CLAUDE.local.md",
+		"AGENTS.local.md",
+		"nested/CLAUDE.local.md",
+		".claude/AGENTS.local.md",
+		"docs/private.LOCAL.MD",
+		".mcp.json",
+		"nested/mcp.json",
+		"mcp-config.json",
+		"mcp/server.json",
+		"nested/mcp/readme.md",
+		".claude/settings.json",
+		".claude/settings.local.json",
+		"nested/.claude/settings.private.json",
+		".codex/config.toml",
+		"nested/.codex/config.toml",
+		".cursor/mcp.json",
+		".cursor/settings.json",
+		"nested/.cursor/private.json",
+	];
+	const files = Object.fromEntries(
+		metadataPaths.map((path) => [path, `OPAQUE_PRIVATE_CANARY ${path}\n`]),
+	);
+	const directory = await createSmallFixture({
+		...files,
+		"AGENTS.md": "Shared instructions\n",
+		"CLAUDE.project.md": "Shared project instructions\n",
+		"mcp/AGENTS.md": "Instructions inside an MCP package\n",
+		"mcp/observed/SKILL.md": "Observed skill inside an MCP package\n",
+	});
+	const bundle = await collectLocalContextBundle(
+		directory,
+		{
+			...getDefaultLocalContextCollectionOptions(),
+			capturePolicy: "session-evidence",
+			observedSkillNames: ["observed"],
+		},
+		createLocalContextSourceEnv(),
+	);
+	for (const path of metadataPaths) {
+		const entry = fileEntry(bundle, "repository", path);
+		const content = files[path] ?? "";
+		expect(entry.size).toBe(Buffer.byteLength(content));
+		expect(entry.content).toEqual({
+			status: "omitted",
+			reason: "metadata-only",
+			detail: null,
+		});
+		expect(entry.hash).toMatchObject({
+			status: "available",
+			algorithm: "sha256",
+			scope: "source",
+			value: createHash("sha256").update(content).digest("hex"),
+		});
+	}
+	for (const path of [
+		"AGENTS.md",
+		"CLAUDE.project.md",
+		"mcp/AGENTS.md",
+		"mcp/observed/SKILL.md",
+	]) {
+		expect(fileEntry(bundle, "repository", path).content.status).toBe(
+			"available",
+		);
+	}
+	for (const blob of bundle.blobs) {
+		expect(blob.content).not.toContain("OPAQUE_PRIVATE_CANARY");
+	}
+	expect(bundle.blobs).toHaveLength(4);
+	expect(bundle.manifest.coverage.truncated).toBeUndefined();
+});
+
+test("does not walk dependency, generated or cache directories", async () => {
+	const skippedDirectories = [
+		".venv",
+		"venv",
+		"__pycache__",
+		".wrangler",
+		".terraform",
+		".gradle",
+		".mypy_cache",
+		".pytest_cache",
+		".parcel-cache",
+	];
+	const directory = await createSmallFixture({
+		"AGENTS.md": "Instructions\n",
+		...Object.fromEntries(
+			skippedDirectories.map((name) => [
+				`nested/${name}/private.md`,
+				"SKIPPED_CANARY\n",
+			]),
+		),
+	});
+	const env = createLocalContextSourceEnv();
+	const walked: string[] = [];
+	const bundle = await collectLocalContextBundle(
+		directory,
+		{
+			...getDefaultLocalContextCollectionOptions(),
+			capturePolicy: "session-evidence",
+		},
+		{
+			...env,
+			fileSystem: {
+				...env.fileSystem,
+				readDirectory: async (path, maxEntries) => {
+					walked.push(path);
+					return env.fileSystem.readDirectory(path, maxEntries);
+				},
+			},
+		},
+	);
+	expect(walked.sort()).toEqual([directory, join(directory, "nested")].sort());
+	expect(bundle.manifest.entries.map((entry) => entry.path)).toEqual([
+		"AGENTS.md",
+		"nested",
+	]);
+	expect(
+		bundle.manifest.coverage.excludedPaths.map((entry) => entry.path).sort(),
+	).toEqual(skippedDirectories.map((name) => `nested/${name}`).sort());
 });
 
 test.each(
@@ -670,15 +802,19 @@ function fileEntry(
 }
 
 test.each([2, 3, 4, 5, 6])(
-	"prioritizes repository instructions, observed skills across roots, other skills, then configs at a %i-blob cap",
+	"prioritizes instructions, observed skills across roots, then agent definitions at a %i-blob cap",
 	async (maxBlobs) => {
 		const directory = await createSmallFixture({
 			"repo/AGENTS.md": "Root instructions\n",
-			"repo/nested/CLAUDE.local.md": "Nested local instructions\n",
+			"repo/nested/CLAUDE.md": "Nested instructions\n",
+			"repo/nested/CLAUDE.local.md": "Private local instructions\n",
 			"repo/.claude/skills/repo-skill/SKILL.md": "Repository skill\n",
 			"repo/.claude/settings.json": '{"permissions":{"allow":[]}}',
+			"repo/.claude/agents/reviewer.md": "Agent definition\n",
 			"skills-a/aaa-unused/SKILL.md": "Unused skill\n",
 			"skills-z/zzz-observed/SKILL.md": "Observed skill\n",
+			"skills-codex/private/SKILL.md": "Private Codex skill\n",
+			"skills-agents/private/SKILL.md": "Private shared skill\n",
 		});
 		const defaults = getDefaultLocalContextCollectionOptions();
 		const observedSkillNames = extractObservedSkills({
@@ -695,9 +831,9 @@ test.each([2, 3, 4, 5, 6])(
 		const options = {
 			...defaults,
 			capturePolicy: "session-evidence" as const,
-			observedSkillNames,
+			observedSkillNames: [...observedSkillNames, "repo-skill"],
 			limits: { ...defaults.limits, maxBlobs },
-			additionalRoots: ["a", "z"].map((suffix) => ({
+			additionalRoots: ["a", "z", "codex", "agents"].map((suffix) => ({
 				id: `skills-${suffix}`,
 				label: `Skills ${suffix}`,
 				absolutePath: join(directory, `skills-${suffix}`),
@@ -717,11 +853,10 @@ test.each([2, 3, 4, 5, 6])(
 		);
 		const priority = [
 			["repository", "AGENTS.md"],
-			["repository", "nested/CLAUDE.local.md"],
-			["skills-z", "zzz-observed/SKILL.md"],
+			["repository", "nested/CLAUDE.md"],
 			["repository", ".claude/skills/repo-skill/SKILL.md"],
-			["skills-a", "aaa-unused/SKILL.md"],
-			["repository", ".claude/settings.json"],
+			["skills-z", "zzz-observed/SKILL.md"],
+			["repository", ".claude/agents/reviewer.md"],
 		] as const;
 		for (const [index, [rootId, path]] of priority.entries()) {
 			const entry = fileEntry(bundle, rootId, path);
@@ -730,10 +865,24 @@ test.each([2, 3, 4, 5, 6])(
 			);
 			expect(entry.hash.status).toBe("available");
 		}
-		expect(bundle.blobs).toHaveLength(maxBlobs);
-		if (maxBlobs < 6)
+		for (const [rootId, path] of [
+			["repository", "nested/CLAUDE.local.md"],
+			["repository", ".claude/settings.json"],
+			["skills-a", "aaa-unused/SKILL.md"],
+			["skills-codex", "private/SKILL.md"],
+			["skills-agents", "private/SKILL.md"],
+		]) {
+			const entry = fileEntry(bundle, rootId, path);
+			expect(entry.content).toMatchObject({
+				status: "omitted",
+				reason: "metadata-only",
+			});
+			expect(entry.hash.status).toBe("available");
+		}
+		expect(bundle.blobs).toHaveLength(Math.min(maxBlobs, priority.length));
+		if (maxBlobs < priority.length)
 			expect(bundle.manifest.coverage.truncated).toEqual({
-				omittedBlobs: 6 - maxBlobs,
+				omittedBlobs: priority.length - maxBlobs,
 				omittedEntries: 0,
 				reason: "capture-limit",
 			});
@@ -761,7 +910,7 @@ test("counts stored UTF-8 bytes and unique blobs at the byte boundary", () => {
 	expect(store.blobs.size).toBe(2);
 });
 
-test("Git patches use only capacity left after instructions, skill definitions and configs", async () => {
+test("Git patches use only capacity left after instructions and observed skill definitions", async () => {
 	const directory = await createSmallFixture({
 		"AGENTS.md": "Original instructions\n",
 		".claude/skills/demo/SKILL.md": "Definition\n",
@@ -788,6 +937,7 @@ test("Git patches use only capacity left after instructions, skill definitions a
 		{
 			...defaults,
 			capturePolicy: "session-evidence",
+			observedSkillNames: ["demo"],
 			limits: { ...defaults.limits, maxBlobs: 2 },
 		},
 		createLocalContextSourceEnv(),
@@ -813,15 +963,19 @@ test("Git patches use only capacity left after instructions, skill definitions a
 		reconstructable: false,
 	});
 	expect(bundle.manifest.coverage.truncated).toMatchObject({
-		omittedBlobs: 2,
+		omittedBlobs: 1,
 		reason: "capture-limit",
 	});
 	const complete = await collectLocalContextBundle(
 		directory,
-		{ ...defaults, capturePolicy: "session-evidence" },
+		{
+			...defaults,
+			capturePolicy: "session-evidence",
+			observedSkillNames: ["demo"],
+		},
 		createLocalContextSourceEnv(),
 	);
-	expect(complete.blobs).toHaveLength(4);
+	expect(complete.blobs).toHaveLength(3);
 	expect(complete.manifest.coverage.truncated).toBeUndefined();
 });
 
@@ -854,7 +1008,7 @@ test("enforces the exact 2 MiB byte boundary before skills and configs and hashe
 		const entry = fileEntry(bundle, "repository", path);
 		expect(entry.content).toMatchObject({
 			status: "omitted",
-			reason: "total-content-cap",
+			reason: path === ".mcp.json" ? "metadata-only" : "total-content-cap",
 		});
 		expect(entry.hash).toMatchObject({
 			status: "available",
@@ -864,7 +1018,7 @@ test("enforces the exact 2 MiB byte boundary before skills and configs and hashe
 	}
 	expect(bundle.manifest.coverage.truncated).toEqual({
 		omittedEntries: 0,
-		omittedBlobs: 2,
+		omittedBlobs: 1,
 		reason: "capture-limit",
 	});
 	expect(bundle.manifest.coverage.limitsReached).toContain(
@@ -906,6 +1060,7 @@ test("all skill resources, including configs and instructions, are hash-only and
 		{
 			...getDefaultLocalContextCollectionOptions(),
 			capturePolicy: "session-evidence",
+			observedSkillNames: ["demo"],
 		},
 		createLocalContextSourceEnv(),
 	);

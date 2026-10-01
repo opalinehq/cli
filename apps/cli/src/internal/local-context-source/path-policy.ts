@@ -11,6 +11,8 @@ const DEPENDENCY_SEGMENTS = new Set([
 	"vendor",
 	"third_party",
 	"third-party",
+	".venv",
+	"venv",
 ]);
 const GENERATED_SEGMENTS = new Set([
 	"dist",
@@ -19,8 +21,18 @@ const GENERATED_SEGMENTS = new Set([
 	"target",
 	".next",
 	".nuxt",
+	".wrangler",
 ]);
-const CACHE_SEGMENTS = new Set([".cache", ".turbo"]);
+const CACHE_SEGMENTS = new Set([
+	".cache",
+	".turbo",
+	"__pycache__",
+	".terraform",
+	".gradle",
+	".mypy_cache",
+	".pytest_cache",
+	".parcel-cache",
+]);
 const SOURCE_EXTENSIONS = new Set([
 	".c",
 	".cc",
@@ -60,6 +72,8 @@ const DOCUMENT_EXTENSIONS = new Set([".adoc", ".mdx", ".rst", ".txt"]);
 const HIGH_RISK_CONTENT_PATHS = {
 	names: [
 		".env",
+		".envrc",
+		".dev.vars",
 		".npmrc",
 		".netrc",
 		".pypirc",
@@ -67,9 +81,22 @@ const HIGH_RISK_CONTENT_PATHS = {
 		"service-account.json",
 		"id_rsa",
 		"id_ed25519",
+		".pgpass",
+		".git-credentials",
+		".htpasswd",
 	],
-	prefixes: [".env."],
-	suffixes: [".pem", ".key", ".p12", ".pfx"],
+	prefixes: [".env.", "secrets."],
+	suffixes: [
+		".pem",
+		".key",
+		".p12",
+		".pfx",
+		".tfvars",
+		".tfstate",
+		".keystore",
+		".jks",
+	],
+	paths: [".aws/**/credentials"],
 };
 
 export interface PathExclusion {
@@ -117,7 +144,9 @@ export function isHighRiskContentPath(relativePath: string): boolean {
 		HIGH_RISK_CONTENT_PATHS.prefixes.some((prefix) =>
 			name.startsWith(prefix),
 		) ||
-		HIGH_RISK_CONTENT_PATHS.suffixes.some((suffix) => name.endsWith(suffix))
+		HIGH_RISK_CONTENT_PATHS.suffixes.some((suffix) => name.endsWith(suffix)) ||
+		(name === "credentials" &&
+			relativePath.toLowerCase().split("/").includes(".aws"))
 	);
 }
 
@@ -126,6 +155,7 @@ export function getHighRiskContentPathspecExclusions(): readonly string[] {
 		...HIGH_RISK_CONTENT_PATHS.names,
 		...HIGH_RISK_CONTENT_PATHS.prefixes.map((prefix) => `${prefix}*`),
 		...HIGH_RISK_CONTENT_PATHS.suffixes.map((suffix) => `*${suffix}`),
+		...HIGH_RISK_CONTENT_PATHS.paths,
 	].map((pattern) => `:(exclude,icase,glob)**/${pattern}`);
 }
 
@@ -253,7 +283,7 @@ function isMcpConfigPath(name: string, lowerPath: string): boolean {
 		name === ".mcp.json" ||
 		name === "mcp.json" ||
 		name === "mcp-config.json" ||
-		lowerPath.includes("/mcp/")
+		/(?:^|\/)mcp\//u.test(lowerPath)
 	);
 }
 
