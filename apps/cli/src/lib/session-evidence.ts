@@ -24,15 +24,23 @@ import {
 	createRepositorySpoolEnv,
 	markRepositorySpoolCaptureAbandoned,
 	markRepositorySpoolCaptureAccepted,
+	removeRepositorySpoolCapture,
 } from "./repo-spool.js";
 import {
 	getLegacyRepositoryKey,
 	resolveUploadRepositoryIdentity,
 } from "./repository-discovery.js";
 import {
+	isEvidenceCaptureDisabledError,
+	pauseRepositoryEvidenceCapture,
+	readRepositoryEvidencePauseUntil,
+} from "./repository-evidence-pause.js";
+import {
 	deferPendingRepositoryEvidence,
 	normalizeRepositoryEvidenceEndpoint,
+	type PendingRepositoryEvidence,
 	readPendingRepositoryEvidence,
+	removePendingRepositoryEvidence,
 	writePendingRepositoryEvidence,
 } from "./repository-evidence-pending.js";
 import {
@@ -77,7 +85,10 @@ export async function captureAndUploadSessionEvidence(input: {
 		readonly startedAt: string;
 	};
 	readonly terminalTranscript: boolean;
-}): Promise<{ readonly contextId: string; readonly receiptId: string }> {
+}): Promise<
+	{ readonly contextId: string; readonly receiptId: string } | undefined
+> {
+	if (readRepositoryEvidencePauseUntil() !== undefined) return undefined;
 	const deadlineAt = Date.now() + EVIDENCE_DELIVERY_BUDGET_MS;
 	if (!input.credentials.user) {
 		throw new Error("Repository evidence requires an authenticated CLI user.");
@@ -95,6 +106,7 @@ export async function captureAndUploadSessionEvidence(input: {
 	const request = materialized.request;
 	const sourceId = materialized.sourceId;
 	let hasPending = false;
+	let currentPending: PendingRepositoryEvidence | undefined;
 	let contextCapture:
 		| Awaited<ReturnType<typeof collectSessionRepositoryContext>>
 		| undefined;
@@ -169,7 +181,7 @@ export async function captureAndUploadSessionEvidence(input: {
 			transcriptLastEventAt: attribution.streams[0]?.prefix.lastEventAt ?? null,
 			transcriptRevision,
 		});
-		const currentPending = {
+		currentPending = {
 			repositorySelection: {
 				repoKey: repository.repoKey,
 				legacyKeys: [getLegacyRepositoryKey(request.projectPath, gitInfo)],
@@ -224,6 +236,14 @@ export async function captureAndUploadSessionEvidence(input: {
 			contextId: receipt.contextId,
 			receiptId: receipt.receiptId,
 		};
+	} catch (error) {
+		if (isEvidenceCaptureDisabledError(error)) {
+			pauseRepositoryEvidenceCapture(error, configDir);
+			if (currentPending)
+				await discardDisabledCapture(currentPending, configDir);
+			return undefined;
+		}
+		throw error;
 	} finally {
 		if (!hasPending) {
 			await rm(transcriptSourcePath(configDir, sourceId), { force: true });
@@ -248,6 +268,7 @@ export async function retryPendingSessionEvidence(
 		readonly onWarning?: (message: string) => void;
 	} = {},
 ): Promise<number> {
+	if (readRepositoryEvidencePauseUntil() !== undefined) return 0;
 	if (!credentials.user) {
 		throw new Error("Repository evidence requires an authenticated CLI user.");
 	}
@@ -261,6 +282,7 @@ export async function retryPendingSessionEvidence(
 	const maxItems = options.maxItems ?? 25;
 	const attemptedOperationIds = new Set<string>();
 	for (let attempted = 0; attempted < maxItems; attempted++) {
+		if (readRepositoryEvidencePauseUntil(configDir) !== undefined) break;
 		const readErrors: unknown[] = [];
 		const [pending] = await readPendingRepositoryEvidence(configDir, {
 			actorId: credentials.user.id,
@@ -290,6 +312,11 @@ export async function retryPendingSessionEvidence(
 			await continueAcceptedTranscript(pending, configDir);
 			completed++;
 		} catch (error) {
+			if (isEvidenceCaptureDisabledError(error)) {
+				pauseRepositoryEvidenceCapture(error, configDir);
+				await discardDisabledCapture(pending, configDir);
+				break;
+			}
 			failures.push(error);
 			await deferPendingRepositoryEvidence(pending, configDir);
 		}
@@ -311,7 +338,11 @@ async function retryOnePendingRepositoryEvidence(
 	deadlineAt: number,
 	onWarning: ((message: string) => void) | undefined,
 ): Promise<unknown | undefined> {
-	if (Date.now() >= deadlineAt) return undefined;
+	if (
+		Date.now() >= deadlineAt ||
+		readRepositoryEvidencePauseUntil(configDir) !== undefined
+	)
+		return undefined;
 	const failures: unknown[] = [];
 	for (const pending of await readPendingRepositoryEvidence(configDir, {
 		actorId,
@@ -337,6 +368,11 @@ async function retryOnePendingRepositoryEvidence(
 			);
 			await continueAcceptedTranscript(pending, configDir);
 		} catch (error) {
+			if (isEvidenceCaptureDisabledError(error)) {
+				pauseRepositoryEvidenceCapture(error, configDir);
+				await discardDisabledCapture(pending, configDir);
+				return undefined;
+			}
 			if (error instanceof RepositoryAutoUploadDisabledError) continue;
 			failures.push(error);
 			await deferPendingRepositoryEvidence(pending, configDir);
@@ -383,6 +419,28 @@ async function markPendingRepositoryCaptureAccepted(
 	);
 }
 
+async function discardDisabledCapture(
+	pending: PendingRepositoryEvidence,
+	configDir: string,
+): Promise<void> {
+	await removePendingRepositoryEvidence(pending, configDir);
+	if (pending.continuation)
+		await rm(transcriptSourcePath(configDir, pending.continuation.sourceId), {
+			force: true,
+		});
+	const binding = await createRepositorySpoolBinding({
+		accountId: pending.transcriptRevision.scope.actorId,
+		apiBaseUrl: pending.endpoint,
+		localIdentity: pending.upload.input.repository.local,
+		workspaceId: pending.upload.input.organizationId,
+	});
+	await removeRepositorySpoolCapture(
+		binding,
+		pending.upload.input.capture.contextId,
+		createRepositorySpoolEnv(configDir),
+	);
+}
+
 async function uploadWithBoundedRetries(
 	upload: ReturnType<typeof buildRepositoryEvidenceUpload>,
 	credentials: Credentials,
@@ -418,6 +476,10 @@ async function uploadWithBoundedRetries(
 			});
 		} catch (error) {
 			lastError = error;
+			if (isEvidenceCaptureDisabledError(error)) {
+				pauseRepositoryEvidenceCapture(error);
+				throw error;
+			}
 			if (!isRetryableRepositoryEvidenceError(error) || attempt === 3) break;
 			const retryDelayMs = overrides.deadlineAt
 				? Math.min(attempt * 100, overrides.deadlineAt - Date.now())

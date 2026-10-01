@@ -16,6 +16,7 @@ import {
 	getLegacyRepositoryKey,
 	resolveUploadRepositoryIdentity,
 } from "../../../lib/repository-discovery.js";
+import { readRepositoryEvidencePauseUntil } from "../../../lib/repository-evidence-pause.js";
 import { captureAndUploadSessionEvidence } from "../../../lib/session-evidence.js";
 import { allowsInsecureEndpointFromEnv } from "../../../lib/upload-endpoint.js";
 import {
@@ -49,20 +50,21 @@ async function runSessionEnd(): Promise<undefined | Error> {
 		const input = JSON.parse(raw) as HookInput;
 		if (!input.session_id || !input.transcript_path) return;
 		const hookReceivedAt = new Date().toISOString();
-		try {
-			const paths = new Set([
-				claudeCodeAdapter.getHookConfigPath({ global: true }),
-				claudeCodeAdapter.getHookConfigPath({ projectPath: input.cwd }),
-			]);
-			for (const path of paths) {
-				if (ensureSessionStartHook(path))
-					logger.info("Added the missing Claude Code SessionStart hook");
+		if (readRepositoryEvidencePauseUntil() === undefined)
+			try {
+				const paths = new Set([
+					claudeCodeAdapter.getHookConfigPath({ global: true }),
+					claudeCodeAdapter.getHookConfigPath({ projectPath: input.cwd }),
+				]);
+				for (const path of paths) {
+					if (ensureSessionStartHook(path))
+						logger.info("Added the missing Claude Code SessionStart hook");
+				}
+			} catch (error) {
+				logger.warn("Could not add the SessionStart hook: {error}", {
+					error: error instanceof Error ? error.message : String(error),
+				});
 			}
-		} catch (error) {
-			logger.warn("Could not add the SessionStart hook: {error}", {
-				error: error instanceof Error ? error.message : String(error),
-			});
-		}
 		const gitInfo = await getGitInfo(input.cwd);
 		const repository = resolveUploadRepositoryIdentity(input.cwd, gitInfo);
 		if (
@@ -118,6 +120,7 @@ async function runSessionEnd(): Promise<undefined | Error> {
 					terminalTranscript: true,
 				})
 					.then((receipt) => {
+						if (!receipt) return;
 						logger.info(
 							"Repository evidence accepted for context {contextId}",
 							{ contextId: receipt.contextId },

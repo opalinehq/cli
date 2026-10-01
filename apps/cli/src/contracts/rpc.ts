@@ -17,6 +17,7 @@ import {
 import {
 	RepositoryEvidenceCommitInputSchema,
 	RepositoryEvidenceCommitOutputSchema,
+	RepositoryEvidenceErrors,
 	RepositoryEvidenceInitInputSchema,
 	RepositoryEvidenceInitOutputSchema,
 } from "./repository-evidence.js";
@@ -117,9 +118,11 @@ export const contract = {
 		}),
 	repositoryEvidence: {
 		commit: oc
+			.errors(RepositoryEvidenceErrors)
 			.input(RepositoryEvidenceCommitInputSchema)
 			.output(RepositoryEvidenceCommitOutputSchema),
 		init: oc
+			.errors(RepositoryEvidenceErrors)
 			.input(RepositoryEvidenceInitInputSchema)
 			.output(RepositoryEvidenceInitOutputSchema),
 	},

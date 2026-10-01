@@ -428,6 +428,40 @@ export async function markRepositorySpoolCaptureAbandoned(
 	}
 }
 
+export async function removeRepositorySpoolCapture(
+	binding: RepositorySpoolBinding,
+	captureId: string,
+	env: RepositorySpoolEnv,
+): Promise<void> {
+	const paths = getSpoolPaths(binding, env);
+	await ensureSpoolDirectories(paths);
+	const releaseLock = await acquireSpoolWriteLock(paths.root, env);
+	try {
+		const plan = await planBindingRetirement(paths, env, new Set());
+		const retired = plan.captures.filter(
+			(capture) => capture.record?.captureId === captureId,
+		);
+		if (retired.length === 0) return;
+		const before = await ensureCleanAccountingLocked(env);
+		await writeSpoolAccounting({ ...before, state: "dirty" }, env);
+		const applied = await applyBindingRetirement({
+			...plan,
+			retired,
+		});
+		await writeSpoolAccounting(
+			{
+				blobCount: Math.max(0, before.blobCount - applied.retiredBlobs),
+				captureCount: Math.max(0, before.captureCount - retired.length),
+				state: "clean",
+				usedBytes: Math.max(0, before.usedBytes - applied.freedBytes),
+			},
+			env,
+		);
+	} finally {
+		await releaseLock();
+	}
+}
+
 export async function planRepositoryBundle(
 	candidate: RepositoryBundleCandidate,
 	binding: RepositorySpoolBinding,

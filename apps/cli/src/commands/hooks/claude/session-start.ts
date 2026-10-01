@@ -14,6 +14,7 @@ import {
 	getLegacyRepositoryKey,
 	resolveUploadRepositoryIdentity,
 } from "../../../lib/repository-discovery.js";
+import { readRepositoryEvidencePauseUntil } from "../../../lib/repository-evidence-pause.js";
 import { captureAndUploadSessionEvidence } from "../../../lib/session-evidence.js";
 import { disposeLogging, setupHookLogging } from "../../../logging.js";
 
@@ -39,6 +40,7 @@ async function runSessionStart(): Promise<undefined> {
 		if (!raw.trim()) return;
 		const input: unknown = JSON.parse(raw);
 		if (!isSessionStartInput(input)) return;
+		if (readRepositoryEvidencePauseUntil() !== undefined) return;
 		const hookReceivedAt = new Date().toISOString();
 		const gitInfo = await getGitInfo(input.cwd);
 		const repository = resolveUploadRepositoryIdentity(input.cwd, gitInfo);
@@ -98,6 +100,7 @@ async function runSessionStart(): Promise<undefined> {
 			request,
 			terminalTranscript: false,
 		});
+		if (!receipt) return;
 		logger.info(
 			"Start context accepted for session {sessionId} ({contextId})",
 			{ contextId: receipt.contextId, sessionId: input.session_id },

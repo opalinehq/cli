@@ -123,6 +123,7 @@ async function runTurnComplete(
 					terminalTranscript: false,
 				})
 					.then((receipt) => {
+						if (!receipt) return;
 						logger.info(
 							"Repository evidence accepted for context {contextId}",
 							{ contextId: receipt.contextId },

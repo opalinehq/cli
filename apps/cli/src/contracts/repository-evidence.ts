@@ -7,6 +7,14 @@ export const REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES = 64 * 1024 * 1024;
 export const REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES = 128 * 1024 * 1024;
 export const REPOSITORY_EVIDENCE_MAX_OBJECTS = 4_096;
 
+export const RepositoryEvidenceErrors = {
+	EVIDENCE_CAPTURE_DISABLED: {
+		status: 403,
+		message: "Repository evidence capture is temporarily disabled.",
+		data: z.object({ pauseSeconds: z.number().int().min(3_600).max(604_800) }),
+	},
+};
+
 const SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/u;
 const CONTENT_OBJECT_ID_PATTERN = /^sha256:[a-f0-9]{64}$/u;
 const LOCAL_REPOSITORY_ID_PATTERN = /^local-repository:[a-f0-9]{64}$/u;
