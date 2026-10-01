@@ -108,6 +108,8 @@ export async function captureAndUploadSessionEvidence(input: {
 		isEligible: (pending) =>
 			pending.upload.input.session.source === metadata.source &&
 			pending.upload.input.organizationId === input.organizationId,
+		onError: (error) =>
+			input.onWarning?.(error instanceof Error ? error.message : String(error)),
 		onWarning: (warning) => input.onWarning?.(warning.message),
 	});
 	if (existingPending) {

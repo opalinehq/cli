@@ -323,13 +323,16 @@ function parsePending(
 	if (
 		(record.next_attempt_at !== undefined &&
 			(!Number.isSafeInteger(record.next_attempt_at) ||
-				Number(record.next_attempt_at) < 0)) ||
+				Number(record.next_attempt_at) < 0 ||
+				Number(record.next_attempt_at) > Date.now() + 240 * 60_000)) ||
 		(record.retry_attempts !== undefined &&
 			(!Number.isSafeInteger(record.retry_attempts) ||
 				Number(record.retry_attempts) < 0 ||
 				Number(record.retry_attempts) > RETRY_BACKOFF_MINUTES.length))
-	)
-		throw invalidPending();
+	) {
+		record.next_attempt_at = undefined;
+		record.retry_attempts = undefined;
+	}
 	if (
 		record.version !== PENDING_VERSION ||
 		typeof record.endpoint !== "string" ||

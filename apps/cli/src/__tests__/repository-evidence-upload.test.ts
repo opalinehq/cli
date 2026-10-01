@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { ok as assert } from "node:assert";
 import { execFileSync } from "node:child_process";
 import {
@@ -70,6 +70,71 @@ const scope: TranscriptRevisionScope = {
 };
 
 describe("repository evidence delivery", () => {
+	test.each([
+		{ next_attempt_at: Number.MAX_SAFE_INTEGER },
+		{ next_attempt_at: Date.now() + 241 * 60_000 },
+		{ next_attempt_at: "garbage" },
+		{ next_attempt_at: -1 },
+		{ next_attempt_at: Number.POSITIVE_INFINITY },
+		{ next_attempt_at: Number.NaN },
+		{ retry_attempts: "garbage" },
+		{ retry_attempts: -1 },
+		{ retry_attempts: Number.MAX_SAFE_INTEGER },
+	])(
+		"resets invalid scheduling metadata without losing evidence: %j",
+		async (schedule) => {
+			const configDir = await mkdtemp(join(tmpdir(), "opaline-backoff-reset-"));
+			try {
+				const content = '{"ordinal":0}\n';
+				const plan = await planTranscriptRevision({
+					content: new TextEncoder().encode(content),
+					previous: undefined,
+					scope,
+					terminal: true,
+				});
+				const upload = buildUploadFor(makeBundle(), plan, content);
+				const path = await writePendingRepositoryEvidence(
+					{
+						endpoint: "https://opaline.so/rpc",
+						transcriptRevision: plan.manifest,
+						upload,
+					},
+					configDir,
+				);
+				const record = JSON.parse(await readFile(path, "utf8"));
+				const serialized = JSON.stringify({
+					...record,
+					next_attempt_at: Date.now() + 240 * 60_000,
+					retry_attempts: 4,
+					...schedule,
+				});
+				await writeFile(
+					path,
+					schedule.next_attempt_at === Number.POSITIVE_INFINITY
+						? serialized.replace(
+								'"next_attempt_at":null',
+								'"next_attempt_at":1e400',
+							)
+						: serialized,
+				);
+				const restored = await readPendingRepositoryEvidence(configDir, {
+					isEligible: (pending) => (pending.next_attempt_at ?? 0) <= Date.now(),
+				});
+				expect(restored).toHaveLength(1);
+				expect(restored[0]?.next_attempt_at).toBeUndefined();
+				expect(restored[0]?.retry_attempts).toBeUndefined();
+				expect(restored[0]?.upload).toEqual(upload);
+				expect(restored[0]?.transcriptRevision).toEqual(plan.manifest);
+				expect(await readFile(path, "utf8")).toBeTruthy();
+				expect(
+					await readdir(join(configDir, "repository-evidence-pending", "v4")),
+				).toEqual([path.split("/").at(-1)]);
+			} finally {
+				await rm(configDir, { force: true, recursive: true });
+			}
+		},
+	);
+
 	test.each(["http", "etag", "timeout"])(
 		"stops dequeuing and settles in-flight parts before rejecting a %s failure",
 		async (failure) => {
@@ -317,6 +382,8 @@ describe("repository evidence delivery", () => {
 				});
 			},
 		});
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
 		try {
 			execFileSync("git", ["init", "--quiet", fixture.projectPath]);
 			const repositoryRoot = execFileSync(
@@ -348,7 +415,6 @@ describe("repository evidence delivery", () => {
 				preload,
 				"Date.now = () => Number(process.env.OPALINE_TEST_NOW);\n",
 			);
-			let now = Date.now();
 			const hook = (
 				sessionId = fixture.sessionId,
 				lifecycle = "session-start",
@@ -384,6 +450,34 @@ describe("repository evidence delivery", () => {
 				expect(deliveries).toHaveLength(requests);
 				now = value.next_attempt_at ?? now;
 			}
+			const pendingDirectory = join(
+				configDir,
+				"repository-evidence-pending",
+				"v4",
+			);
+			const [pendingName] = await readdir(pendingDirectory);
+			assert(pendingName);
+			const pendingPath = join(pendingDirectory, pendingName);
+			for (const nextAttemptAt of [Number.MAX_SAFE_INTEGER, "garbage", -1]) {
+				const record = JSON.parse(await readFile(pendingPath, "utf8"));
+				await writeFile(
+					pendingPath,
+					JSON.stringify({
+						...record,
+						next_attempt_at: nextAttemptAt,
+					}),
+				);
+				const requests = deliveries.length;
+				expect((await hook()).exitCode).toBe(0);
+				expect(deliveries).toHaveLength(requests + 1);
+				expect(deliveries.at(-1)?.operationId).toBe(operationId);
+				const [reset] = await readPendingRepositoryEvidence(configDir);
+				expect(reset).toMatchObject({
+					next_attempt_at: now + 5 * 60_000,
+					retry_attempts: 1,
+				});
+			}
+			now += 5 * 60_000;
 			failEvidence = false;
 			expect((await hook()).exitCode).toBe(0);
 			expect(await readPendingRepositoryEvidence(configDir)).toEqual([]);
@@ -394,6 +488,9 @@ describe("repository evidence delivery", () => {
 				next_attempt_at: now + 5 * 60_000,
 				retry_attempts: 1,
 			});
+			const [resetName] = await readdir(pendingDirectory);
+			assert(resetName);
+			const resetPath = join(pendingDirectory, resetName);
 			const requests = deliveries.length;
 			expect((await hook(fixture.sessionId, "session-end")).exitCode).toBe(0);
 			expect(transcripts).toBe(1);
@@ -405,7 +502,16 @@ describe("repository evidence delivery", () => {
 			expect((await hook("successful-new-session")).exitCode).toBe(0);
 			expect(deliveries).toHaveLength(requests + 2);
 			expect(await readPendingRepositoryEvidence(configDir)).toHaveLength(2);
+			const record = JSON.parse(await readFile(resetPath, "utf8"));
+			await writeFile(
+				resetPath,
+				JSON.stringify({ ...record, objects: "garbage" }),
+			);
+			expect((await hook()).exitCode).toBe(0);
+			expect(deliveries).toHaveLength(requests + 3);
+			expect(deliveries.at(-1)?.operationId).not.toBe(operationId);
 		} finally {
+			clock.mockRestore();
 			server.stop(true);
 			await rm(fixture.home, { force: true, recursive: true });
 		}
