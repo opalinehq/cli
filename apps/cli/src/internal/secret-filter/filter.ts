@@ -14,6 +14,8 @@ export interface CompiledSecretRule {
 	readonly allowlistMatchers: readonly RegExp[];
 }
 
+type SecretRedactor = (ruleId: string, original: string) => string;
+
 const COMPILED_SECRET_RULES = GENERATED_SECRET_RULES.map(compileSecretRule);
 const UTF8_ENCODER = new TextEncoder();
 
@@ -48,13 +50,21 @@ export class SecretFilterJsonIntegrityError extends Error {
 	}
 }
 
-export function filterKnownSecrets(text: string): SecretFilterResult {
-	return filterKnownSecretsWithCompiledRules(text, COMPILED_SECRET_RULES);
+export function filterKnownSecrets(
+	text: string,
+	redactSecret?: SecretRedactor,
+): SecretFilterResult {
+	return filterKnownSecretsWithCompiledRules(
+		text,
+		COMPILED_SECRET_RULES,
+		redactSecret,
+	);
 }
 
 export function filterKnownSecretsWithCompiledRules(
 	text: string,
 	rules: readonly CompiledSecretRule[],
+	redactSecret?: SecretRedactor,
 ): SecretFilterResult {
 	let filteredText = text;
 	let counts: RedactionCounts = {};
@@ -73,7 +83,11 @@ export function filterKnownSecretsWithCompiledRules(
 	// again, but an older CLI uploads raw text and gets exactly one server-side
 	// pass. Without this loop those two paths store different bytes.
 	for (let pass = 0; pass < MAX_FILTER_PASSES; pass += 1) {
-		const passResult = applyCompiledSecretRules(filteredText, rules);
+		const passResult = applyCompiledSecretRules(
+			filteredText,
+			rules,
+			redactSecret,
+		);
 		// A clean pass means the text is a fixpoint; nothing was rewritten, so
 		// there is nothing to merge.
 		if (getRedactionCount(passResult.counts) === 0) {
@@ -90,7 +104,11 @@ export function filterKnownSecretsWithCompiledRules(
 	// Four changing passes are allowed, but their output is not trusted until a
 	// clean pass confirms that it is a fixpoint. Never return partially filtered
 	// text when the bounded loop cannot establish that invariant.
-	const confirmation = applyCompiledSecretRules(filteredText, rules);
+	const confirmation = applyCompiledSecretRules(
+		filteredText,
+		rules,
+		redactSecret,
+	);
 	if (getRedactionCount(confirmation.counts) > 0) {
 		throw new SecretFilterConvergenceError();
 	}
@@ -234,6 +252,7 @@ export function compileSecretRule(rule: SecretRule): CompiledSecretRule {
 export function applyCompiledSecretRule(
 	text: string,
 	rule: CompiledSecretRule,
+	redactSecret?: SecretRedactor,
 ): SecretFilterResult {
 	const pieces: string[] = [];
 	let count = 0;
@@ -262,7 +281,8 @@ export function applyCompiledSecretRule(
 		const secretBytes = getUtf8ByteLength(secret);
 		pieces.push(
 			text.slice(cursor, secretStart),
-			`[REDACTED:${rule.definition.id}]`,
+			redactSecret?.(rule.definition.id, secret) ??
+				`[REDACTED:${rule.definition.id}]`,
 		);
 		cursor = secretEnd;
 		count += 1;
@@ -301,13 +321,14 @@ export function applyCompiledSecretRule(
 function applyCompiledSecretRules(
 	text: string,
 	rules: readonly CompiledSecretRule[],
+	redactSecret?: SecretRedactor,
 ): SecretFilterResult {
 	let filteredText = text;
 	let counts: RedactionCounts = {};
 	let redactedBytes = 0;
 
 	for (const rule of rules) {
-		const result = applyCompiledSecretRule(filteredText, rule);
+		const result = applyCompiledSecretRule(filteredText, rule, redactSecret);
 		filteredText = result.text;
 		counts = mergeRedactionCounts(counts, result.counts);
 		redactedBytes += result.redactedBytes;

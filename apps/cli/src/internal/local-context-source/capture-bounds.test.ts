@@ -4,8 +4,14 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { RepositoryEvidenceInitInputSchema } from "../../contracts/index.js";
-import { createRepositoryBundleCandidate } from "../../lib/repo-context.js";
+import {
+	RepositoryEvidenceInitInputSchema,
+	type RepositoryEvidenceRemoteHint,
+} from "../../contracts/index.js";
+import {
+	createRepositoryBundleCandidate,
+	parseGitHubRepositoryRemoteHint,
+} from "../../lib/repo-context.js";
 import {
 	createRepositorySpoolBinding,
 	createRepositorySpoolEnv,
@@ -14,10 +20,10 @@ import {
 import { buildRepositoryEvidenceUpload } from "../../lib/repository-evidence-upload.js";
 import { planTranscriptRevision } from "../../lib/transcript-revision.js";
 import { extractObservedSkills } from "../../lib/transcript-skills.js";
-import { filterKnownSecrets } from "../secret-filter/index.js";
 import { buildRepositoryEvidenceIndexRow } from "./__fixtures__/athena-evidence-index.js";
 import { addSanitizedTextBlob, createBlobStore } from "./blob-store.js";
 import { collectLocalContextBundle } from "./collector.js";
+import { filterContextMetadata } from "./metadata-filter.js";
 import { createLocalContextSourceEnv } from "./node-env.js";
 import { getDefaultLocalContextCollectionOptions } from "./options.js";
 import type { ContextRegularFileEntry, LocalContextBundle } from "./types.js";
@@ -277,8 +283,16 @@ async function createSmallFixture(files: Readonly<Record<string, string>>) {
 	return directory;
 }
 
-async function buildTestUpload(bundle: LocalContextBundle) {
-	const content = '{"type":"event_msg","payload":{"type":"task_complete"}}\n';
+async function buildTestUpload(
+	bundle: LocalContextBundle,
+	options: {
+		content?: string;
+		remoteHint?: RepositoryEvidenceRemoteHint | null;
+	} = {},
+) {
+	const content =
+		options.content ??
+		'{"type":"event_msg","payload":{"type":"task_complete"}}\n';
 	const transcriptRevision = await planTranscriptRevision({
 		content: new TextEncoder().encode(content),
 		previous: undefined,
@@ -299,7 +313,7 @@ async function buildTestUpload(bundle: LocalContextBundle) {
 				repositoryId: `local-repository:${"a".repeat(64)}`,
 				worktreeId: `local-worktree:${"b".repeat(64)}`,
 			},
-			remoteHint: null,
+			remoteHint: options.remoteHint ?? null,
 		},
 		firstActionAt: null,
 		firstActionBasis: "unavailable",
@@ -457,14 +471,18 @@ test("keeps Claude and Codex agent-definition Markdown but not skill-resource Ma
 	}
 });
 
-test.each(["delta", "session-evidence"] as const)(
-	"redacts GitHub tokens in exported filenames, directory names and every path reference (%s)",
-	async (capturePolicy) => {
-		const token = `ghp_${"AbCdEf0123456789".repeat(3).slice(0, 36)}`;
-		const redactedToken = filterKnownSecrets(token).text;
+test.each(
+	(["delta", "session-evidence"] as const).flatMap((capturePolicy) => [
+		[capturePolicy, "github-pat", `ghp_${"A".repeat(36)}`] as const,
+		[capturePolicy, "npm-access-token", `npm_${"a".repeat(36)}`] as const,
+	]),
+)(
+	"redacts tokens in exported filenames, directory names and every path reference (%s, %s)",
+	async (capturePolicy, ruleId, token) => {
+		const redactedToken = filterContextMetadata(token);
 		expect(redactedToken).not.toBe(token);
 		const paths = [
-			`docs/${token}.md`,
+			ruleId === "github-pat" ? `docs/${token}.md` : `docs/${token}/CLAUDE.md`,
 			`${token}/AGENTS.md`,
 			`.claude/skills/${token}/SKILL.md`,
 		];
@@ -484,11 +502,14 @@ test.each(["delta", "session-evidence"] as const)(
 			},
 			createLocalContextSourceEnv(),
 		);
-		expect(JSON.stringify(bundle)).not.toContain(token);
+		expect(JSON.stringify(bundle.manifest)).not.toContain(token);
 		for (const path of paths) {
-			const exportedPath = filterKnownSecrets(path).text;
+			const exportedPath = filterContextMetadata(path);
 			const entry = fileEntry(bundle, "repository", exportedPath);
 			expect(entry.name).toBe(exportedPath.split("/").at(-1) ?? "");
+			expect(entry.parentPath).toBe(
+				exportedPath.split("/").slice(0, -1).join("/"),
+			);
 			expect(bundle.manifest.documents.markdown).toContainEqual({
 				rootId: "repository",
 				path: exportedPath,
@@ -539,6 +560,100 @@ test.each(["delta", "session-evidence"] as const)(
 		expect(legacyUpload.input.manifestObjectId).toBe(
 			upload.input.manifestObjectId,
 		);
+	},
+);
+
+test("redacts a GitHub token used as the outbound remote repository name", async () => {
+	const token = `ghp_${"A".repeat(36)}`;
+	const directory = await createSmallFixture({ "AGENTS.md": "Instructions\n" });
+	const bundle = await collectLocalContextBundle(
+		directory,
+		getDefaultLocalContextCollectionOptions(),
+		createLocalContextSourceEnv(),
+	);
+	const remoteHint = parseGitHubRepositoryRemoteHint(
+		`git@github.com:fixture/${token}.git`,
+	);
+	expect(remoteHint?.name).toBe(token);
+	const upload = await buildTestUpload(bundle, { remoteHint });
+	expect(JSON.stringify(upload.input)).not.toContain(token);
+	expect(upload.input.repository.remoteHint).toEqual(
+		filterContextMetadata(remoteHint),
+	);
+	expect(upload.input.repository.remoteHint?.name).toBe(
+		`[REDACTED:github-pat:${createHash("sha256").update(token).digest("hex").slice(0, 12)}]`,
+	);
+	expect(
+		RepositoryEvidenceInitInputSchema.safeParse(upload.input).success,
+	).toBe(true);
+});
+
+test.each(["delta", "session-evidence"] as const)(
+	"keeps two distinct token-named directories as two skills with consistent usage (%s)",
+	async (capturePolicy) => {
+		const tokens = [`ghp_${"A".repeat(36)}`, `ghp_${"B".repeat(36)}`];
+		const directory = await createSmallFixture(
+			Object.fromEntries(
+				tokens.map((token, index) => [
+					`.claude/skills/${token}/SKILL.md`,
+					`Skill definition ${index}\n`,
+				]),
+			),
+		);
+		const bundle = await collectLocalContextBundle(
+			directory,
+			{ ...getDefaultLocalContextCollectionOptions(), capturePolicy },
+			createLocalContextSourceEnv(),
+		);
+		expect(bundle.manifest.contextIndex.skills).toHaveLength(2);
+		const names = tokens.map(filterContextMetadata);
+		expect(new Set(names).size).toBe(2);
+		for (const name of names) {
+			const path = `.claude/skills/${name}/SKILL.md`;
+			expect(fileEntry(bundle, "repository", path).parentPath).toBe(
+				`.claude/skills/${name}`,
+			);
+			expect(
+				bundle.manifest.contextIndex.skills.find((skill) => skill.name === name)
+					?.definitions,
+			).toMatchObject([{ rootId: "repository", path }]);
+		}
+		const upload = await buildTestUpload(bundle, {
+			content: `${JSON.stringify({
+				type: "response_item",
+				payload: {
+					type: "function_call",
+					name: "Skill",
+					arguments: JSON.stringify({ skill: tokens[0] }),
+				},
+			})}\n`,
+		});
+		const object = upload.objects.get(upload.input.manifestObjectId);
+		if (!object) throw new Error("Missing manifest object");
+		const wireManifest = new TextDecoder().decode(object.bytes);
+		for (const token of tokens) expect(wireManifest).not.toContain(token);
+		const manifest = JSON.parse(wireManifest);
+		expect(manifest.contextIndex.skills).toHaveLength(2);
+		expect(manifest.contextIndex.skills).toContainEqual(
+			expect.objectContaining({
+				name: names[0],
+				use: expect.objectContaining({ status: "observed-used" }),
+			}),
+		);
+		expect(manifest.contextIndex.skills).toContainEqual(
+			expect.objectContaining({
+				name: names[1],
+				use: expect.objectContaining({ status: "unknown" }),
+			}),
+		);
+		const indexed = buildRepositoryEvidenceIndexRow(
+			upload.input,
+			manifest,
+			new Date("2026-10-01T00:00:00Z"),
+			"fixture-user",
+		);
+		expect(indexed.available_skills).toHaveLength(2);
+		expect([...indexed.available_skills].sort()).toEqual([...names].sort());
 	},
 );
 

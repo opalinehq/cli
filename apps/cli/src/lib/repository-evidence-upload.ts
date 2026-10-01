@@ -200,7 +200,7 @@ export function buildRepositoryEvidenceUpload(
 			repository: {
 				local: input.context.localIdentity,
 				provider: null,
-				remoteHint: input.context.remoteHint,
+				remoteHint: filterContextMetadata(input.context.remoteHint),
 			},
 			session: {
 				agentId: null,
