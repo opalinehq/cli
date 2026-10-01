@@ -63,12 +63,12 @@ export async function withConfigLock<TResult>(
 	}
 }
 
-// Runs the operation only when the lock is free now. Returns false and skips
-// the operation when another process holds the lock.
+// Runs the operation only when the lock is free now. Skips the operation
+// when another process holds the lock.
 export function tryWithConfigLockSync(
 	configDir: string,
 	operation: () => void,
-): boolean {
+): void {
 	const directory = join(configDir, ".auto-upload-lock");
 	const owner = `${process.pid}-${randomUUID()}`;
 	const prepared = join(configDir, `.auto-upload-lock-${owner}`);
@@ -78,13 +78,11 @@ export function tryWithConfigLockSync(
 		try {
 			renameSync(prepared, directory);
 		} catch (error) {
-			if (hasCode(error, "EEXIST", "ENOTEMPTY", "EACCES", "EPERM"))
-				return false;
+			if (hasCode(error, "EEXIST", "ENOTEMPTY", "EACCES", "EPERM")) return;
 			throw error;
 		}
 		try {
 			operation();
-			return true;
 		} finally {
 			unlinkSync(join(directory, owner));
 			removeEmptyDirectorySync(directory);

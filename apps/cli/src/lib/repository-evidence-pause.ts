@@ -28,9 +28,9 @@ export function readRepositoryEvidencePauseUntil(
 	// A pause writer holds the config lock between its read and its rename.
 	// Remove a stale marker only under that lock, so that the reader cannot
 	// delete a marker that a writer published after this read.
-	return readPauseMarker(configDir, now, (remove) => {
-		tryWithConfigLockSync(configDir, remove);
-	});
+	return readPauseMarker(configDir, now, (remove) =>
+		tryWithConfigLockSync(configDir, remove),
+	);
 }
 
 function readPauseMarker(
