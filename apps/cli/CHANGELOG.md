@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.11.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.10.0...opaline-cli@0.11.0) (2026-10-01)
+
+
+### Features
+
+* add automatic repository sidecar capture ([#494](https://github.com/opalinehq/cli/issues/494)) ([7aeb5b2](https://github.com/opalinehq/cli/commit/7aeb5b22136538e24dc04fa3094b0d8c6288e377))
+
+### What's new in automatic uploads
+
+In repositories linked to an Opaline workspace, automatic uploads now also send a small amount of repository context with each session, so your team can see which instructions, skills and changes a session worked with.
+
+- **Sent as content** (secret-filtered, at most 2 MiB per capture, unchanged files are not re-sent): repository instruction files such as `AGENTS.md` and `CLAUDE.md`, `SKILL.md` files of skills used in the session, agent definitions, and the uncommitted git diff of tracked files.
+- **Sent as path, size and hash only:** all other files, including source code, package manifests, unused skills, `*.local.md`, MCP configs and agent settings.
+- **Never read:** `.env*`, `.envrc`, `.dev.vars`, `secrets.*`, `*.tfvars`, `*.tfstate`, credential files and private keys. Dependency, build and cache directories are not scanned.
+
+Transcript uploads work exactly as before. Repositories that are not linked to a workspace are not captured.
+
 ## [0.10.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.9.0...opaline-cli@0.10.0) (2026-09-18)
 
 
