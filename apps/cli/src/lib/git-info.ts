@@ -2,7 +2,6 @@ import { existsSync, readFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { exec } from "./exec.js";
-import { readRepositoryEvidencePauseUntil } from "./repository-evidence-pause.js";
 
 export interface GitInfo {
 	repositoryRoot?: string;
@@ -28,8 +27,6 @@ export function normalizeRemoteUrl(url: string): string {
  * Extract git metadata for a given project directory.
  */
 export async function getGitInfo(cwd: string): Promise<GitInfo> {
-	if (readRepositoryEvidencePauseUntil() !== undefined)
-		return readGitInfoFromFiles(cwd);
 	const repositoryRoot = await getRepositoryRoot(cwd);
 	const [remoteUrl, branch, sha, packageInfo] = await Promise.all([
 		getGitRemoteUrl(repositoryRoot ?? cwd),
@@ -48,69 +45,6 @@ export async function getGitInfo(cwd: string): Promise<GitInfo> {
 		branch: branch ?? undefined,
 		sha: sha ?? undefined,
 	};
-}
-
-function readGitInfoFromFiles(cwd: string): GitInfo {
-	let root = resolve(cwd);
-	while (!existsSync(join(root, ".git"))) {
-		const parent = dirname(root);
-		if (parent === root) return {};
-		root = parent;
-	}
-	try {
-		const marker = join(root, ".git");
-		const pointer =
-			readOptionalGitFile(marker)?.match(/^gitdir:\s*(.+)$/mu)?.[1];
-		const gitDir = pointer ? resolve(root, pointer.trim()) : marker;
-		const commonPointer = readOptionalGitFile(join(gitDir, "commondir"));
-		const commonDir = commonPointer
-			? resolve(gitDir, commonPointer.trim())
-			: gitDir;
-		const repositoryRoot =
-			basename(commonDir) === ".git" ? dirname(commonDir) : root;
-		const config = readOptionalGitFile(join(commonDir, "config")) ?? "";
-		const origin = config.match(/\[remote\s+"origin"\]([^[]*)/u)?.[1];
-		const remote = origin?.match(/^\s*url\s*=\s*(.+)$/mu)?.[1]?.trim();
-		const head = readOptionalGitFile(join(gitDir, "HEAD"))?.trim();
-		const ref = head?.startsWith("ref: ") ? head.slice(5) : undefined;
-		const packed = readOptionalGitFile(join(commonDir, "packed-refs")) ?? "";
-		const sha = ref
-			? (readOptionalGitFile(join(commonDir, ref))?.trim() ??
-				packed
-					.split("\n")
-					.find((line) => line.endsWith(` ${ref}`))
-					?.split(" ")[0])
-			: head;
-		const packageInfo =
-			getNodePackage(repositoryRoot) ??
-			getPythonPackage(repositoryRoot) ??
-			getRustPackage(repositoryRoot) ??
-			getGoModule(repositoryRoot);
-		return {
-			repositoryRoot,
-			gitRemote: remote
-				? normalizeRemoteUrl(remote.replace(/^"(.*)"$/u, "$1"))
-				: undefined,
-			branch: ref?.startsWith("refs/heads/")
-				? ref.slice(11)
-				: head
-					? "HEAD"
-					: undefined,
-			sha: sha && /^[a-f0-9]{40,64}$/u.test(sha) ? sha : undefined,
-			packageName: packageInfo?.name,
-			packageType: packageInfo?.type,
-		};
-	} catch {
-		return { repositoryRoot: root };
-	}
-}
-
-function readOptionalGitFile(path: string): string | undefined {
-	try {
-		return readFileSync(path, "utf8");
-	} catch {
-		return undefined;
-	}
 }
 
 /** Discovery omits branch/SHA, but retains package names for legacy setting keys. */

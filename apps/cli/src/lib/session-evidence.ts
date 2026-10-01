@@ -238,9 +238,12 @@ export async function captureAndUploadSessionEvidence(input: {
 		};
 	} catch (error) {
 		if (isEvidenceCaptureDisabledError(error)) {
-			pauseRepositoryEvidenceCapture(error, configDir);
-			if (currentPending)
-				await discardDisabledCapture(currentPending, configDir);
+			await handleDisabledCapture(
+				error,
+				currentPending,
+				configDir,
+				input.onWarning,
+			);
 			return undefined;
 		}
 		throw error;
@@ -313,8 +316,12 @@ export async function retryPendingSessionEvidence(
 			completed++;
 		} catch (error) {
 			if (isEvidenceCaptureDisabledError(error)) {
-				pauseRepositoryEvidenceCapture(error, configDir);
-				await discardDisabledCapture(pending, configDir);
+				await handleDisabledCapture(
+					error,
+					pending,
+					configDir,
+					options.onWarning,
+				);
 				break;
 			}
 			failures.push(error);
@@ -369,8 +376,7 @@ async function retryOnePendingRepositoryEvidence(
 			await continueAcceptedTranscript(pending, configDir);
 		} catch (error) {
 			if (isEvidenceCaptureDisabledError(error)) {
-				pauseRepositoryEvidenceCapture(error, configDir);
-				await discardDisabledCapture(pending, configDir);
+				await handleDisabledCapture(error, pending, configDir, onWarning);
 				return undefined;
 			}
 			if (error instanceof RepositoryAutoUploadDisabledError) continue;
@@ -419,26 +425,54 @@ async function markPendingRepositoryCaptureAccepted(
 	);
 }
 
-async function discardDisabledCapture(
-	pending: PendingRepositoryEvidence,
+async function handleDisabledCapture(
+	error: Parameters<typeof pauseRepositoryEvidenceCapture>[0],
+	pending: PendingRepositoryEvidence | undefined,
 	configDir: string,
+	onWarning: ((message: string) => void) | undefined,
 ): Promise<void> {
-	await removePendingRepositoryEvidence(pending, configDir);
-	if (pending.continuation)
-		await rm(transcriptSourcePath(configDir, pending.continuation.sourceId), {
-			force: true,
-		});
-	const binding = await createRepositorySpoolBinding({
-		accountId: pending.transcriptRevision.scope.actorId,
-		apiBaseUrl: pending.endpoint,
-		localIdentity: pending.upload.input.repository.local,
-		workspaceId: pending.upload.input.organizationId,
-	});
-	await removeRepositorySpoolCapture(
-		binding,
-		pending.upload.input.capture.contextId,
-		createRepositorySpoolEnv(configDir),
-	);
+	try {
+		await pauseRepositoryEvidenceCapture(error, configDir);
+	} catch (persistenceError) {
+		onWarning?.(
+			`Could not persist repository evidence pause: ${String(persistenceError)}`,
+		);
+	} finally {
+		if (pending) {
+			const cleanups = [
+				() => removePendingRepositoryEvidence(pending, configDir),
+				async () => {
+					if (pending.continuation)
+						await rm(
+							transcriptSourcePath(configDir, pending.continuation.sourceId),
+							{ force: true },
+						);
+				},
+				async () => {
+					const binding = await createRepositorySpoolBinding({
+						accountId: pending.transcriptRevision.scope.actorId,
+						apiBaseUrl: pending.endpoint,
+						localIdentity: pending.upload.input.repository.local,
+						workspaceId: pending.upload.input.organizationId,
+					});
+					await removeRepositorySpoolCapture(
+						binding,
+						pending.upload.input.capture.contextId,
+						createRepositorySpoolEnv(configDir),
+					);
+				},
+			];
+			for (const cleanup of cleanups) {
+				try {
+					await cleanup();
+				} catch (cleanupError) {
+					onWarning?.(
+						`Could not discard disabled repository evidence capture: ${String(cleanupError)}`,
+					);
+				}
+			}
+		}
+	}
 }
 
 async function uploadWithBoundedRetries(
@@ -476,10 +510,7 @@ async function uploadWithBoundedRetries(
 			});
 		} catch (error) {
 			lastError = error;
-			if (isEvidenceCaptureDisabledError(error)) {
-				pauseRepositoryEvidenceCapture(error);
-				throw error;
-			}
+			if (isEvidenceCaptureDisabledError(error)) throw error;
 			if (!isRetryableRepositoryEvidenceError(error) || attempt === 3) break;
 			const retryDelayMs = overrides.deadlineAt
 				? Math.min(attempt * 100, overrides.deadlineAt - Date.now())

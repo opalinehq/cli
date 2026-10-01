@@ -7,9 +7,8 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { exec } from "./exec.js";
-import { getGitInfo, normalizeRemoteUrl } from "./git-info.js";
+import { normalizeRemoteUrl } from "./git-info.js";
 import { getConfigDir } from "./local-state.js";
-import { readRepositoryEvidencePauseUntil } from "./repository-evidence-pause.js";
 
 interface ProjectEntry {
 	organizationId: string;
@@ -42,10 +41,6 @@ function saveProjectsConfig(config: ProjectsConfig): void {
 }
 
 async function getProjectKey(cwd: string): Promise<string> {
-	if (readRepositoryEvidencePauseUntil() !== undefined) {
-		const info = await getGitInfo(cwd);
-		return info.gitRemote ?? info.repositoryRoot ?? cwd;
-	}
 	// Prefer git remote URL (portable across clones)
 	try {
 		const result = await exec("git", [

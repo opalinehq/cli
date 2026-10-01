@@ -7,6 +7,7 @@ import {
 	mkdtemp,
 	readdir,
 	readFile,
+	realpath,
 	rm,
 	stat,
 	writeFile,
@@ -39,7 +40,7 @@ test.each([
 	async (pauseSeconds, seconds) => {
 		const directory = await mkdtemp(join(tmpdir(), "opaline-pause-"));
 		try {
-			pauseRepositoryEvidenceCapture(
+			await pauseRepositoryEvidenceCapture(
 				new ORPCError("EVIDENCE_CAPTURE_DISABLED", {
 					status: 403,
 					data: { pauseSeconds },
@@ -51,12 +52,12 @@ test.each([
 				1_000 + seconds * 1_000,
 			);
 			expect(
-				readRepositoryEvidencePauseUntil(directory, 1_000 + seconds * 1_000),
-			).toBeUndefined();
-			expect(
 				(await stat(join(directory, "repository-evidence-pause.json"))).mode &
 					0o777,
 			).toBe(0o600);
+			expect(
+				readRepositoryEvidencePauseUntil(directory, 1_000 + seconds * 1_000),
+			).toBeUndefined();
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}
@@ -117,14 +118,14 @@ test.each(["init", "commit"])(
 );
 
 test.each(HOOK_CASES)(
-	"$name uploads transcripts while paused with zero git commands or evidence writes",
+	"$name uploads transcripts while paused without repository capture commands or evidence writes",
 	async (hook) => {
 		const fixture = await createCliFixture(hook.source);
 		const stub = startEvidenceStub("EVIDENCE_CAPTURE_DISABLED");
 		try {
 			await prepareEvidenceFixture(fixture, stub.loopbackBase);
 			const config = join(fixture.home, ".rudel");
-			pauseRepositoryEvidenceCapture(
+			await pauseRepositoryEvidenceCapture(
 				new ORPCError("EVIDENCE_CAPTURE_DISABLED", { status: 403 }),
 				config,
 			);
@@ -134,7 +135,7 @@ test.each(HOOK_CASES)(
 			await writeFile(calls, "");
 			await writeFile(
 				join(bin, "git"),
-				`#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\nexit 99\n`,
+				`#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\nexec '${execFileSync("which", ["git"], { encoding: "utf8" }).trim()}' "$@"\n`,
 			);
 			await chmod(join(bin, "git"), 0o700);
 			const invocation = hook.buildInvocation(fixture);
@@ -143,7 +144,9 @@ test.each(HOOK_CASES)(
 				env: { PATH: `${bin}:${process.env.PATH}` },
 			});
 			expect(result.exitCode).toBe(0);
-			expect(await readFile(calls, "utf8")).toBe("");
+			const commands = await readFile(calls, "utf8");
+			expect(commands).toContain("remote get-url origin");
+			expect(commands).not.toMatch(/\b(diff|ls-files|status)\b/u);
 			expect(
 				stub.requests.some(
 					(request) => request.pathname === "/rpc/ingestSession",
@@ -172,7 +175,7 @@ test.each(HOOK_CASES)(
 					},
 				);
 				expect(start.exitCode).toBe(0);
-				expect(await readFile(calls, "utf8")).toBe("");
+				expect(await readFile(calls, "utf8")).toBe(commands);
 			}
 		} finally {
 			stub.server.stop(true);
@@ -180,6 +183,224 @@ test.each(HOOK_CASES)(
 		}
 	},
 );
+
+test.each(
+	HOOK_CASES.flatMap((hook) =>
+		["non-git", "rewritten-remote", "remote-less-worktree"].map((kind) => ({
+			hook,
+			kind,
+			name: `${hook.name}: ${kind}`,
+		})),
+	),
+)(
+	"$name preserves identical transcript identity and workspace binding while paused",
+	async ({ hook, kind }) => {
+		const original = await createCliFixture(hook.source);
+		let fixture = original;
+		const stub = startEvidenceStub("");
+		try {
+			await prepareEvidenceFixture(fixture, stub.loopbackBase);
+			let repoKey = "remote:github.com/opaline-test/pause";
+			let projectKey = "github.com/opaline-test/pause";
+			if (kind === "non-git") {
+				await rm(join(fixture.projectPath, ".git"), { recursive: true });
+				await writeFile(
+					join(fixture.projectPath, "package.json"),
+					JSON.stringify({ name: "my-project" }),
+				);
+				repoKey = "pkg:my-project";
+				projectKey = fixture.projectPath;
+			} else if (kind === "rewritten-remote") {
+				execFileSync("git", [
+					"-C",
+					fixture.projectPath,
+					"remote",
+					"set-url",
+					"origin",
+					"pause:opaline-test/pause.git",
+				]);
+				execFileSync("git", [
+					"-C",
+					fixture.projectPath,
+					"config",
+					"url.https://github.com/.insteadOf",
+					"pause:",
+				]);
+			} else {
+				execFileSync("git", [
+					"-C",
+					fixture.projectPath,
+					"remote",
+					"remove",
+					"origin",
+				]);
+				execFileSync("git", [
+					"-C",
+					fixture.projectPath,
+					"-c",
+					"user.name=Test",
+					"-c",
+					"user.email=test@example.test",
+					"commit",
+					"--quiet",
+					"--allow-empty",
+					"-m",
+					"fixture",
+				]);
+				const worktree = join(fixture.home, "linked");
+				execFileSync("git", [
+					"-C",
+					fixture.projectPath,
+					"worktree",
+					"add",
+					"--quiet",
+					"-b",
+					"linked",
+					worktree,
+				]);
+				repoKey = `path-raw:${await realpath(fixture.projectPath)}`;
+				projectKey = await realpath(worktree);
+				fixture = { ...fixture, projectPath: projectKey };
+			}
+			const config = join(fixture.home, ".rudel");
+			await writeFile(
+				join(config, "projects.json"),
+				JSON.stringify({
+					projects: { [projectKey]: { organizationId: "org" } },
+				}),
+			);
+			await writeFile(
+				join(config, "auto-upload.json"),
+				JSON.stringify({
+					version: 1,
+					repositories: { [repoKey]: { label: kind, sources: [hook.source] } },
+				}),
+			);
+			const invocation = hook.buildInvocation(fixture);
+			expect(
+				(await runCli(invocation.command, fixture, { stdin: invocation.stdin }))
+					.exitCode,
+			).toBe(0);
+			const transcripts = () =>
+				stub.bodies.filter(
+					(_, index) => stub.requests[index]?.pathname === "/rpc/ingestSession",
+				);
+			expect(transcripts()).toHaveLength(1);
+			expect(JSON.parse(transcripts()[0] ?? "").json.organizationId).toBe(
+				"org",
+			);
+			await pauseRepositoryEvidenceCapture(
+				new ORPCError("EVIDENCE_CAPTURE_DISABLED", { status: 403 }),
+				config,
+			);
+			const evidenceCount = stub.requests.filter((request) =>
+				request.pathname.includes("repositoryEvidence"),
+			).length;
+			expect(
+				(await runCli(invocation.command, fixture, { stdin: invocation.stdin }))
+					.exitCode,
+			).toBe(0);
+			expect(transcripts()).toHaveLength(2);
+			expect(transcripts()[1]).toBe(transcripts()[0]);
+			expect(
+				stub.requests.filter((request) =>
+					request.pathname.includes("repositoryEvidence"),
+				),
+			).toHaveLength(evidenceCount);
+		} finally {
+			stub.server.stop(true);
+			await rm(original.home, { recursive: true, force: true });
+		}
+	},
+);
+
+test.each(["init", "commit"])(
+	"an unwritable config directory warns but still discards disabled %s evidence",
+	async (stage) => {
+		const fixture = await createCliFixture("claude_code");
+		const config = join(fixture.home, ".rudel");
+		const stub = startEvidenceStub("EVIDENCE_CAPTURE_DISABLED", stage, () =>
+			chmod(config, 0o500),
+		);
+		try {
+			await prepareEvidenceFixture(fixture, stub.loopbackBase);
+			expect((await runHook(fixture)).exitCode).toBe(0);
+			expect(
+				stub.requests.filter((request) =>
+					request.pathname.endsWith(`repositoryEvidence/${stage}`),
+				),
+			).toHaveLength(1);
+			expect(
+				stub.requests.some(
+					(request) => request.pathname === "/rpc/ingestSession",
+				),
+			).toBe(true);
+			expect(
+				await readdir(join(config, "repository-evidence-pending", "v4")),
+			).toEqual([]);
+			expect(
+				await readdir(join(config, "repository-evidence-sources")),
+			).toEqual([]);
+			const spool = await readdir(join(config, "repo-context-spool"), {
+				recursive: true,
+			});
+			expect(
+				spool.filter(
+					(name) => name.endsWith(".capture.json") || name.endsWith(".blob"),
+				),
+			).toEqual([]);
+			expect(
+				await readFile(join(config, "logs", "hook-upload.log"), "utf8"),
+			).toContain("Could not persist repository evidence pause");
+			expect(readRepositoryEvidencePauseUntil(config)).toBeUndefined();
+		} finally {
+			await chmod(config, 0o700);
+			stub.server.stop(true);
+			await rm(fixture.home, { recursive: true, force: true });
+		}
+	},
+);
+
+test("a disabled pending retry still discards its evidence when the config directory becomes unwritable", async () => {
+	const fixture = await createCliFixture("claude_code");
+	const config = join(fixture.home, ".rudel");
+	let code = "FUTURE_UNKNOWN_ERROR";
+	const stub = startEvidenceStub(
+		() => code,
+		"init",
+		async () => {
+			if (code === "EVIDENCE_CAPTURE_DISABLED") await chmod(config, 0o500);
+		},
+	);
+	try {
+		await prepareEvidenceFixture(fixture, stub.loopbackBase);
+		expect((await runHook(fixture)).exitCode).toBe(0);
+		const pendingDir = join(config, "repository-evidence-pending", "v4");
+		expect(await readdir(pendingDir)).toHaveLength(1);
+		code = "EVIDENCE_CAPTURE_DISABLED";
+		const result = await runCli(["upload", "--retry"], fixture);
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toContain(
+			"Could not persist repository evidence pause",
+		);
+		expect(await readdir(pendingDir)).toEqual([]);
+		expect(await readdir(join(config, "repository-evidence-sources"))).toEqual(
+			[],
+		);
+		const spool = await readdir(join(config, "repo-context-spool"), {
+			recursive: true,
+		});
+		expect(
+			spool.filter(
+				(name) => name.endsWith(".capture.json") || name.endsWith(".blob"),
+			),
+		).toEqual([]);
+	} finally {
+		await chmod(config, 0o700);
+		stub.server.stop(true);
+		await rm(fixture.home, { recursive: true, force: true });
+	}
+});
 
 test("an unknown code defers as before; paused pending captures are unchanged, then resume on expiry", async () => {
 	const fixture = await createCliFixture("claude_code");
@@ -199,7 +420,7 @@ test("an unknown code defers as before; paused pending captures are unchanged, t
 			await readdir(join(config, "repository-evidence-sources")),
 		).toHaveLength(2);
 		expect(readRepositoryEvidencePauseUntil(config)).toBeUndefined();
-		pauseRepositoryEvidenceCapture(
+		await pauseRepositoryEvidenceCapture(
 			new ORPCError("EVIDENCE_CAPTURE_DISABLED", { status: 403 }),
 			config,
 		);
@@ -303,14 +524,19 @@ function runHook(fixture: CliFixture) {
 	});
 }
 
-function startEvidenceStub(code: string | (() => string), stage = "init") {
+function startEvidenceStub(
+	code: string | (() => string),
+	stage = "init",
+	onDisabled?: () => Promise<void>,
+) {
 	let latest:
 		| ReturnType<typeof RepositoryEvidenceInitInputSchema.parse>
 		| undefined;
 	return startIngestStub({
-		respond({ pathname, body }) {
+		async respond({ pathname, body }) {
 			const errorCode = typeof code === "string" ? code : code();
-			if (errorCode && pathname.endsWith(`repositoryEvidence/${stage}`))
+			if (errorCode && pathname.endsWith(`repositoryEvidence/${stage}`)) {
+				await onDisabled?.();
 				return Response.json(
 					{
 						json: {
@@ -323,6 +549,7 @@ function startEvidenceStub(code: string | (() => string), stage = "init") {
 					},
 					{ status: 403 },
 				);
+			}
 			if (pathname.endsWith("repositoryEvidence/init")) {
 				const input = RepositoryEvidenceInitInputSchema.parse(
 					JSON.parse(body).json,
