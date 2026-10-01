@@ -71,6 +71,7 @@ import { allowsInsecureEndpointFromEnv } from "./upload-endpoint.js";
 type EvidenceLifecycle = "start" | "resume" | "checkpoint" | "end";
 
 const EVIDENCE_DELIVERY_BUDGET_MS = 20_000;
+const DISABLED_CLEANUP_LOCK_WAIT_MS = 2_000;
 export const EVIDENCE_TRANSCRIPT_INPUT_MAX_BYTES = 32 * 1024 * 1024;
 
 export async function captureAndUploadSessionEvidence(input: {
@@ -243,6 +244,7 @@ export async function captureAndUploadSessionEvidence(input: {
 				currentPending,
 				configDir,
 				input.onWarning,
+				deadlineAt,
 			);
 			return undefined;
 		}
@@ -376,7 +378,13 @@ async function retryOnePendingRepositoryEvidence(
 			await continueAcceptedTranscript(pending, configDir);
 		} catch (error) {
 			if (isEvidenceCaptureDisabledError(error)) {
-				await handleDisabledCapture(error, pending, configDir, onWarning);
+				await handleDisabledCapture(
+					error,
+					pending,
+					configDir,
+					onWarning,
+					deadlineAt,
+				);
 				return undefined;
 			}
 			if (error instanceof RepositoryAutoUploadDisabledError) continue;
@@ -430,6 +438,7 @@ async function handleDisabledCapture(
 	pending: PendingRepositoryEvidence | undefined,
 	configDir: string,
 	onWarning: ((message: string) => void) | undefined,
+	deadlineAt?: number,
 ): Promise<void> {
 	try {
 		await pauseRepositoryEvidenceCapture(error, configDir);
@@ -455,10 +464,19 @@ async function handleDisabledCapture(
 						localIdentity: pending.upload.input.repository.local,
 						workspaceId: pending.upload.input.organizationId,
 					});
+					const env = createRepositorySpoolEnv(configDir);
 					await removeRepositorySpoolCapture(
 						binding,
 						pending.upload.input.capture.contextId,
-						createRepositorySpoolEnv(configDir),
+						deadlineAt === undefined
+							? env
+							: {
+									...env,
+									writeLockTimeoutMs: Math.min(
+										DISABLED_CLEANUP_LOCK_WAIT_MS,
+										Math.max(0, deadlineAt - Date.now()),
+									),
+								},
 					);
 				},
 			];
