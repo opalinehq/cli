@@ -18,6 +18,7 @@ import {
 	getLegacyRepositoryKey,
 	resolveUploadRepositoryIdentity,
 } from "../../../lib/repository-discovery.js";
+import { captureAndUploadSessionEvidence } from "../../../lib/session-evidence.js";
 import { allowsInsecureEndpointFromEnv } from "../../../lib/upload-endpoint.js";
 import {
 	formatRedactionSummary,
@@ -64,6 +65,7 @@ async function runTurnComplete(
 
 		const input = parseNotification(notification);
 		if (!input) return;
+		const hookReceivedAt = new Date().toISOString();
 		const gitInfo = await getGitInfo(input.cwd);
 		const repository = resolveUploadRepositoryIdentity(input.cwd, gitInfo);
 		if (
@@ -110,6 +112,29 @@ async function runTurnComplete(
 			organizationId,
 			uploadMode: "hook",
 		});
+		const evidenceUpload = organizationId
+			? captureAndUploadSessionEvidence({
+					credentials,
+					hookReceivedAt,
+					lifecycle: "checkpoint",
+					onWarning: (warning) => logger.warn("{warning}", { warning }),
+					organizationId,
+					request,
+					terminalTranscript: false,
+				})
+					.then((receipt) => {
+						if (!receipt) return;
+						logger.info(
+							"Repository evidence accepted for context {contextId}",
+							{ contextId: receipt.contextId },
+						);
+					})
+					.catch((error: unknown) => {
+						logger.warn("Repository evidence capture deferred: {error}", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					})
+			: Promise.resolve();
 
 		const apiBase = getApiBaseOverride() ?? credentials.apiBaseUrl;
 		const endpoint = `${apiBase}/rpc`;
@@ -119,6 +144,7 @@ async function runTurnComplete(
 			allowInsecureEndpoint: allowsInsecureEndpointFromEnv(),
 			authType: credentials.authType,
 		});
+		await evidenceUpload;
 
 		if (result.success) {
 			const redactionSummary = formatRedactionSummary(

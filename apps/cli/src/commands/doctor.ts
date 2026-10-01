@@ -8,6 +8,7 @@ import { getDefaultApiBase } from "../lib/api-target.js";
 import { type Credentials, loadCredentials } from "../lib/credentials.js";
 import { debugLog } from "../lib/debug.js";
 import { getConfigPathInfo } from "../lib/local-state.js";
+import { readRepositoryEvidencePauseUntil } from "../lib/repository-evidence-pause.js";
 
 const CHECK_TIMEOUT_MS = 5_000;
 const NPM_REGISTRY_BASE = "https://registry.npmjs.org";
@@ -42,6 +43,11 @@ export async function runDoctor(): Promise<void> {
 	const checks = [auth, api, config.check, version, hooks];
 
 	process.stdout.write("Opaline doctor\n");
+	const pauseUntil = readRepositoryEvidencePauseUntil();
+	if (pauseUntil !== undefined)
+		process.stdout.write(
+			`[warn] Repository evidence: server-paused until ${new Date(pauseUntil).toISOString()}; transcript uploads continue.\n`,
+		);
 	for (const check of checks) {
 		process.stdout.write(`[${check.status}] ${check.label}: ${check.detail}\n`);
 	}

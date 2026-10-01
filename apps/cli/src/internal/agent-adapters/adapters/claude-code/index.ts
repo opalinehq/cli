@@ -1,13 +1,25 @@
-import { readdir, readFile, realpath, stat } from "node:fs/promises";
+import {
+	lstat,
+	opendir,
+	readdir,
+	readFile,
+	realpath,
+	stat,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import pMap from "p-map";
+import {
+	INGEST_AGGREGATE_CONTENT_MAX_BYTES,
+	INGEST_MAX_SUBAGENT_COUNT,
+} from "../../../../contracts/ingest.js";
 import { scanBoundedJsonlFile } from "../../bounded-jsonl-scan.js";
 import { MissingTranscriptTimestampError } from "../../errors.js";
 import type {
 	AgentAdapter,
 	FileBackedUploadRequest,
 	FileBackedUploadSubagent,
+	FileBackedUploadSubagentDiscovery,
 	HookOptions,
 	ScannedProject,
 	SessionFile,
@@ -25,6 +37,8 @@ import {
 } from "./settings.js";
 
 const SAFE_BASENAME_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
+const SUBAGENT_FILENAME_PATTERN = /^agent-([A-Za-z0-9_-]{1,200})\.jsonl$/u;
+const MAX_SUBAGENT_DIRECTORY_ENTRIES = 4_096;
 
 // ── Exported utilities ──
 
@@ -106,31 +120,9 @@ interface SubagentFile {
 	content: string;
 }
 
-async function resolveSubagentFilePaths(
-	sessionDir: string,
-	agentIds: string[],
-	sessionId?: string,
-): Promise<FileBackedUploadSubagent[]> {
-	const subagents: FileBackedUploadSubagent[] = [];
-	const subagentDirs = await resolveSubagentDirectories(sessionDir, sessionId);
-
-	for (const agentId of agentIds) {
-		if (!isSafeBasename(agentId)) continue;
-
-		for (const subagentDir of subagentDirs) {
-			let agentPath: string;
-			try {
-				agentPath = await realpath(join(subagentDir, `agent-${agentId}.jsonl`));
-			} catch {
-				continue;
-			}
-			if (!isContainedPath(subagentDir, agentPath)) continue;
-			subagents.push({ agentId, path: agentPath });
-			break;
-		}
-	}
-
-	return subagents;
+interface DiscoveredSubagentFiles {
+	discovery: FileBackedUploadSubagentDiscovery;
+	files: FileBackedUploadSubagent[];
 }
 
 async function scanUploadTranscript(path: string): Promise<{
@@ -332,14 +324,11 @@ class ClaudeCodeAdapter implements AgentAdapter {
 		}
 
 		const sessionDir = dirname(session.transcriptPath);
-		const subagents =
-			scan.agentIds.length > 0
-				? await resolveSubagentFilePaths(
-						sessionDir,
-						scan.agentIds,
-						session.sessionId,
-					)
-				: [];
+		const discovered = await discoverClaudeSubagentFiles(
+			sessionDir,
+			session.sessionId,
+			scan.agentIds,
+		);
 
 		return {
 			kind: "file",
@@ -356,7 +345,8 @@ class ClaudeCodeAdapter implements AgentAdapter {
 				organizationId: context.organizationId,
 				upload_mode: context.uploadMode,
 			},
-			subagents,
+			subagentDiscovery: discovered.discovery,
+			subagents: discovered.files,
 			transcriptPath: session.transcriptPath,
 		};
 	}
@@ -439,6 +429,179 @@ class ClaudeCodeAdapter implements AgentAdapter {
 	}
 }
 
+export async function discoverClaudeSubagentFiles(
+	sessionDir: string,
+	sessionId: string,
+	referencedAgentIds: readonly string[] = [],
+): Promise<DiscoveredSubagentFiles> {
+	const resolvedDirectories = await resolveSubagentDirectoriesWithCoverage(
+		sessionDir,
+		sessionId,
+	);
+	const directories = resolvedDirectories.directories;
+	const referenced = [
+		...new Set(referencedAgentIds.filter((agentId) => isSafeBasename(agentId))),
+	];
+	const candidateAgentIds = new Set(referenced);
+	const candidatePaths = new Map<string, string>();
+	const reasons = new Set<string>();
+	let omittedCount = 0;
+	let omissionCountKnown = !resolvedDirectories.unavailable;
+	if (resolvedDirectories.unavailable) {
+		reasons.add("A subagent directory could not be enumerated");
+	}
+	for (const directory of directories) {
+		let handle: Awaited<ReturnType<typeof opendir>>;
+		try {
+			handle = await opendir(directory);
+		} catch {
+			reasons.add("A subagent directory could not be enumerated");
+			omissionCountKnown = false;
+			continue;
+		}
+		let entryCount = 0;
+		for await (const entry of handle) {
+			entryCount += 1;
+			if (entryCount > MAX_SUBAGENT_DIRECTORY_ENTRIES) {
+				reasons.add("Subagent directory entry limit reached");
+				omissionCountKnown = false;
+				break;
+			}
+			const match = SUBAGENT_FILENAME_PATTERN.exec(entry.name);
+			if (!match?.[1]) continue;
+			candidateAgentIds.add(match[1]);
+			if (!candidatePaths.has(match[1])) {
+				candidatePaths.set(match[1], join(directory, entry.name));
+			}
+		}
+	}
+
+	const files: FileBackedUploadSubagent[] = [];
+	let inspectedBytes = 0;
+	let inspectedFileCount = 0;
+	const unreferenced = [...candidateAgentIds]
+		.filter((agentId) => !referenced.includes(agentId))
+		.sort();
+	for (const agentId of [...referenced, ...unreferenced]) {
+		if (inspectedFileCount >= INGEST_MAX_SUBAGENT_COUNT) {
+			omittedCount += 1;
+			reasons.add("Subagent count limit reached");
+			continue;
+		}
+		inspectedFileCount += 1;
+		const path =
+			candidatePaths.get(agentId) ??
+			(await findSubagentPath(directories, agentId));
+		if (!path) {
+			omittedCount += 1;
+			reasons.add("A referenced subagent file was unavailable");
+			continue;
+		}
+		let canonicalPath: string;
+		let fileBytes: number;
+		try {
+			const pathMetadata = await lstat(path);
+			if (pathMetadata.isSymbolicLink()) {
+				throw new Error("Subagent path cannot be a symbolic link");
+			}
+			canonicalPath = await realpath(path);
+			if (
+				!directories.some((directory) =>
+					isContainedPath(directory, canonicalPath),
+				)
+			) {
+				throw new Error("Subagent path escaped its session directory");
+			}
+			const metadata = await stat(canonicalPath);
+			if (!metadata.isFile()) throw new Error("Subagent path is not a file");
+			fileBytes = metadata.size;
+		} catch {
+			omittedCount += 1;
+			reasons.add("A subagent file could not be safely resolved");
+			continue;
+		}
+		if (
+			fileBytes > INGEST_AGGREGATE_CONTENT_MAX_BYTES ||
+			inspectedBytes + fileBytes > INGEST_AGGREGATE_CONTENT_MAX_BYTES
+		) {
+			omittedCount += 1;
+			reasons.add("Subagent byte limit reached");
+			continue;
+		}
+		inspectedBytes += fileBytes;
+		if (
+			!(await hasMatchingClaudeSubagentIdentity(
+				canonicalPath,
+				agentId,
+				sessionId,
+			))
+		) {
+			omittedCount += 1;
+			reasons.add("A subagent filename did not match its native identity");
+			continue;
+		}
+		files.push({ agentId, path: canonicalPath });
+	}
+
+	const reason = reasons.size > 0 ? [...reasons].sort().join("; ") : null;
+	return {
+		discovery: {
+			omittedCount: omissionCountKnown ? omittedCount : null,
+			reason,
+			status: reason === null ? "complete" : "partial",
+		},
+		files,
+	};
+}
+
+async function findSubagentPath(
+	directories: readonly string[],
+	agentId: string,
+): Promise<string | null> {
+	for (const directory of directories) {
+		const candidatePath = join(directory, `agent-${agentId}.jsonl`);
+		try {
+			await stat(candidatePath);
+			return candidatePath;
+		} catch {
+			// Try the next supported Claude subagent layout.
+		}
+	}
+	return null;
+}
+
+async function hasMatchingClaudeSubagentIdentity(
+	path: string,
+	agentId: string,
+	sessionId: string,
+): Promise<boolean> {
+	const identity = await scanBoundedJsonlFile(
+		path,
+		() => ({ conflict: false, matched: false }),
+		(line, state) => {
+			if (!line) return true;
+			let record: unknown;
+			try {
+				record = JSON.parse(line);
+			} catch {
+				return true;
+			}
+			if (!isRecord(record)) return true;
+			if (
+				("agentId" in record && record.agentId !== agentId) ||
+				("sessionId" in record && record.sessionId !== sessionId)
+			) {
+				state.conflict = true;
+			}
+			if (record.agentId === agentId && record.sessionId === sessionId) {
+				state.matched = true;
+			}
+			return true;
+		},
+	);
+	return identity.matched && !identity.conflict;
+}
+
 export const claudeCodeAdapter = new ClaudeCodeAdapter();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -453,16 +616,24 @@ async function resolveSubagentDirectories(
 	sessionDir: string,
 	sessionId: string | undefined,
 ): Promise<string[]> {
+	return (await resolveSubagentDirectoriesWithCoverage(sessionDir, sessionId))
+		.directories;
+}
+
+async function resolveSubagentDirectoriesWithCoverage(
+	sessionDir: string,
+	sessionId: string | undefined,
+): Promise<{ directories: string[]; unavailable: boolean }> {
 	let canonicalSessionDir: string;
 	try {
 		canonicalSessionDir = await realpath(sessionDir);
 	} catch {
-		return [];
+		return { directories: [], unavailable: true };
 	}
 
 	const directories = [canonicalSessionDir];
 	if (!isSafeBasename(sessionId)) {
-		return directories;
+		return { directories, unavailable: false };
 	}
 
 	try {
@@ -472,11 +643,17 @@ async function resolveSubagentDirectories(
 		if (isContainedPath(canonicalSessionDir, nestedDir)) {
 			directories.push(nestedDir);
 		}
-	} catch {
-		// The nested subagent directory is optional.
+	} catch (error) {
+		if (!isMissingPath(error)) {
+			return { directories, unavailable: true };
+		}
 	}
 
-	return directories;
+	return { directories, unavailable: false };
+}
+
+function isMissingPath(error: unknown): boolean {
+	return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
 function isContainedPath(parentPath: string, candidatePath: string): boolean {

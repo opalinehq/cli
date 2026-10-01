@@ -2,6 +2,7 @@ export {
 	claudeCodeAdapter,
 	createClaudeCodeAdapter,
 	decodeProjectPath,
+	discoverClaudeSubagentFiles,
 	extractAgentIds,
 	readSubagentFiles,
 } from "./adapters/claude-code/index.js";
@@ -26,6 +27,7 @@ export type {
 	AgentAdapter,
 	FileBackedUploadRequest,
 	FileBackedUploadSubagent,
+	FileBackedUploadSubagentDiscovery,
 	GitInfo,
 	HookOptions,
 	ScannedProject,

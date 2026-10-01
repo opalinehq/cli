@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { open, writeFile } from "node:fs/promises";
+import { open, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { IngestSessionInput } from "../contracts/index.js";
@@ -66,6 +66,26 @@ interface FilteredFileResult {
 	readonly sha256: string;
 }
 
+export interface FilteredUploadBudget {
+	readonly deadlineAt: number;
+	readonly maxInputBytes: number;
+	readonly maxSources?: number;
+	readonly includeEmptySubagents?: boolean;
+}
+
+interface SourceBudget {
+	readonly limits: FilteredUploadBudget;
+	inputBytes: number;
+}
+
+function checkBudget(budget: SourceBudget | undefined): void {
+	if (!budget) return;
+	if (Date.now() >= budget.limits.deadlineAt)
+		throw new Error("Transcript capture exceeded its time budget.");
+	if (budget.inputBytes > budget.limits.maxInputBytes)
+		throw new Error("Transcript capture exceeded its input budget.");
+}
+
 export function createFilteredUploadSources(
 	request: IngestSessionInput | FileBackedUploadRequest,
 ): FilteredUploadSources {
@@ -92,12 +112,31 @@ export function createFilteredUploadSources(
 
 export async function stageFilteredUpload(
 	sources: FilteredUploadSources,
+	limits?: FilteredUploadBudget,
 ): Promise<StagedFilteredUpload> {
+	const budget = limits ? { limits, inputBytes: 0 } : undefined;
+	checkBudget(budget);
+	if (limits && sources.subagents.length + 1 > (limits.maxSources ?? 256))
+		throw new Error("Transcript capture exceeded its source-count budget.");
+	if (budget) {
+		for (const source of [
+			sources.main,
+			...sources.subagents.map((child) => child.source),
+		]) {
+			checkBudget(budget);
+			budget.inputBytes +=
+				source.kind === "text"
+					? Buffer.byteLength(source.content, "utf8")
+					: (await stat(source.path)).size;
+			checkBudget(budget);
+		}
+		budget.inputBytes = 0;
+	}
 	const directory = await createOwnedR2StagingDirectory(
 		R2_UPLOAD_STAGING_DIRECTORY_PREFIX,
 	);
 	try {
-		return await stageSourcesIntoDirectory(sources, directory);
+		return await stageSourcesIntoDirectory(sources, directory, budget);
 	} catch (error) {
 		await cleanupOwnedR2StagingDirectory(directory);
 		throw error;
@@ -113,8 +152,13 @@ export async function cleanupStagedUpload(
 async function stageSourcesIntoDirectory(
 	sources: FilteredUploadSources,
 	directory: string,
+	budget: SourceBudget | undefined,
 ): Promise<StagedFilteredUpload> {
-	const main = await stageSource(sources.main, join(directory, "main.jsonl"));
+	const main = await stageSource(
+		sources.main,
+		join(directory, "main.jsonl"),
+		budget,
+	);
 	const objects: StagedUploadObject[] = [
 		{
 			byteLength: main.byteLength,
@@ -133,12 +177,13 @@ async function stageSourcesIntoDirectory(
 
 	for (const [index, subagent] of sortedSubagents.entries()) {
 		const path = join(directory, `subagent-${index + 1}.jsonl`);
-		const result = await stageSource(subagent.source, path);
+		const result = await stageSource(subagent.source, path, budget);
 		aggregateBytes += result.byteLength;
 		inputBytes += result.inputBytes;
 		redactedBytes += result.redactedBytes;
 		redactions = mergeRedactionCounts(redactions, result.redactions);
-		if (result.byteLength === 0) continue;
+		if (result.byteLength === 0 && !budget?.limits.includeEmptySubagents)
+			continue;
 		objects.push({
 			agentId: subagent.agentId,
 			byteLength: result.byteLength,
@@ -148,6 +193,7 @@ async function stageSourcesIntoDirectory(
 		});
 	}
 
+	checkBudget(budget);
 	return {
 		aggregateBytes,
 		directory,
@@ -162,17 +208,23 @@ async function stageSourcesIntoDirectory(
 async function stageSource(
 	source: TranscriptSource,
 	destinationPath: string,
+	budget: SourceBudget | undefined,
 ): Promise<FilteredFileResult> {
+	checkBudget(budget);
 	return source.kind === "text"
-		? stageText(source.content, destinationPath)
-		: stageFile(source.path, destinationPath);
+		? stageText(source.content, destinationPath, budget)
+		: stageFile(source.path, destinationPath, budget);
 }
 
 async function stageText(
 	content: string,
 	destinationPath: string,
+	budget: SourceBudget | undefined,
 ): Promise<FilteredFileResult> {
+	if (budget) budget.inputBytes += Buffer.byteLength(content, "utf8");
+	checkBudget(budget);
 	const filtered = filterSessionTextFields({ content, subagents: undefined });
+	checkBudget(budget);
 	const byteLength = Buffer.byteLength(filtered.content, "utf8");
 	await writeFile(destinationPath, filtered.content, {
 		encoding: "utf8",
@@ -191,8 +243,14 @@ async function stageText(
 async function stageFile(
 	sourcePath: string,
 	destinationPath: string,
+	budget: SourceBudget | undefined,
 ): Promise<FilteredFileResult> {
-	const input = createReadStream(sourcePath, { highWaterMark: 64 * 1024 });
+	const input = createReadStream(sourcePath, {
+		highWaterMark: 64 * 1024,
+		signal: budget
+			? AbortSignal.timeout(Math.max(1, budget.limits.deadlineAt - Date.now()))
+			: undefined,
+	});
 	const output = await open(destinationPath, "wx", 0o600);
 	const decoder = new StringDecoder("utf8");
 	const hash = createHash("sha256");
@@ -208,9 +266,12 @@ async function stageFile(
 				throw new Error("Transcript stream produced a non-binary chunk");
 			}
 			inputBytes += chunk.byteLength;
+			if (budget) budget.inputBytes += chunk.byteLength;
+			checkBudget(budget);
 			pending += decoder.write(chunk);
 			let newlineIndex = pending.indexOf("\n");
 			while (newlineIndex >= 0) {
+				checkBudget(budget);
 				const record = pending.slice(0, newlineIndex + 1);
 				pending = pending.slice(newlineIndex + 1);
 				assertRecordWithinLimit(record);
@@ -224,6 +285,7 @@ async function stageFile(
 		}
 
 		pending += decoder.end();
+		checkBudget(budget);
 		if (pending.length > 0) {
 			assertRecordWithinLimit(pending);
 			const result = await filterAndWriteRecord(pending, output, hash);
@@ -232,6 +294,7 @@ async function stageFile(
 			redactions = mergeRedactionCounts(redactions, result.redactions);
 		}
 	} finally {
+		input.destroy();
 		await output.close();
 	}
 

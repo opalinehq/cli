@@ -402,8 +402,14 @@ describe("file-backed transcript scanning", () => {
 			await file.close();
 		}
 		await Promise.all([
-			writeFile(join(tempDir, "agent-before.jsonl"), "{}"),
-			writeFile(join(tempDir, "agent-after.jsonl"), "{}"),
+			writeFile(
+				join(tempDir, "agent-before.jsonl"),
+				JSON.stringify({ agentId: "before", sessionId }),
+			),
+			writeFile(
+				join(tempDir, "agent-after.jsonl"),
+				JSON.stringify({ agentId: "after", sessionId }),
+			),
 		]);
 
 		const request = await claudeCodeAdapter.buildUploadRequest(
@@ -676,7 +682,11 @@ describe("full upload pipeline (dry-run)", () => {
 		// Create subagent files so they get included in the request
 		await writeFile(
 			join(projectDir, "agent-sub-agent-001.jsonl"),
-			SAMPLE_SUBAGENT_CONTENT,
+			JSON.stringify({
+				agentId: "sub-agent-001",
+				sessionId: "cli-test-session",
+				type: "message",
+			}),
 		);
 
 		const cliPath = join(import.meta.dir, "..", "bin", "cli.ts");

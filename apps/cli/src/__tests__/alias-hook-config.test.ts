@@ -109,6 +109,18 @@ for (const command of ["opaline", "rudel"]) {
 			expect(JSON.parse(await readFile(claudePath, "utf8"))).toEqual({
 				permissions: { allow: ["Read"] },
 				hooks: {
+					SessionStart: [
+						{
+							matcher: "",
+							hooks: [
+								{
+									type: "command",
+									command: `${command} hooks claude session-start`,
+									async: true,
+								},
+							],
+						},
+					],
 					SessionEnd: [
 						{ matcher: "", hooks: [{ type: "command", command: "echo keep" }] },
 						{

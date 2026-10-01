@@ -638,7 +638,7 @@ describe("filter provenance", () => {
 			);
 		}
 
-		expect(FILTER_VERSION).toBe(5);
+		expect(FILTER_VERSION).toBe(6);
 		expect(digest.digest("hex")).toBe(OUTPUT_FINGERPRINT);
 	});
 });

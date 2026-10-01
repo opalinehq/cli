@@ -23,6 +23,7 @@ import {
 	filterSessionTextFields,
 	getRedactionBudgetAnomaly,
 	getRedactionCount,
+	MAX_REDACTION_RATIO,
 	mergeRedactionCounts,
 	type RedactionBudgetAnomaly,
 	type RedactionCounts,
@@ -364,7 +365,12 @@ export async function uploadSession(
 	const sourceBytes = isFileBackedUploadRequest(request)
 		? await getFileBackedAggregateBytes(request)
 		: getUploadAggregateBytes(request);
-	const sizeFailure = getUploadSizeFailure(sourceBytes, maxAggregateBytes);
+	const sizeFailure =
+		sourceBytes > LEGACY_MATERIALIZATION_MAX_BYTES &&
+		(isFileBackedUploadRequest(request) ||
+			sourceBytes * (1 - MAX_REDACTION_RATIO) > maxAggregateBytes)
+			? getUploadSizeFailure(sourceBytes, maxAggregateBytes)
+			: undefined;
 	if (sizeFailure) return sizeFailure;
 	config.signal?.throwIfAborted();
 

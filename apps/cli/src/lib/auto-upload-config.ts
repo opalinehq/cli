@@ -90,8 +90,9 @@ export function isRepositoryAutoUploadAllowed(
 	repoKey: string,
 	source: Source,
 	legacyKeys: readonly string[] = [],
+	configDir = getConfigDir(),
 ): boolean {
-	const config = loadAutoUploadConfig();
+	const config = loadAutoUploadConfig(configDir);
 	if (config === null) return true;
 	const canonical = config.repositories[repoKey];
 	const allowed = (entry: RepositoryUploadSetting | undefined) =>

@@ -1,5 +1,6 @@
 import { getLogger } from "@logtape/logtape";
 import { buildCommand } from "@stricli/core";
+import { ensureSessionStartHook } from "../../../internal/agent-adapters/adapters/claude-code/settings.js";
 import {
 	claudeCodeAdapter,
 	type SessionFile,
@@ -15,6 +16,7 @@ import {
 	getLegacyRepositoryKey,
 	resolveUploadRepositoryIdentity,
 } from "../../../lib/repository-discovery.js";
+import { captureAndUploadSessionEvidence } from "../../../lib/session-evidence.js";
 import { allowsInsecureEndpointFromEnv } from "../../../lib/upload-endpoint.js";
 import {
 	formatRedactionSummary,
@@ -46,6 +48,21 @@ async function runSessionEnd(): Promise<undefined | Error> {
 
 		const input = JSON.parse(raw) as HookInput;
 		if (!input.session_id || !input.transcript_path) return;
+		const hookReceivedAt = new Date().toISOString();
+		try {
+			const paths = new Set([
+				claudeCodeAdapter.getHookConfigPath({ global: true }),
+				claudeCodeAdapter.getHookConfigPath({ projectPath: input.cwd }),
+			]);
+			for (const path of paths) {
+				if (ensureSessionStartHook(path))
+					logger.info("Added the missing Claude Code SessionStart hook");
+			}
+		} catch (error) {
+			logger.warn("Could not add the SessionStart hook: {error}", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 		const gitInfo = await getGitInfo(input.cwd);
 		const repository = resolveUploadRepositoryIdentity(input.cwd, gitInfo);
 		if (
@@ -90,6 +107,29 @@ async function runSessionEnd(): Promise<undefined | Error> {
 			organizationId,
 			uploadMode: "hook",
 		});
+		const evidenceUpload = organizationId
+			? captureAndUploadSessionEvidence({
+					credentials,
+					hookReceivedAt,
+					lifecycle: "end",
+					onWarning: (warning) => logger.warn("{warning}", { warning }),
+					organizationId,
+					request,
+					terminalTranscript: true,
+				})
+					.then((receipt) => {
+						if (!receipt) return;
+						logger.info(
+							"Repository evidence accepted for context {contextId}",
+							{ contextId: receipt.contextId },
+						);
+					})
+					.catch((error: unknown) => {
+						logger.warn("Repository evidence capture deferred: {error}", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					})
+			: Promise.resolve();
 
 		const apiBase = getApiBaseOverride() ?? credentials.apiBaseUrl;
 		const endpoint = `${apiBase}/rpc`;
@@ -105,6 +145,7 @@ async function runSessionEnd(): Promise<undefined | Error> {
 				);
 			},
 		});
+		await evidenceUpload;
 
 		if (result.success) {
 			logger.info(

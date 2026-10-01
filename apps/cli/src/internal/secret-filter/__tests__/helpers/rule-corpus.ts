@@ -667,7 +667,7 @@ export const NEAR_MISS_MUTATIONS: readonly NearMissMutation[] = [
 		value: [
 			"-----BEGIN PRIVATE KEY-----",
 			pad("CANARY", 64, "A"),
-			"-----END PRIVATE KEY----",
+			'-----END PRIVATE KEY----"',
 		].join("\n"),
 	},
 	{
@@ -688,7 +688,7 @@ export const NEAR_MISS_MUTATIONS: readonly NearMissMutation[] = [
 		value: [
 			"-----BEGIN PRIVATE KEY-----",
 			pad("CANARY", 44, "A"),
-			"-----END PRIVATE KEY-----",
+			'-----END PRIVATE KEY-----"',
 		].join("\n"),
 	},
 	{

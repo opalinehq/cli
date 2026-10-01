@@ -1,0 +1,6 @@
+{"type":"session_meta","timestamp":"2026-09-29T10:00:00.000Z","payload":{"id":"session-1","cwd":"/repo","model_provider":"openai"}}
+{"type":"response_item","timestamp":"2026-09-29T10:00:01.000Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Read the skills and review the tests."}]}}
+{"type":"response_item","timestamp":"2026-09-29T10:00:02.000Z","payload":{"type":"function_call","name":"exec_command","call_id":"read-testing","arguments":"{\"cmd\":\"cat /repo/.claude/skills/testing-bun/SKILL.md\"}"}}
+{"type":"response_item","timestamp":"2026-09-29T10:00:03.000Z","payload":{"type":"function_call_output","call_id":"read-testing","output":"Process exited with code 0\nFinal output:\n# Testing with Bun\nRun regression tests."}}
+{"type":"response_item","timestamp":"2026-09-29T10:00:04.000Z","payload":{"type":"function_call","name":"exec_command","call_id":"read-review","arguments":"{\"cmd\":\"cat /repo/.codex/skills/code-review/SKILL.md\"}"}}
+{"type":"response_item","timestamp":"2026-09-29T10:00:05.000Z","payload":{"type":"function_call_output","call_id":"read-review","output":"Process exited with code 0\nFinal output:\n# Code review\nCheck the evidence."}}

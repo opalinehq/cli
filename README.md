@@ -66,6 +66,8 @@ The CLI also sends limited usage analytics, including version, operating system,
 
 See [data handling](docs/data-handling.md) for the full disclosure and persistent opt-out settings.
 
+The server can temporarily pause repository-evidence capture without pausing session uploads or changing their project identity and workspace binding. Normal Git metadata lookups continue; only repository-context collection, spool writes and evidence delivery stop. The CLI stores the pause in `repository-evidence-pause.json` under its config directory, leaves other pending captures untouched, and resumes after expiry (24 hours by default, bounded to 1 hour–7 days). Invalid markers are ignored and removed; persistence failures warn without preventing rejected-capture cleanup. `opaline doctor` reports an active pause.
+
 ## Common commands
 
 | Command | What it does |
