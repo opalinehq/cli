@@ -1,3 +1,10 @@
+import {
+	REDACTED,
+	redactCredentialText,
+	sanitizeArgumentList,
+	sanitizeCommandString,
+	sanitizeUrlString,
+} from "./credential-redaction.js";
 import { filterContextMetadata } from "./metadata-filter.js";
 import type {
 	UserAgentConfiguration,
@@ -21,7 +28,6 @@ const MAX_LIST_ITEMS = 200;
 const MAX_SUMMARY_BYTES = 64 * 1024;
 const CREDENTIAL_KEY =
 	/(?:token|secret|passw(?:or)?d|authori[sz]ation|auth|api[-_]?key|cookie|credential|private[-_]?key|session)/iu;
-const REDACTED = "[REDACTED]";
 const MAX_SETTINGS_DEPTH = 8;
 
 export interface AgentConfigurationInputs {
@@ -173,7 +179,7 @@ function summarizeHooks(value: unknown): readonly UserAgentHook[] {
 					event: cleanString(event) ?? "",
 					matcher,
 					type: cleanString(hook.type),
-					command: cleanString(hook.command),
+					command: cleanCommand(hook.command),
 					timeoutSeconds:
 						typeof hook.timeout === "number" && Number.isFinite(hook.timeout)
 							? hook.timeout
@@ -228,7 +234,9 @@ function sanitizeSettings(value: unknown, depth: number): unknown {
 		sanitized[name] =
 			CREDENTIAL_KEY.test(key) && child !== null && typeof child !== "boolean"
 				? REDACTED
-				: sanitizeSettings(child, depth + 1);
+				: /^(?:command|apiKeyHelper)$/u.test(key) && typeof child === "string"
+					? (cleanCommand(child) ?? REDACTED)
+					: sanitizeSettings(child, depth + 1);
 	}
 	return sanitized;
 }
@@ -240,7 +248,7 @@ function summarizeMcpServers(value: unknown): readonly UserAgentMcpServer[] {
 		.slice(0, MAX_LIST_ITEMS)
 		.map(([name, configuration]): UserAgentMcpServer => {
 			const server = asRecord(configuration);
-			const command = cleanString(server?.command);
+			const command = cleanCommand(server?.command);
 			const url = sanitizeUrl(server?.url);
 			const declared = server?.type;
 			return {
@@ -286,46 +294,21 @@ function summarizeFlags(
 	return flags;
 }
 
-/**
- * Command-line arguments: a value following a credential-like flag
- * (`--api-key x`, `--token=x`) is replaced, as is any argument that names a
- * credential with `=`.
- */
 function cleanArguments(value: unknown): readonly string[] {
 	if (!Array.isArray(value)) return [];
-	const cleaned: string[] = [];
-	let redactNext = false;
-	for (const item of value.slice(0, MAX_LIST_ITEMS)) {
-		if (typeof item !== "string") continue;
-		if (redactNext) {
-			cleaned.push(REDACTED);
-			redactNext = false;
-			continue;
-		}
-		const assignment = /^(-{0,2}[^=\s]+)=(.*)$/su.exec(item);
-		if (assignment?.[1] && CREDENTIAL_KEY.test(assignment[1])) {
-			cleaned.push(`${assignment[1]}=${REDACTED}`);
-			continue;
-		}
-		if (/^-{1,2}\S+$/u.test(item) && CREDENTIAL_KEY.test(item))
-			redactNext = true;
-		cleaned.push(truncate(item));
-	}
-	return cleaned;
+	return sanitizeArgumentList(value.slice(0, MAX_LIST_ITEMS)).map(truncate);
 }
 
 function sanitizeUrl(value: unknown): string | null {
 	if (typeof value !== "string" || value.trim().length === 0) return null;
-	try {
-		const url = new URL(value);
-		url.username = "";
-		url.password = "";
-		url.search = "";
-		url.hash = "";
-		return truncate(url.toString());
-	} catch {
-		return REDACTED;
-	}
+	return truncate(sanitizeUrlString(value));
+}
+
+/** A command string sanitized token by token (sanitizeCommandString). */
+function cleanCommand(value: unknown): string | null {
+	return typeof value === "string"
+		? truncate(sanitizeCommandString(value))
+		: null;
 }
 
 function cleanStrings(value: unknown): readonly string[] {
@@ -340,20 +323,13 @@ function cleanString(value: unknown): string | null {
 }
 
 /**
- * Every kept string also loses inline credentials the known-secret rules may
- * not recognize: `Bearer <value>` / `Basic <value>` and `<credential-name>=`
- * or `<credential-name>: <value>` pairs.
+ * Every kept string also loses credentials the known-secret rules may not
+ * recognize (credential assignments with any identifier prefix, credential
+ * flags with `=` or space-separated values, Authorization values,
+ * connection-string passwords, JWTs), then is length-bounded.
  */
 function truncate(value: string): string {
-	const redacted = value
-		.replace(
-			/\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{6,}/giu,
-			`$1$2${REDACTED}`,
-		)
-		.replace(
-			/\b((?:x-)?(?:api[-_]?key|access[-_]?token|auth[-_]?token|token|secret|password|passwd)\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s"',;&|]+)/giu,
-			`$1${REDACTED}`,
-		);
+	const redacted = redactCredentialText(value, () => REDACTED).text;
 	return redacted.length > MAX_STRING_CHARS
 		? `${redacted.slice(0, MAX_STRING_CHARS)}…`
 		: redacted;

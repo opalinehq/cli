@@ -664,7 +664,14 @@ describe("user-level context roots", () => {
 				hooks: {
 					PreToolUse: [
 						{
-							hooks: [{ type: "command", command: `guard ${token}` }],
+							hooks: [
+								{ type: "command", command: `guard ${token}` },
+								{
+									type: "command",
+									command:
+										"INTERNAL_API_KEY=opaque-hook-value-1 export SVC_TOKEN=opaque-hook-value-2 run-guard --client-secret opaque-hook-value-3",
+								},
+							],
 						},
 					],
 				},
@@ -674,6 +681,19 @@ describe("user-level context roots", () => {
 			}),
 			"managed-root/managed-settings.json": JSON.stringify({
 				permissions: { disableBypassPermissionsMode: "disable" },
+				hooks: {
+					PreToolUse: [
+						{
+							hooks: [
+								{
+									type: "command",
+									command:
+										"CORP_AUTH_PASSWORD=opaque-hook-value-4 audit --password 'opaque hook value 5'",
+								},
+							],
+						},
+					],
+				},
 			}),
 			"managed-root/managed-mcp.json": JSON.stringify({
 				mcpServers: {
@@ -744,8 +764,13 @@ describe("user-level context roots", () => {
 			"PRIVATE_HISTORY_CANARY",
 			"PRIVATE_ALLOWED_TOOL_CANARY",
 			"PRIVATE_OTHER_PROJECT",
+			"opaque-hook-value",
+			"opaque hook value",
 		])
 			expect(serialized).not.toContain(secret);
+		expect(serialized).toContain(
+			"INTERNAL_API_KEY=[REDACTED] export SVC_TOKEN=[REDACTED] run-guard --client-secret [REDACTED]",
+		);
 		expect(
 			summary.claude.settingsLayers.map((layer) => [
 				layer.scope,
