@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getLogger } from "@logtape/logtape";
@@ -602,5 +602,61 @@ describe("batch upload ordering and pending results", () => {
 			{ sessionId: "screenshots", uploadBytes: 31 },
 			{ sessionId: "measured-large", uploadBytes: 5_000 },
 		]);
+	});
+});
+
+describe("failed uploads recorded by 0.11", () => {
+	test("size skips this version can upload become retryable; other permanent failures stay", async () => {
+		const entry = (sessionId: string, error: string) => ({
+			error,
+			failedAt: "2026-09-30T10:00:00.000Z",
+			projectPath: "/repo",
+			sessionId,
+			source: "claude_code",
+			status: "permanent",
+			transcriptPath: `/repo/${sessionId}.jsonl`,
+		});
+		await writeFile(
+			join(process.env.OPALINE_CONFIG_DIR ?? "", "failed-uploads.json"),
+			JSON.stringify({
+				failures: [
+					entry(
+						"raw-skip",
+						"Skipped: session files total 212.40 MiB, above the 128.00 MiB per-session limit. No upload attempted.",
+					),
+					entry(
+						"filtered-skip",
+						"Session transcript payload is 140.25 MiB, above the 128.00 MiB per-session limit. Reduce the transcript/subagent payload before retrying.",
+					),
+					entry(
+						"legacy-skip",
+						"Transcript too large for this server: the 40.00 MiB transcript/subagent payload exceeds the CLI's 32.00 MiB safe limit for legacy uploads. Upgrade the Opaline server to one that supports direct R2 uploads, or upload a smaller transcript.",
+					),
+					entry(
+						"huge-skip",
+						"Skipped: session files total 2048.00 MiB, above the 128.00 MiB per-session limit. No upload attempted.",
+					),
+					entry(
+						"no-timestamps",
+						"This transcript has no timestamped user/assistant messages.",
+					),
+				],
+			}),
+		);
+
+		const statuses = Object.fromEntries(
+			(await loadFailedUploads()).map((failure) => [
+				failure.sessionId,
+				failure.status,
+			]),
+		);
+
+		expect(statuses).toEqual({
+			"raw-skip": "retryable",
+			"filtered-skip": "retryable",
+			"legacy-skip": "retryable",
+			"huge-skip": "permanent",
+			"no-timestamps": "permanent",
+		});
 	});
 });

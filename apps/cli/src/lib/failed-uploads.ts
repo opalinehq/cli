@@ -87,10 +87,38 @@ export async function loadFailedUploads(): Promise<FailedUpload[]> {
 }
 
 function normalizeStatus(failure: FailedUpload): FailedUpload["status"] {
-	if (failure.status === "permanent") return "permanent";
+	if (failure.status === "permanent")
+		return isSizeSkipThisVersionCanRetry(failure.error)
+			? "retryable"
+			: "permanent";
 	if (failure.status === "pending" && typeof failure.jobId === "string")
 		return "pending";
 	return "retryable";
+}
+
+// Raw transcripts up to this size are read and slimmed before the
+// per-session limit applies (MAX_RAW_TRANSCRIPT_BYTES in the uploader).
+const RETRYABLE_SIZE_MAX_MIB = 1024;
+
+/**
+ * Size skips recorded by 0.11 as permanent that this version can upload:
+ * 0.11 refused anything above 128 MiB raw or filtered, and sessions too large
+ * for its legacy request path; 0.12 slims first, allows 256 MiB per session
+ * and uploads large sessions over R2.
+ */
+function isSizeSkipThisVersionCanRetry(error: string): boolean {
+	const skipped =
+		/^Skipped: session files total ([\d.]+) MiB, above the 128\.00 MiB per-session limit\. No upload attempted\.$/u.exec(
+			error,
+		) ??
+		/^Session transcript payload is ([\d.]+) MiB, above the 128\.00 MiB per-session limit\./u.exec(
+			error,
+		);
+	if (skipped?.[1] !== undefined)
+		return Number(skipped[1]) <= RETRYABLE_SIZE_MAX_MIB;
+	return /^Transcript too large for this server: .* safe limit for legacy uploads\./u.test(
+		error,
+	);
 }
 
 async function saveFailedUploads(failures: FailedUpload[]): Promise<void> {
