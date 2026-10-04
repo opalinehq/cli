@@ -5,6 +5,7 @@ import type { ContractRouterClient } from "@orpc/contract";
 import {
 	type contract,
 	INGEST_AGGREGATE_CONTENT_MAX_BYTES,
+	INGEST_DIRECT_CONTENT_MAX_BYTES,
 	INGEST_LIMIT_REASONS,
 	type IngestSessionInput,
 	parseSafeApiEndpoint,
@@ -94,6 +95,11 @@ type LegacyUploadPreparation =
 			readonly actualBytes: number;
 			readonly maxBytes: number;
 			readonly status: "legacy-too-large";
+	  }
+	| {
+			readonly actualBytes: number;
+			readonly maxBytes: number;
+			readonly status: "direct-too-large";
 	  }
 	| {
 			readonly actualBytes: number;
@@ -388,11 +394,12 @@ export async function uploadSession(
 	const client: ContractRouterClient<typeof contract> = createORPCClient(link);
 	const authType = config.authType ?? "bearer";
 	const endpointUrl = new URL(endpoint.url);
+	// Sources the direct request cannot carry probe R2 even without a cached
+	// capability; an unsupported server falls back to the bounded direct path.
 	const shouldProbeR2 =
 		authType === "api-key" &&
 		(hasAdvertisedR2UploadCapability(endpointUrl, authType, config.token) ||
-			(isFileBackedUploadRequest(request) &&
-				sourceBytes > LEGACY_MATERIALIZATION_MAX_BYTES));
+			sourceBytes > LEGACY_MATERIALIZATION_MAX_BYTES);
 	if (authType === "api-key" && shouldProbeR2) {
 		try {
 			const r2Result = await uploadSessionViaR2(request, {
@@ -476,7 +483,12 @@ export async function uploadSession(
 	if (legacy.status === "empty-main") {
 		return getEmptyMainUploadFailure();
 	}
-	if (legacy.status === "legacy-too-large") {
+	if (
+		legacy.status === "legacy-too-large" ||
+		legacy.status === "direct-too-large"
+	) {
+		// Direct R2 upload (API-key login on a server that supports it) can
+		// carry this session, so a later retry can still succeed.
 		return {
 			totalBytes: legacy.actualBytes,
 			maxBytes: legacy.maxBytes,
@@ -484,9 +496,10 @@ export async function uploadSession(
 			error: formatLegacyServerTooLargeError(
 				legacy.actualBytes,
 				legacy.maxBytes,
+				authType,
 			),
 			attempts: 0,
-			retryable: false,
+			retryable: true,
 		};
 	}
 	if (legacy.status === "too-large") {
@@ -671,6 +684,13 @@ async function prepareLegacyUpload(
 			status: "too-large",
 		};
 	}
+	if (aggregateBytes > INGEST_DIRECT_CONTENT_MAX_BYTES) {
+		return {
+			actualBytes: aggregateBytes,
+			maxBytes: INGEST_DIRECT_CONTENT_MAX_BYTES,
+			status: "direct-too-large",
+		};
+	}
 	return { filteredRequest, filteredText, status: "ready" };
 }
 
@@ -843,8 +863,13 @@ function formatTranscriptTooLargeError(
 function formatLegacyServerTooLargeError(
 	actualBytes: number,
 	maxBytes: number,
+	authType: "api-key" | "bearer",
 ): string {
-	return `Transcript too large for this server: the ${formatMebibytes(actualBytes)} MiB transcript/subagent payload exceeds the CLI's ${formatMebibytes(maxBytes)} MiB safe limit for legacy uploads. Upgrade the Opaline server to one that supports direct R2 uploads, or upload a smaller transcript.`;
+	const remedy =
+		authType === "api-key"
+			? "Upgrade the Opaline server to one that supports direct R2 uploads"
+			: "Run `opaline login` to upload with an API key over direct R2 uploads";
+	return `Transcript too large for this server: the ${formatMebibytes(actualBytes)} MiB transcript/subagent payload exceeds the CLI's ${formatMebibytes(maxBytes)} MiB safe limit for legacy uploads. ${remedy}, then retry with: opaline upload --retry`;
 }
 
 function formatMebibytes(bytes: number): string {

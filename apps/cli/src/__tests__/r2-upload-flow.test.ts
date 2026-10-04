@@ -10,7 +10,10 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { IngestSessionInput } from "../contracts/index.js";
+import {
+	INGEST_DIRECT_CONTENT_MAX_BYTES,
+	type IngestSessionInput,
+} from "../contracts/index.js";
 import type { FileBackedUploadRequest } from "../internal/agent-adapters/index.js";
 import {
 	R2_INGEST_PART_SIZE_BYTES,
@@ -931,6 +934,89 @@ describe("capability-gated R2 upload flow", () => {
 		expect(uploadedBody.split(output)).toHaveLength(5);
 	});
 
+	test.each([
+		{ status: 413, code: "PAYLOAD_TOO_LARGE" },
+		{ status: 400, code: "BAD_REQUEST" },
+	])(
+		"keeps a 128-256 MiB session retryable when an older server rejects its size at init ($status)",
+		async ({ status, code }) => {
+			await isolateCapabilityCache();
+			const directory = await mkdtemp(join(tmpdir(), "opaline-r2-old-limit-"));
+			temporaryDirectories.push(directory);
+			const transcriptPath = join(directory, "large.jsonl");
+			const rawBytes = await writeCodexTranscriptAtLeast(
+				transcriptPath,
+				"clean",
+				INGEST_DIRECT_CONTENT_MAX_BYTES,
+			);
+			const requestPaths: string[] = [];
+			const server = serveFetchStub({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch(request) {
+					requestPaths.push(new URL(request.url).pathname);
+					return Response.json(
+						{ json: { code, defined: false, message: "too large", status } },
+						{ status },
+					);
+				},
+			});
+			activeServers.push(server);
+			const config = createUploadConfig(server);
+			await rememberR2UploadCapability(
+				new URL(config.endpoint),
+				"api-key",
+				TOKEN,
+			);
+
+			const result = await uploadSession(
+				createFileRequest("old-server-limit", transcriptPath),
+				config,
+			);
+
+			expect(rawBytes).toBeGreaterThan(INGEST_DIRECT_CONTENT_MAX_BYTES);
+			expect(result).toMatchObject({ success: false, retryable: true });
+			expect(result.error).toContain("does not accept sessions this large yet");
+			expect(requestPaths).toEqual(["/rpc/ingest/init"]);
+		},
+		60_000,
+	);
+
+	test("keeps an init rejection permanent for a session the old limit allows", async () => {
+		await isolateCapabilityCache();
+		const server = serveFetchStub({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch() {
+				return Response.json(
+					{
+						json: {
+							code: "BAD_REQUEST",
+							defined: false,
+							message: "bad",
+							status: 400,
+						},
+					},
+					{ status: 400 },
+				);
+			},
+		});
+		activeServers.push(server);
+		const config = createUploadConfig(server);
+		await rememberR2UploadCapability(
+			new URL(config.endpoint),
+			"api-key",
+			TOKEN,
+		);
+
+		const result = await uploadSession(
+			createRequest("small-bad-request", '{"type":"user"}\n'),
+			config,
+		);
+
+		expect(result).toMatchObject({ success: false, retryable: false });
+	});
+
 	test("rejects an empty main transcript locally before any R2 request", async () => {
 		await isolateCapabilityCache();
 		let requestCount = 0;
@@ -1001,10 +1087,11 @@ describe("capability-gated R2 upload flow", () => {
 		expect(result).toMatchObject({
 			success: false,
 			attempts: 0,
-			retryable: false,
+			retryable: true,
 		});
 		expect(result.error).toContain("Transcript too large for this server");
 		expect(result.error).toContain("32.00 MiB safe limit for legacy uploads");
+		expect(result.error).toContain("opaline upload --retry");
 		expect(requestPaths).toEqual(["/rpc/ingest/init"]);
 		expect(
 			hasAdvertisedR2UploadCapability(

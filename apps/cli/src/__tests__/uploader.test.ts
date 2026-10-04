@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ORPCError } from "@orpc/client";
 import {
+	INGEST_AGGREGATE_CONTENT_MAX_BYTES,
+	INGEST_DIRECT_CONTENT_MAX_BYTES,
 	INGEST_LIMIT_REASONS,
 	type IngestSessionInput,
 	REDACTION_DID_NOT_CONVERGE_CODE,
@@ -404,6 +406,60 @@ describe("uploadSession aggregate size guard", () => {
 			attempts: 0,
 		});
 	});
+
+	test("allows sessions up to 256 MiB after slimming", () => {
+		expect(INGEST_AGGREGATE_CONTENT_MAX_BYTES).toBe(256 * 1024 * 1024);
+		expect(INGEST_DIRECT_CONTENT_MAX_BYTES).toBe(128 * 1024 * 1024);
+	});
+
+	for (const authType of ["api-key", "bearer"] as const) {
+		test(`keeps a session above the direct-request limit retryable without R2 (${authType})`, async () => {
+			const content = `${JSON.stringify({ type: "user", text: "u".repeat(4096) })}\n`;
+			const stub = startIngestStub({
+				respond: () =>
+					Response.json(
+						{
+							json: {
+								code: "NOT_FOUND",
+								defined: false,
+								message: "Not Found",
+								status: 404,
+							},
+						},
+						{ status: 404 },
+					),
+			});
+			try {
+				const result = await uploadSession(
+					{
+						source: "claude_code",
+						sessionId: "needs-r2",
+						projectPath: "/test",
+						content: content.repeat(40_000),
+					},
+					{
+						endpoint: `${stub.loopbackBase}/rpc`,
+						allowInsecureEndpoint: true,
+						authType,
+						token: INGEST_STUB_TEST_TOKEN,
+					},
+				);
+
+				expect(result).toMatchObject({
+					success: false,
+					attempts: 0,
+					retryable: true,
+					maxBytes: INGEST_DIRECT_CONTENT_MAX_BYTES,
+				});
+				expect(result.error).toContain("opaline upload --retry");
+				expect(stub.requests.map((request) => request.pathname)).toEqual(
+					authType === "api-key" ? ["/rpc/ingest/init"] : [],
+				);
+			} finally {
+				await stub.server.stop(true);
+			}
+		}, 60_000);
+	}
 
 	test("permits the exact raw limit and skips one byte above it", () => {
 		const limit = MAX_RAW_TRANSCRIPT_BYTES;
