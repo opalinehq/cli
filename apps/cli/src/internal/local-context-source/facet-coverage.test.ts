@@ -290,6 +290,32 @@ describe("instruction capture", () => {
 		expect(readCaptured(bundle, "CLAUDE.md")).toBe("Claude instructions\n");
 	});
 
+	test("labels hash-only-by-policy resources apart from capacity cuts, keeping the wire values", async () => {
+		const repository = await createRepository({
+			"AGENTS.md": "x".repeat(3 * 1024 * 1024),
+			"package.json": '{"name":"fixture"}',
+		});
+		const bundle = await collect(repository);
+		const access = (kind: string, path: string) =>
+			bundle.manifest.contextIndex.facets
+				.find((facet) => facet.rootId === "repository" && facet.kind === kind)
+				?.resources.find((resource) => resource.path === path)?.access;
+		expect(access("package-context", "package.json")).toEqual({
+			status: "truncated",
+			reason: "file-content-cap",
+			policy: "hash-only",
+		});
+		expect(access("agents-instructions", "AGENTS.md")).toEqual({
+			status: "truncated",
+			reason: "file-content-cap",
+		});
+		// Policy omissions leave their facet complete; capacity cuts do not.
+		expect(getFacetCoverage(bundle, "repository")).toMatchObject({
+			"package-context": "complete",
+			"agents-instructions": "truncated",
+		});
+	});
+
 	test("fills the instruction byte budget in rank order and records the limit", async () => {
 		const chunk = "y".repeat(400 * 1024);
 		const repository = await createRepository({

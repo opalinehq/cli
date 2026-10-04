@@ -410,6 +410,13 @@ export type ContextIndexResourceAccess =
 				| "file-content-cap"
 				| "root-content-cap"
 				| "total-content-cap";
+			/**
+			 * Present when the content was left out by capture policy (the file
+			 * is hash-only), not cut by a capacity limit. The server accepts no
+			 * access value for this yet, so the wire status and reason stay
+			 * `truncated` / `file-content-cap` for compatibility.
+			 */
+			readonly policy?: "hash-only";
 	  }
 	| {
 			readonly status: "unavailable";
