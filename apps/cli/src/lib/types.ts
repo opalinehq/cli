@@ -43,6 +43,15 @@ export interface UploadResult {
 	redactionConvergenceExceeded?: boolean;
 	endpointRejected?: boolean;
 	usageChecksum?: string;
+	/**
+	 * The server accepted the upload but was still processing it when local
+	 * polling ended. Not a failure: reconcile later with `ingest.status`.
+	 */
+	pendingJobId?: string;
+	/** The server stored an analysis upload without confirming its link. */
+	analysisLinkMissing?: boolean;
+	/** The server refused the analysis id (unknown, not visible, log off). */
+	analysisRejected?: boolean;
 }
 
 export const DEFAULT_ENDPOINT = `${PRODUCTION_API_BASE}/rpc`;

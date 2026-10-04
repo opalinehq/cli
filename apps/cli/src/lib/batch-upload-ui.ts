@@ -71,6 +71,11 @@ export function renderBatchSummary(
 	if (redactionSummary) {
 		lines.push(`${prefix}${redactionSummary}`);
 	}
+	if (summary.pending > 0) {
+		lines.push(
+			`${prefix}${summary.pending} session(s) accepted and still processing on the server; they are checked on the next upload or \`opaline upload --retry\``,
+		);
+	}
 	if (summary.failed > 0) {
 		lines.push(`${prefix}${summary.failed} session(s) failed`);
 		for (const err of summary.errors.slice(0, maxErrors)) {

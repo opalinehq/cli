@@ -57,6 +57,66 @@ export async function forgetR2UploadCapability(
 	}
 }
 
+const ANALYSIS_CAPABILITY = "analysisLinkedUploads";
+
+/**
+ * Whether this endpoint and key confirmed analysis-linked uploads before. Only
+ * positive answers are stored: a server that lacks the capability is asked
+ * again next time, so an upgrade takes effect immediately.
+ */
+export function hasCachedAnalysisUploadCapability(
+	endpoint: URL,
+	authType: "api-key" | "bearer",
+	token: string,
+): boolean {
+	try {
+		const path = getAnalysisCapabilityPath(
+			getCapabilityKey(endpoint, authType, token),
+		);
+		return (
+			existsSync(path) &&
+			readFileSync(path, "utf8").trim() === ANALYSIS_CAPABILITY
+		);
+	} catch {
+		return false;
+	}
+}
+
+export async function rememberAnalysisUploadCapability(
+	endpoint: URL,
+	authType: "api-key" | "bearer",
+	token: string,
+): Promise<void> {
+	try {
+		await writePrivateFile(
+			getAnalysisCapabilityPath(getCapabilityKey(endpoint, authType, token)),
+			`${ANALYSIS_CAPABILITY}\n`,
+			getConfigDir(),
+		);
+	} catch {
+		// The preflight simply runs again next time.
+	}
+}
+
+export async function forgetAnalysisUploadCapability(
+	endpoint: URL,
+	authType: "api-key" | "bearer",
+	token: string,
+): Promise<void> {
+	try {
+		await rm(
+			getAnalysisCapabilityPath(getCapabilityKey(endpoint, authType, token)),
+			{ force: true },
+		);
+	} catch {
+		// A stale entry is caught by the per-upload analysisId echo check.
+	}
+}
+
+function getAnalysisCapabilityPath(key: string): string {
+	return join(getConfigDir(), "upload-capabilities", `${key}.analysis`);
+}
+
 function getCapabilityKey(
 	endpoint: URL,
 	authType: "api-key" | "bearer",

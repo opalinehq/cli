@@ -63,11 +63,18 @@ export const IngestSessionInputSchema = z.object({
 	platform_os: ProductAnalyticsPlatformOsSchema.optional(),
 	filter_version: z.number().int().min(0).max(65_535).optional(),
 	force_replace: z.boolean().optional(),
+	/**
+	 * Link this upload to an Opaline analysis; the server stores the session in
+	 * the analysis's workspace. Only sent by `opaline import --analysis`.
+	 */
+	analysisId: z.string().max(200).optional(),
 });
 
 export const IngestSessionOutputSchema = z.object({
 	success: z.literal(true),
 	sessionId: z.string(),
+	/** Echoed only when the server recorded the analysis link. */
+	analysisId: z.string().optional(),
 	redacted: z.record(z.string(), z.number().int().nonnegative()).default({}),
 	redactedBytes: z.number().int().nonnegative().optional(),
 	usageChecksum: z

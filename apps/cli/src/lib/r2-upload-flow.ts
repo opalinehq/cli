@@ -21,6 +21,7 @@ import {
 	isR2IngestStatusOutput,
 	type R2IngestCommitInput,
 	type R2IngestInitInput,
+	type R2IngestStatusOutput,
 	type R2IngestSuccess,
 	type R2IngestUploadObject,
 } from "./r2-ingest-contract.js";
@@ -42,6 +43,16 @@ const COMMITTED_JOB_IN_PROGRESS_REASONS = new Set([
 	"R2_INGEST_JOB_BUSY",
 	"R2_INGEST_JOB_RETRY_LATER",
 ]);
+// The server accepted the uploaded objects but its materialization queue was
+// full. Repeating the commit only queues again; the job is finished by the
+// server's recovery worker and confirmed by status polling or reconciliation.
+const MATERIALIZATION_QUEUED_REASON = "R2_INGEST_GATE_QUEUE_TIMEOUT";
+// Server job failures that are not caused by the transcript itself: a fresh
+// upload of the same session can succeed.
+const RETRYABLE_JOB_FAILURE_CODES = new Set([
+	"R2_INGEST_JOB_EXPIRED",
+	"R2_INGEST_ATTEMPTS_EXHAUSTED",
+]);
 
 export interface R2UploadFlowConfig {
 	readonly authType: "api-key" | "bearer";
@@ -54,6 +65,8 @@ export interface R2UploadFlowConfig {
 		| ((attempt: number, maxAttempts: number, error: string) => void)
 		| undefined;
 	readonly statusPollIntervalMs: number | undefined;
+	/** Status polls before an accepted job is left to later reconciliation. */
+	readonly statusMaxPolls: number | undefined;
 	readonly token: string;
 }
 
@@ -99,6 +112,27 @@ export class R2IngestFlowError extends Error {
 		this.name = "R2IngestFlowError";
 		this.retryable = retryable;
 	}
+}
+
+/**
+ * The server accepted the upload but had not finished processing it when the
+ * local polling window ended. The job keeps running server-side; callers record
+ * it as pending and reconcile it later with `ingest.status`.
+ */
+export class R2IngestPendingError extends Error {
+	readonly jobId: string;
+
+	constructor(jobId: string) {
+		super(
+			"Opaline accepted the upload and is still processing it; it will be checked again on the next upload or `opaline upload --retry`.",
+		);
+		this.name = "R2IngestPendingError";
+		this.jobId = jobId;
+	}
+}
+
+export function isRetryableR2JobFailure(code: string | undefined): boolean {
+	return code !== undefined && RETRYABLE_JOB_FAILURE_CODES.has(code);
 }
 
 export async function uploadSessionViaR2(
@@ -232,7 +266,11 @@ async function uploadStagedSession(
 		}
 		commitResult = commitCall.value.result;
 	} catch (error) {
-		if (!isCommittedJobInProgressError(error)) throw error;
+		if (
+			!isCommittedJobInProgressError(error) &&
+			!isMaterializationQueuedError(error)
+		)
+			throw error;
 	}
 	const statusCall = await pollJobStatus(client, initCall.value.jobId, config);
 	const serverResult = statusCall.result ?? commitResult;
@@ -268,11 +306,23 @@ async function pollJobStatus(
 	readonly result: R2IngestSuccess | null;
 }> {
 	let maxAttempts = 1;
-	for (let poll = 0; poll < STATUS_MAX_POLLS; poll += 1) {
-		const statusCall = await callRpcWithRetry(
-			() => client.ingest.status({ jobId }),
-			config.onRetry,
-		);
+	const maxPolls = Math.max(1, config.statusMaxPolls ?? STATUS_MAX_POLLS);
+	for (let poll = 0; poll < maxPolls; poll += 1) {
+		let statusCall: {
+			readonly attempts: number;
+			readonly value: R2IngestStatusOutput;
+		};
+		try {
+			statusCall = await callRpcWithRetry(
+				() => client.ingest.status({ jobId }),
+				config.onRetry,
+			);
+		} catch (error) {
+			// The job was accepted; an unreachable status endpoint does not make
+			// it fail. Leave it to reconciliation instead of re-uploading.
+			if (isRetryableRpcError(error)) throw new R2IngestPendingError(jobId);
+			throw error;
+		}
 		maxAttempts = Math.max(maxAttempts, statusCall.attempts);
 		if (!isR2IngestStatusOutput(statusCall.value)) {
 			throw new R2IngestFlowError(
@@ -290,19 +340,22 @@ async function pollJobStatus(
 			return { attempts: maxAttempts, result: statusCall.value.result };
 		}
 		if (statusCall.value.status === "failed") {
-			const detail =
-				statusCall.value.error?.message ?? "unknown processing error";
 			throw new R2IngestFlowError(
-				`R2 ingest job failed after upload: ${detail}`,
-				false,
+				formatR2JobFailure(statusCall.value.error),
+				isRetryableR2JobFailure(statusCall.value.error?.code),
 			);
 		}
-		await delay(config.statusPollIntervalMs ?? STATUS_POLL_INTERVAL_MS);
+		if (poll + 1 < maxPolls) {
+			await delay(config.statusPollIntervalMs ?? STATUS_POLL_INTERVAL_MS);
+		}
 	}
-	throw new R2IngestFlowError(
-		"R2 ingest job did not finish within the local status polling window",
-		true,
-	);
+	throw new R2IngestPendingError(jobId);
+}
+
+export function formatR2JobFailure(
+	error: { readonly code: string; readonly message: string } | null,
+): string {
+	return `R2 ingest job failed after upload: ${error?.message ?? "unknown processing error"}`;
 }
 
 function buildInitInput(staged: StagedFilteredUpload): R2IngestInitInput {
@@ -375,7 +428,11 @@ async function callRpcWithRetry<TValue>(
 		try {
 			return { attempts: attempt, value: await operation() };
 		} catch (error) {
-			if (!isRetryableRpcError(error) || attempt === RPC_MAX_ATTEMPTS) {
+			if (
+				!isRetryableRpcError(error) ||
+				isMaterializationQueuedError(error) ||
+				attempt === RPC_MAX_ATTEMPTS
+			) {
 				throw error;
 			}
 			const detail =
@@ -404,6 +461,17 @@ function isCommittedJobInProgressError(error: unknown): boolean {
 	const reason = error.data.reason;
 	return (
 		typeof reason === "string" && COMMITTED_JOB_IN_PROGRESS_REASONS.has(reason)
+	);
+}
+
+// Older APIs answer a full materialization queue with the gate's own reason;
+// current APIs mark the job for their recovery worker and say `queued: true`.
+function isMaterializationQueuedError(error: unknown): boolean {
+	return (
+		error instanceof ORPCError &&
+		isRecord(error.data) &&
+		(error.data.reason === MATERIALIZATION_QUEUED_REASON ||
+			error.data.queued === true)
 	);
 }
 
