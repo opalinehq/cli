@@ -7,7 +7,10 @@ import {
 	type ParsedSource,
 	summarizeUserAgentConfiguration,
 } from "../internal/local-context-source/agent-configuration.js";
-import { CLAUDE_PROJECT_MEMORY_ROOT_ID } from "../internal/local-context-source/capture-policy.js";
+import {
+	CLAUDE_PROJECT_MEMORY_ROOT_ID,
+	CLAUDE_TOOL_RESULTS_ROOT_ID,
+} from "../internal/local-context-source/capture-policy.js";
 import type {
 	AdditionalContextRoot,
 	ContextRootInclude,
@@ -110,6 +113,8 @@ export async function resolveUserContextRoots(input: {
 	readonly sources: UserAgentSources;
 	/** Claude auto-memory directory of the session's project, if known. */
 	readonly memoryDirectory?: string | null;
+	/** `<session>/tool-results` of the captured Claude Code session. */
+	readonly toolResultsDirectory?: string | null;
 }): Promise<readonly AdditionalContextRoot[]> {
 	const { home, codexHome } = input.locations;
 	const claudeDirectory = join(home, ".claude");
@@ -238,6 +243,14 @@ export async function resolveUserContextRoots(input: {
 			absolutePath: input.memoryDirectory,
 			id: CLAUDE_PROJECT_MEMORY_ROOT_ID,
 			label: "Claude Code auto-memory of this project",
+			origin: "user",
+			scope: "custom",
+		});
+	if (input.toolResultsDirectory)
+		roots.push({
+			absolutePath: input.toolResultsDirectory,
+			id: CLAUDE_TOOL_RESULTS_ROOT_ID,
+			label: "Large tool outputs Claude Code saved for this session",
 			origin: "user",
 			scope: "custom",
 		});

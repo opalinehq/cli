@@ -434,6 +434,121 @@ describe("sidecar delivery under faults", () => {
 		}
 	});
 
+	test("carries the session's saved tool outputs, linked to their records", async () => {
+		const stub = startEvidenceProtocolStub();
+		try {
+			const workspace = await createWorkspace(stub, ["alpha"]);
+			const alpha = workspace.repositories.get("alpha");
+			assert(alpha);
+			const sessionId = "tool-results";
+			const transcriptPath = claudeTranscriptPath(workspace, sessionId);
+			const toolResults = join(
+				dirname(transcriptPath),
+				sessionId,
+				"tool-results",
+			);
+			const secret = `ghp_${"C".repeat(36)}`;
+			const pixels = Buffer.from(
+				Array.from({ length: 3_000 }, (_, index) => (index * 7 + 3) % 256),
+			).toString("base64");
+			const outputs = {
+				"bash-1.txt": `${"build log line\n".repeat(400)}token=${secret}\n`,
+				"mcp-2.txt": `${JSON.stringify({ type: "image", data: `data:image/png;base64,${pixels}` })}\n`,
+				"unreferenced.txt": "Never referenced\n",
+			};
+			await mkdir(toolResults, { recursive: true });
+			for (const [name, content] of Object.entries(outputs))
+				await writeFile(join(toolResults, name), content);
+			const persisted = (toolUseId: string, name: string) => ({
+				type: "user",
+				sessionId,
+				cwd: alpha,
+				version: "2.1.286",
+				entrypoint: "cli",
+				timestamp: "2026-10-04T10:00:03.000Z",
+				message: {
+					role: "user",
+					content: [
+						{
+							tool_use_id: toolUseId,
+							type: "tool_result",
+							content: `<persisted-output>\nOutput too large. Full output saved to: ${join(toolResults, name)}\n</persisted-output>`,
+						},
+					],
+				},
+				toolUseResult: { persistedOutputPath: join(toolResults, name) },
+			});
+			await mkdir(dirname(transcriptPath), { recursive: true });
+			await writeFile(
+				transcriptPath,
+				`${[
+					{
+						type: "user",
+						sessionId,
+						cwd: alpha,
+						version: "2.1.286",
+						entrypoint: "cli",
+						timestamp: "2026-10-04T10:00:01.000Z",
+						message: { role: "user", content: "Build it" },
+					},
+					persisted("toolu_bash", "bash-1.txt"),
+					persisted("toolu_mcp", "mcp-2.txt"),
+				]
+					.map((line) => JSON.stringify(line))
+					.join("\n")}\n`,
+			);
+			expect(
+				(
+					await runHook(workspace, "claude-end", "alpha", sessionId, {
+						transcriptWritten: true,
+					})
+				).exitCode,
+			).toBe(0);
+			const capture = only(stub);
+			expectCompleteCapture(capture, workspace, "alpha");
+			const localContext = capture.manifest.localContext;
+			expect(localContext.toolResultReferences).toEqual({
+				references: [
+					{
+						path: "bash-1.txt",
+						agentId: null,
+						recordIndex: 2,
+						toolUseId: "toolu_bash",
+					},
+					{
+						path: "mcp-2.txt",
+						agentId: null,
+						recordIndex: 3,
+						toolUseId: "toolu_mcp",
+					},
+				],
+				omitted: 0,
+			});
+			const stored = (path: string) => {
+				const entry = localContext.entries.find(
+					(candidate) =>
+						candidate.rootId === "claude-tool-results" &&
+						candidate.path === path,
+				);
+				assert(entry?.content?.blobId, `${path} was not captured`);
+				const bytes = capture.objects.get(entry.content.blobId);
+				assert(bytes);
+				return new TextDecoder().decode(bytes);
+			};
+			// Secret-filtered, and slimmed like the transcript.
+			const log = stored("bash-1.txt");
+			expect(log).toContain("build log line");
+			expect(log).not.toContain(secret);
+			const image = stored("mcp-2.txt");
+			expect(image).toContain("opaline-image-omitted:v1;sha256=");
+			expect(image).not.toContain(pixels);
+			expect(stored("unreferenced.txt")).toBe("Never referenced\n");
+			await expectNothingDropped(workspace, stub);
+		} finally {
+			stub.stop();
+		}
+	});
+
 	test("a 40 MiB transcript (over the old 32 MiB budget) is captured and delivered whole", async () => {
 		const stub = startEvidenceProtocolStub();
 		try {

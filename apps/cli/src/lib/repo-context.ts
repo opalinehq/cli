@@ -21,6 +21,7 @@ import {
 	getLocalContextBundleExternalObjectIds,
 	type LocalContextBundle,
 	serializeLocalContextBundle,
+	type ToolResultReferences,
 } from "../internal/local-context-source/index.js";
 import { loadCredentials } from "./credentials.js";
 import { exec } from "./exec.js";
@@ -151,6 +152,12 @@ export async function collectSessionRepositoryContext(input: {
 	readonly repositoryPath: string;
 	readonly deadlineAt?: number;
 	readonly observedSkillNames?: readonly string[];
+	/** Claude Code session artifacts: saved large tool outputs. */
+	readonly toolResults?: {
+		readonly directory: string;
+		readonly references: ToolResultReferences;
+		readonly transformText: (text: string) => string;
+	};
 }): Promise<SessionRepositoryContextCapture> {
 	const resolvedContext = await resolveRepositoryContext(input.repositoryPath);
 	const context: RepositoryContext = {
@@ -195,6 +202,7 @@ export async function collectSessionRepositoryContext(input: {
 		memoryDirectory,
 		repositoryRoot: context.repositoryRoot,
 		sources: userSources,
+		toolResultsDirectory: input.toolResults?.directory ?? null,
 	});
 	await assertAdditionalRootsSafe(additionalRoots, configBoundary);
 	const collected = await collectLocalContextBundle(
@@ -230,6 +238,7 @@ export async function collectSessionRepositoryContext(input: {
 				maxTotalHashBytes: 256 * 1024 * 1024,
 			},
 			parentCapture,
+			transformToolResultText: input.toolResults?.transformText,
 		},
 		createLocalContextSourceEnv(input.deadlineAt),
 	);
@@ -240,6 +249,9 @@ export async function collectSessionRepositoryContext(input: {
 		manifest: {
 			...collected.manifest,
 			userConfiguration: summarizeUserAgentSources(userSources),
+			...(input.toolResults === undefined
+				? {}
+				: { toolResultReferences: input.toolResults.references }),
 		},
 	};
 	const candidate = createRepositoryBundleCandidate(bundle);

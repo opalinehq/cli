@@ -53,11 +53,14 @@ export interface LocalContextCollectionLimits {
 	readonly maxInstructionContentBytesPerFile: number;
 	readonly maxInstructionContentBytes: number;
 	readonly maxDiffContentBytes: number;
-	// User context (skill definitions and auto-memory) has a pool of its own
-	// as well.
+	// User context (skill definitions and auto-memory) and saved tool outputs
+	// have pools of their own as well.
 	readonly maxUserContextFiles: number;
 	readonly maxUserContextContentBytesPerFile: number;
 	readonly maxUserContextContentBytes: number;
+	readonly maxToolResultFiles: number;
+	readonly maxToolResultContentBytesPerFile: number;
+	readonly maxToolResultContentBytes: number;
 }
 
 export interface LocalContextCollectionOptions {
@@ -72,6 +75,11 @@ export interface LocalContextCollectionOptions {
 	 * that apply to it are captured before other nested instruction files.
 	 */
 	readonly workingDirectory?: string;
+	/**
+	 * Applied to saved tool-output text before the secret filter, so it gets
+	 * the same slimming as the transcript that references it.
+	 */
+	readonly transformToolResultText?: (text: string) => string;
 }
 
 export interface ParentCaptureReference {
@@ -603,6 +611,12 @@ export interface LocalContextManifest {
 	readonly coverage: AggregateCoverage;
 	/** Secret-filtered user-level agent configuration (hooks, MCP, plugins). */
 	readonly userConfiguration?: UserAgentConfiguration;
+	/**
+	 * Records of the session transcript that reference a saved tool output in
+	 * the `claude-tool-results` root, so each output stays linked to the
+	 * record (stream and 1-based JSONL line) and tool call that produced it.
+	 */
+	readonly toolResultReferences?: ToolResultReferences;
 	readonly transport: {
 		readonly secretFilterApplied: true;
 		readonly secretFilterVersion: number;
@@ -660,6 +674,22 @@ export interface UserAgentConfiguration {
 		readonly plugins: Readonly<Record<string, boolean>>;
 	};
 	readonly truncated: boolean;
+}
+
+export interface ToolResultReference {
+	/** Path relative to the `claude-tool-results` root. */
+	readonly path: string;
+	/** Subagent stream, or null for the main transcript. */
+	readonly agentId: string | null;
+	/** 1-based JSONL line of the referencing record in its stream. */
+	readonly recordIndex: number;
+	readonly toolUseId: string | null;
+}
+
+export interface ToolResultReferences {
+	readonly references: readonly ToolResultReference[];
+	/** References beyond the manifest's bound that were not listed. */
+	readonly omitted: number;
 }
 
 export interface LocalContextBundle {

@@ -9,6 +9,7 @@ import {
 	INSTRUCTION_IMPORT_EVIDENCE_REASON,
 	INSTRUCTION_INCLUDE_EVIDENCE_REASON,
 	isSessionInstructionContent,
+	isSessionToolResult,
 	METADATA_INCLUDE_EVIDENCE_REASON,
 	SESSION_INSTRUCTION_MAX_IMPORT_DEPTH,
 } from "./capture-policy.js";
@@ -52,13 +53,14 @@ const DISCOVERY_LIMITS: ReadonlySet<string> = new Set([
 	"maxTotalEntries",
 ]);
 
-type ContentPool = "general" | "instruction" | "user-context";
+type ContentPool = "general" | "instruction" | "user-context" | "tool-result";
 type DedicatedPool = Exclude<ContentPool, "general">;
 
 /** Session-evidence content pools with budgets of their own. */
 export interface DedicatedContentPools {
 	readonly instruction: BlobStore | null;
 	readonly userContext: BlobStore | null;
+	readonly toolResult: BlobStore | null;
 }
 
 interface DedicatedPoolLimits {
@@ -168,6 +170,7 @@ export async function collectFileSystemContext(
 	pools: DedicatedContentPools = {
 		instruction: null,
 		userContext: null,
+		toolResult: null,
 	},
 ): Promise<FileSystemCollectionResult> {
 	const rootSpecs: readonly RootSpec[] = [
@@ -189,7 +192,7 @@ export async function collectFileSystemContext(
 		totalEnumeratedEntries: 0,
 		totalEntries: 0,
 		contentBudgetBytes: 0,
-		poolBudgetBytes: { instruction: 0, "user-context": 0 },
+		poolBudgetBytes: { instruction: 0, "user-context": 0, "tool-result": 0 },
 		hashBudgetBytes: 0,
 		inventoryBytes: 0,
 		materializedBytes: 0,
@@ -309,6 +312,7 @@ export async function collectFileSystemContext(
 	const poolStores: Readonly<Record<DedicatedPool, BlobStore | null>> = {
 		instruction: instructionStore,
 		"user-context": sessionEvidence ? pools.userContext : null,
+		"tool-result": sessionEvidence ? pools.toolResult : null,
 	};
 	const processed = new Set<string>();
 	const processFile = async (
@@ -399,7 +403,8 @@ export async function collectFileSystemContext(
 		}
 	}
 	// Then the user-context pool in rank order (memory, observed skills, every
-	// other skill), from its own budget.
+	// other skill), then the session's saved tool outputs, each from its own
+	// budget.
 	if (poolStores["user-context"] !== null) {
 		const ranked = files.flatMap((file) => {
 			if (processed.has(getFileKey(file.entry))) return [];
@@ -424,6 +429,13 @@ export async function collectFileSystemContext(
 		);
 		for (const { file } of ranked) await processFile(file, "user-context");
 	}
+	if (poolStores["tool-result"] !== null)
+		for (const file of files)
+			if (
+				!processed.has(getFileKey(file.entry)) &&
+				isSessionToolResult(file.entry.rootId)
+			)
+				await processFile(file, "tool-result");
 	for (const file of files) {
 		if (processed.has(getFileKey(file.entry))) continue;
 		await processFile(file, "general");
@@ -1190,7 +1202,11 @@ async function buildRegularFileEntry(
 				content: { status: "omitted", reason: "binary", detail: null },
 			};
 		}
-		const text = UTF8_DECODER.decode(read.bytes);
+		const decoded = UTF8_DECODER.decode(read.bytes);
+		const text =
+			pool === "tool-result" && options.transformToolResultText
+				? options.transformToolResultText(decoded)
+				: decoded;
 		const sanitized = addSanitizedTextBlob(
 			text,
 			read.bytes.byteLength,
@@ -1412,6 +1428,13 @@ function getDedicatedPoolLimits(
 				maxTotalBytes: options.limits.maxUserContextContentBytes,
 				filesLimit: "maxUserContextFiles",
 				bytesLimit: "maxUserContextContentBytes",
+			};
+		case "tool-result":
+			return {
+				maxFileBytes: options.limits.maxToolResultContentBytesPerFile,
+				maxTotalBytes: options.limits.maxToolResultContentBytes,
+				filesLimit: "maxToolResultFiles",
+				bytesLimit: "maxToolResultContentBytes",
 			};
 	}
 }

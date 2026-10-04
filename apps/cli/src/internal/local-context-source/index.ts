@@ -72,6 +72,8 @@ export type {
 	ParentCaptureReference,
 	RootCoverage,
 	SecretFilterMetadata,
+	ToolResultReference,
+	ToolResultReferences,
 	UserAgentConfiguration,
 } from "./types.js";
 export {

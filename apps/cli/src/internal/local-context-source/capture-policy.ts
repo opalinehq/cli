@@ -23,8 +23,13 @@ export const SESSION_DIFF_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
 export const SESSION_USER_CONTEXT_MAX_FILE_BYTES = 2 * 1024 * 1024;
 export const SESSION_USER_CONTEXT_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
 export const SESSION_USER_CONTEXT_MAX_FILES = 1024;
+// Large tool outputs Claude Code saved next to the session transcript.
+export const SESSION_TOOL_RESULT_MAX_FILE_BYTES = 2 * 1024 * 1024;
+export const SESSION_TOOL_RESULT_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
+export const SESSION_TOOL_RESULT_MAX_FILES = 256;
 
 export const CLAUDE_PROJECT_MEMORY_ROOT_ID = "claude-project-memory";
+export const CLAUDE_TOOL_RESULTS_ROOT_ID = "claude-tool-results";
 
 export const INSTRUCTION_IMPORT_EVIDENCE_REASON = "instruction-import";
 // Explicitly included files of user-level roots (see ContextRootInclude).
@@ -125,6 +130,11 @@ export function getSessionUserContextRank(
 	if (categories.includes("skill-definition")) return observed ? 3 : 4;
 	if (categories.includes("skill-resource") && observed) return 5;
 	return null;
+}
+
+/** Claude Code's saved large tool outputs of the captured session. */
+export function isSessionToolResult(rootId: string): boolean {
+	return rootId === CLAUDE_TOOL_RESULTS_ROOT_ID;
 }
 
 /**

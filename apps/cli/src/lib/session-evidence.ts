@@ -16,6 +16,10 @@ import {
 	isRepositoryAutoUploadAllowed,
 	loadAutoUploadConfig,
 } from "./auto-upload-config.js";
+import {
+	findToolResultReferences,
+	getClaudeToolResultsDirectory,
+} from "./claude-tool-results.js";
 import type { Credentials } from "./credentials.js";
 import { type FileLease, tryAcquireFileLease } from "./file-lease.js";
 import {
@@ -79,6 +83,7 @@ import {
 	type TranscriptRevisionDeliveryScope,
 } from "./transcript-revision-store.js";
 import { extractObservedSkills } from "./transcript-skills.js";
+import { slimTranscriptText } from "./transcript-slim.js";
 import { allowsInsecureEndpointFromEnv } from "./upload-endpoint.js";
 
 type EvidenceLifecycle = "start" | "resume" | "checkpoint" | "end";
@@ -160,6 +165,14 @@ export async function captureAndUploadSessionEvidence(input: {
 		| Awaited<ReturnType<typeof collectSessionRepositoryContext>>
 		| undefined;
 	try {
+		const toolResultsDirectory =
+			request.source === "claude_code" &&
+			isFileBackedEvidenceRequest(input.request)
+				? getClaudeToolResultsDirectory(
+						input.request.transcriptPath,
+						request.sessionId,
+					)
+				: null;
 		contextCapture = await collectSessionRepositoryContext({
 			accountId: user.id,
 			endpoint,
@@ -168,6 +181,23 @@ export async function captureAndUploadSessionEvidence(input: {
 			repositoryPath: request.projectPath,
 			deadlineAt: captureDeadlineAt,
 			observedSkillNames: extractObservedSkills(request),
+			...(toolResultsDirectory === null
+				? {}
+				: {
+						toolResults: {
+							directory: toolResultsDirectory,
+							references: findToolResultReferences(
+								materialized.streams.map((stream) => ({
+									agentId: stream.declaredAgentId,
+									content: stream.content,
+								})),
+								toolResultsDirectory,
+							),
+							// Saved outputs get the transcript's slimming before the
+							// secret filter, like the records that reference them.
+							transformText: slimTranscriptText,
+						},
+					}),
 		});
 		const scope = {
 			actorId: user.id,
