@@ -4,12 +4,16 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FILTER_VERSION } from "../internal/secret-filter/index.js";
+import {
+	FILTER_VERSION,
+	filterSessionTextFields,
+} from "../internal/secret-filter/index.js";
 import {
 	cleanupStagedUpload,
 	createFilteredUploadSources,
 	stageFilteredUpload,
 } from "../lib/filtered-upload-staging.js";
+import { slimTranscriptText } from "../lib/transcript-slim.js";
 
 const temporaryDirectories: string[] = [];
 const SCREENSHOT = Buffer.from(
@@ -262,7 +266,7 @@ describe("filtered upload staging", () => {
 		expect(staged.aggregateBytes).toBe(Buffer.byteLength("mainkept"));
 	});
 
-	test("slims main and subagent streams before secret filtering", async () => {
+	test("filters, then slims main and subagent streams", async () => {
 		const sourceDirectory = await mkdtemp(join(tmpdir(), "opaline-slim-"));
 		temporaryDirectories.push(sourceDirectory);
 		const mainPath = join(sourceDirectory, "main.jsonl");
@@ -355,8 +359,10 @@ describe("filtered upload staging", () => {
 			media_type: "image/jpeg",
 			data: SCREENSHOT_MARKER.replace("image/png", "image/jpeg"),
 		});
-		expect(staged.redactions).toEqual({ "aws-access-key-id": 1 });
-		expect(staged.filterInputBytes).toBeLessThan(staged.inputBytes / 2);
+		// The filter ran over every raw copy of the output before slimming
+		// dropped the duplicates.
+		expect(staged.redactions).toEqual({ "aws-access-key-id": 3 });
+		expect(staged.aggregateBytes).toBeLessThan(staged.unslimmedBytes / 2);
 		expect(staged.aggregateBytes).toBe(
 			Buffer.byteLength(mainText) + Buffer.byteLength(childText),
 		);
@@ -366,6 +372,143 @@ describe("filtered upload staging", () => {
 		for (const line of `${mainText}${childText}`.split("\n")) {
 			if (line !== "") expect(() => JSON.parse(line)).not.toThrow();
 		}
+	});
+
+	test("produces the server's bytes: filter then slim, so a secret-rule match inside image base64 keeps the image inline", async () => {
+		// 6,000 bytes encode to 8,000 characters; "SK" + 32 hex + "AA" keeps the
+		// payload valid, padded base64 that the Twilio rule also matches.
+		const otherPixels = Buffer.alloc(6_000, 5).toString("base64");
+		const falsePositive = `${otherPixels}SK${"0123456789abcdef".repeat(2)}AA`;
+		const raw = `${[
+			JSON.stringify({
+				type: "user",
+				message: {
+					role: "user",
+					content: [
+						{
+							type: "image",
+							source: {
+								type: "base64",
+								media_type: "image/png",
+								data: falsePositive,
+							},
+						},
+						{
+							type: "image",
+							source: {
+								type: "base64",
+								media_type: "image/png",
+								data: SCREENSHOT_BASE64,
+							},
+						},
+					],
+				},
+			}),
+			JSON.stringify({
+				type: "response_item",
+				payload: {
+					type: "function_call_output",
+					output: [
+						{
+							type: "input_image",
+							image_url: `data:image/png;base64,${falsePositive}`,
+						},
+					],
+				},
+			}),
+		].join("\n")}\n`;
+		const directory = await mkdtemp(join(tmpdir(), "opaline-slim-order-"));
+		temporaryDirectories.push(directory);
+		const path = join(directory, "main.jsonl");
+		await writeFile(path, raw);
+		const stage = async (slim: boolean, fromFile: boolean) => {
+			const staged = await stageFilteredUpload(
+				createFilteredUploadSources(
+					fromFile
+						? {
+								kind: "file",
+								metadata: {
+									projectPath: "/t",
+									sessionId: "order",
+									source: "codex",
+								},
+								subagents: [],
+								transcriptPath: path,
+							}
+						: {
+								content: raw,
+								projectPath: "/t",
+								sessionId: "order",
+								source: "codex",
+							},
+					{ slim },
+				),
+			);
+			temporaryDirectories.push(staged.directory);
+			return readFile(staged.objects[0]?.path ?? "", "utf8");
+		};
+		// 0.11 sent the filtered, unslimmed transcript; the API slims what it
+		// receives. 0.12 must upload exactly the bytes the API derives from it.
+		const sentBy011 = await stage(false, true);
+		const derivedByServer = slimTranscriptText(sentBy011);
+		for (const fromFile of [true, false]) {
+			const sentBy012 = await stage(true, fromFile);
+			expect(sentBy012).toBe(derivedByServer);
+			expect(slimTranscriptText(sentBy012)).toBe(sentBy012);
+		}
+		expect(sentBy011).toBe(
+			filterSessionTextFields({ content: raw, subagents: undefined }).content,
+		);
+		// The false-positive images stay inline (their base64 is broken by the
+		// redaction), the clean screenshot becomes a marker.
+		expect(derivedByServer).toContain("[REDACTED:twilio-api-key]");
+		expect(derivedByServer.split("[REDACTED:twilio-api-key]")).toHaveLength(3);
+		expect(derivedByServer.split(otherPixels)).toHaveLength(3);
+		expect(derivedByServer.split(SCREENSHOT_MARKER)).toHaveLength(2);
+	});
+
+	test("stages the API's shared parity fixture to exactly the expected bytes", async () => {
+		const input = await readFile(
+			new URL("./fixtures/transcript-slim/input.jsonl", import.meta.url),
+			"utf8",
+		);
+		const expected = await readFile(
+			new URL("./fixtures/transcript-slim/expected.jsonl", import.meta.url),
+			"utf8",
+		);
+		const directory = await mkdtemp(join(tmpdir(), "opaline-slim-fixture-"));
+		temporaryDirectories.push(directory);
+		const path = join(directory, "input.jsonl");
+		await writeFile(path, input);
+		const staged = await stageFilteredUpload(
+			createFilteredUploadSources(
+				{
+					kind: "file",
+					metadata: {
+						projectPath: "/t",
+						sessionId: "fixture",
+						source: "codex",
+					},
+					subagents: [],
+					transcriptPath: path,
+				},
+				{ slim: true },
+			),
+		);
+		temporaryDirectories.push(staged.directory);
+		const filteredExpected = filterSessionTextFields({
+			content: expected,
+			subagents: undefined,
+		}).content;
+		expect(await readFile(staged.objects[0]?.path ?? "", "utf8")).toBe(
+			filteredExpected,
+		);
+		expect(
+			slimTranscriptText(
+				filterSessionTextFields({ content: input, subagents: undefined })
+					.content,
+			),
+		).toBe(filteredExpected);
 	});
 
 	test("applies the 16 MiB record limit to the slimmed record", async () => {
@@ -442,6 +585,6 @@ describe("filtered upload staging", () => {
 		assert(main);
 
 		expect(await readFile(main.path, "utf8")).toBe(content);
-		expect(staged.filterInputBytes).toBe(staged.inputBytes);
+		expect(staged.unslimmedBytes).toBe(staged.aggregateBytes);
 	});
 });

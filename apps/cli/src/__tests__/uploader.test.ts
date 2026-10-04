@@ -19,6 +19,7 @@ import {
 	SecretFilterJsonIntegrityError,
 } from "../internal/secret-filter/index.js";
 import { MAX_RAW_TRANSCRIPT_BYTES } from "../lib/filtered-upload-staging.js";
+import { slimTranscriptText } from "../lib/transcript-slim.js";
 import {
 	formatRedactionSummary,
 	formatUploadError,
@@ -381,6 +382,85 @@ describe("uploadSession aggregate size guard", () => {
 			expect(body).not.toContain(screenshot);
 		} finally {
 			await stub.server.stop(true);
+		}
+	});
+
+	test("filters before slimming on the direct path, so a false positive in image base64 stays inline", async () => {
+		const pixels = Buffer.alloc(6_000, 5).toString("base64");
+		const falsePositive = `${pixels}SK${"0123456789abcdef".repeat(2)}AA`;
+		const content = `${JSON.stringify({
+			type: "user",
+			timestamp: "2026-10-04T10:00:00.000Z",
+			message: {
+				role: "user",
+				content: [
+					{
+						type: "image",
+						source: {
+							type: "base64",
+							media_type: "image/png",
+							data: falsePositive,
+						},
+					},
+				],
+			},
+		})}\n${JSON.stringify({
+			type: "user",
+			timestamp: "2026-10-04T10:00:01.000Z",
+			message: {
+				role: "user",
+				content: [
+					{
+						type: "image",
+						source: {
+							type: "base64",
+							media_type: "image/png",
+							data: Buffer.alloc(6_000, 9).toString("base64"),
+						},
+					},
+				],
+			},
+		})}\n`;
+		const stub = startIngestStub({
+			respond: (info) =>
+				respondAsSlimmingServer(info) ??
+				Response.json({ json: { success: true, sessionId: "order" } }),
+		});
+		try {
+			const result = await uploadSession(
+				{
+					source: "claude_code",
+					sessionId: "order",
+					projectPath: "/t",
+					content,
+				},
+				{
+					endpoint: `${stub.loopbackBase}/rpc`,
+					allowInsecureEndpoint: true,
+					token: INGEST_STUB_TEST_TOKEN,
+				},
+			);
+			expect(result.success).toBe(true);
+			const sent = JSON.parse(
+				stub.bodies[
+					stub.requests.findIndex(
+						(request) => request.pathname === "/rpc/ingestSession",
+					)
+				] ?? "",
+			).json.content;
+			// What 0.11 sent (filtered) slimmed the way the API slims it.
+			expect(sent).toBe(
+				slimTranscriptText(
+					secretFilter.filterSessionTextFields({
+						content,
+						subagents: undefined,
+					}).content,
+				),
+			);
+			expect(sent).toContain(`${pixels}[REDACTED:twilio-api-key]AA`);
+			expect(sent).toContain("opaline-image-omitted:v1;");
+		} finally {
+			stub.server.stop(true);
 		}
 	});
 

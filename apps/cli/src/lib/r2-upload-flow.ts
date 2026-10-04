@@ -165,7 +165,7 @@ export async function uploadSessionViaR2(
 	// Slimming that changed nothing needs no negotiation; slimmed bytes go
 	// only to a server that accepts them.
 	let slimming: TranscriptSlimming =
-		staged.filterInputBytes < staged.inputBytes ? "applied" : "unchanged";
+		staged.aggregateBytes < staged.unslimmedBytes ? "applied" : "unchanged";
 	if (slimming === "applied" && !(await config.canSlim())) {
 		await cleanupStagedUpload(staged);
 		staged = await stageFilteredUpload(
@@ -206,9 +206,10 @@ function getPreflightFailure(
 ): Exclude<R2UploadFlowResult, { readonly status: "success" }> | null {
 	const main = staged.objects.find((object) => object.kind === "main");
 	if (!main || main.byteLength === 0) return { status: "empty-main" };
+	// The filter ran over the raw input, as in 0.11.
 	const anomaly = getRedactionBudgetAnomaly(
 		staged.redactedBytes,
-		staged.filterInputBytes,
+		staged.inputBytes,
 		staged.redactions,
 	);
 	if (anomaly) return { anomaly, status: "redaction-budget" };

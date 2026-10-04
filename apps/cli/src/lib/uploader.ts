@@ -741,17 +741,9 @@ async function prepareLegacyUpload(
 			};
 		}
 	}
-	const unslimmed = await materializeLegacyUploadRequest(request);
-	const candidate = slimUploadRequest(unslimmed);
-	// Slimming that changed nothing needs no negotiation.
-	const slimming: TranscriptSlimming =
-		getUploadAggregateBytes(candidate) >= getUploadAggregateBytes(unslimmed)
-			? "unchanged"
-			: (await canSlim())
-				? "applied"
-				: "unsupported";
-	const materialized = slimming === "applied" ? candidate : unslimmed;
-	const maxAggregateBytes = maxAggregateBytesFor(slimming);
+	const materialized = await materializeLegacyUploadRequest(request);
+	// Secret filter first, then slimming (as 0.11 and the API order them), so
+	// every CLI version derives the same bytes from one transcript.
 	const inputBytes = getUploadAggregateBytes(materialized);
 	const filteredText = filterSessionTextFields({
 		content: materialized.content,
@@ -769,7 +761,7 @@ async function prepareLegacyUpload(
 	const nonEmptySubagents = filteredText.subagents?.filter(
 		(subagent) => Buffer.byteLength(subagent.content, "utf8") > 0,
 	);
-	const filteredRequest: IngestSessionInput = {
+	const filtered: IngestSessionInput = {
 		...materialized,
 		content: filteredText.content,
 		subagents:
@@ -778,6 +770,16 @@ async function prepareLegacyUpload(
 				: undefined,
 		filter_version: FILTER_VERSION,
 	};
+	const candidate = slimUploadRequest(filtered);
+	// Slimming that changed nothing needs no negotiation.
+	const slimming: TranscriptSlimming =
+		getUploadAggregateBytes(candidate) >= getUploadAggregateBytes(filtered)
+			? "unchanged"
+			: (await canSlim())
+				? "applied"
+				: "unsupported";
+	const filteredRequest = slimming === "applied" ? candidate : filtered;
+	const maxAggregateBytes = maxAggregateBytesFor(slimming);
 	const aggregateBytes = getUploadAggregateBytes(filteredRequest);
 	if (aggregateBytes > maxAggregateBytes) {
 		return {
