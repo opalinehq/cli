@@ -17,6 +17,11 @@ export const SESSION_INSTRUCTION_MAX_FILES = 512;
 export const SESSION_INSTRUCTION_MAX_IMPORT_DEPTH = 5;
 // Working-tree and staged patches have their own pool as well.
 export const SESSION_DIFF_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
+// User context: every skill definition, observed ones first. Filled after the
+// instruction pool and never shares its budget.
+export const SESSION_USER_CONTEXT_MAX_FILE_BYTES = 2 * 1024 * 1024;
+export const SESSION_USER_CONTEXT_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
+export const SESSION_USER_CONTEXT_MAX_FILES = 1024;
 
 export const INSTRUCTION_IMPORT_EVIDENCE_REASON = "instruction-import";
 // Explicitly included files of user-level roots (see ContextRootInclude).
@@ -94,6 +99,24 @@ export function getInstructionRank(
 	)
 		return 1;
 	return 2 + path.split("/").length;
+}
+
+/**
+ * Rank in the user-context pool (lower first), or null for content that does
+ * not belong to it: observed skill definitions, then every other skill
+ * definition, then the resources of observed skills.
+ * Resources of other skills stay hash-only.
+ */
+export function getSessionUserContextRank(
+	categories: readonly ContextFileCategory[],
+	skillDirectory: string | null,
+	observedSkillNames: ReadonlySet<string>,
+): number | null {
+	const observed =
+		skillDirectory !== null && observedSkillNames.has(basename(skillDirectory));
+	if (categories.includes("skill-definition")) return observed ? 3 : 4;
+	if (categories.includes("skill-resource") && observed) return 5;
+	return null;
 }
 
 /**

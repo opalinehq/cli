@@ -4,6 +4,9 @@ import {
 	SESSION_INSTRUCTION_MAX_FILE_BYTES,
 	SESSION_INSTRUCTION_MAX_FILES,
 	SESSION_INSTRUCTION_MAX_TOTAL_BYTES,
+	SESSION_USER_CONTEXT_MAX_FILE_BYTES,
+	SESSION_USER_CONTEXT_MAX_FILES,
+	SESSION_USER_CONTEXT_MAX_TOTAL_BYTES,
 } from "./capture-policy.js";
 import type {
 	LocalContextCollectionLimits,
@@ -44,6 +47,9 @@ export const DEFAULT_LOCAL_CONTEXT_COLLECTION_LIMITS: LocalContextCollectionLimi
 		maxInstructionContentBytesPerFile: SESSION_INSTRUCTION_MAX_FILE_BYTES,
 		maxInstructionContentBytes: SESSION_INSTRUCTION_MAX_TOTAL_BYTES,
 		maxDiffContentBytes: SESSION_DIFF_MAX_TOTAL_BYTES,
+		maxUserContextFiles: SESSION_USER_CONTEXT_MAX_FILES,
+		maxUserContextContentBytesPerFile: SESSION_USER_CONTEXT_MAX_FILE_BYTES,
+		maxUserContextContentBytes: SESSION_USER_CONTEXT_MAX_TOTAL_BYTES,
 	};
 
 export function getDefaultLocalContextCollectionOptions(): LocalContextCollectionOptions {

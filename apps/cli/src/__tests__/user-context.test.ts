@@ -258,11 +258,17 @@ describe("user-level context roots", () => {
 		expect(
 			read("claude-plugins", "mkt/plug/1.0.0/skills/observed/SKILL.md"),
 		).toBe("Observed plugin skill\n");
+		// Every available skill definition, observed or not, in full.
+		expect(
+			read("claude-plugins", "mkt/plug/1.0.0/skills/unused/SKILL.md"),
+		).toBe("Unused plugin skill\n");
+		expect(
+			read("codex-plugins", "mkt/plug/v2/skills/codex-skill/SKILL.md"),
+		).toBe("Codex plugin skill\n");
 		for (const [rootId, path] of [
 			["home-instructions", "work/team/CLAUDE.local.md"],
 			["claude-user-home", "settings.json"],
 			["codex-user-home", "config.toml"],
-			["claude-plugins", "mkt/plug/1.0.0/skills/unused/SKILL.md"],
 			["claude-plugins", "mkt/plug/1.0.0/commands/review.md"],
 		] as const) {
 			const entry = getFile(bundle, rootId, path);

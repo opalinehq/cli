@@ -547,8 +547,26 @@ function getSkillInventoryGap(bundle: LocalContextBundle): string | null {
 		bundle.manifest.coverage.truncated?.omittedSkillDefinitions ?? 0;
 	if (omitted > 0)
 		return `${omitted} skill definition(s) were omitted by the manifest bound`;
+	// Every skill definition is captured in full; one cut by a capacity limit
+	// leaves the skill inventory without its content.
+	const cut = bundle.manifest.entries.filter(
+		(entry) =>
+			entry.kind === "file" &&
+			entry.categories.includes("skill-definition") &&
+			entry.content.status === "omitted" &&
+			SKILL_CAPACITY_OMISSIONS.has(entry.content.reason),
+	).length;
+	if (cut > 0)
+		return `${cut} skill definition(s) exceeded the capture's content budget`;
 	return null;
 }
+
+const SKILL_CAPACITY_OMISSIONS: ReadonlySet<string> = new Set([
+	"blob-count-cap",
+	"file-content-cap",
+	"root-content-cap",
+	"total-content-cap",
+]);
 
 function buildGitStateCoverage(bundle: LocalContextBundle): CoverageItem {
 	const snapshot = bundle.manifest.git;

@@ -440,7 +440,7 @@ describe("local context collection from a real Git worktree", () => {
 		{ observedSkillNames: ["demo"] },
 		{ observedSkillNames: ["DEMO"] },
 	])(
-		"session evidence only materializes skills observed by exact name (%j)",
+		"session evidence materializes every skill definition and nothing else outside instructions (%j)",
 		async ({ observedSkillNames }) => {
 			const fixture = await createRepositoryFixture();
 			const options = {
@@ -464,27 +464,19 @@ describe("local context collection from a real Git worktree", () => {
 			const unrelated = getFile(bundle, "repository", "README.md");
 
 			expect(agents.content.status).toBe("available");
+			// Every available skill's definition is captured, observed or not.
 			for (const definition of [
 				skill,
 				getFile(bundle, "user-skills", "demo/SKILL.md"),
+				getFile(bundle, "user-skills", "cached-plugin/skill/SKILL.md"),
 			]) {
-				if (observedSkillNames?.includes("demo")) {
-					expect(definition.content.status).toBe("available");
-				} else {
-					expect(definition.content).toMatchObject({
-						status: "omitted",
-						reason: "metadata-only",
-					});
-				}
+				expect(definition.content.status).toBe("available");
 				expect(definition.hash).toMatchObject({
 					status: "available",
 					algorithm: "sha256",
-					scope: observedSkillNames?.includes("demo") ? "stored" : "source",
+					scope: "stored",
 				});
 			}
-			expect(
-				getFile(bundle, "user-skills", "cached-plugin/skill/SKILL.md").content,
-			).toMatchObject({ status: "omitted", reason: "metadata-only" });
 			expect(packageContext.content).toMatchObject({
 				status: "omitted",
 				reason: "metadata-only",

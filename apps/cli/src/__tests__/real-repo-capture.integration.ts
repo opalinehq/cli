@@ -14,6 +14,11 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, join, relative } from "node:path";
 import { parse as parseToml } from "smol-toml";
+import {
+	REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES,
+	REPOSITORY_EVIDENCE_MAX_OBJECTS,
+} from "../contracts/index.js";
+import { filterKnownSecrets } from "../internal/secret-filter/index.js";
 import { getConfigDir } from "../lib/local-state.js";
 import { readPendingRepositoryEvidence } from "../lib/repository-evidence-pending.js";
 import { captureAndUploadSessionEvidence } from "../lib/session-evidence.js";
@@ -201,12 +206,16 @@ describe("real repository sidecar capture", () => {
 								result.stored === "content" && result.path === "CLAUDE.md",
 						),
 				).toBe(true);
-				// Every file captured outside the repository (user and parent
-				// instructions, their imports, observed plugin skills) is stored
-				// byte for byte as on disk.
+				// Every captured file outside the repository (user and parent
+				// instructions and their imports, every skill definition), and
+				// every repository skill definition, is stored byte for byte as on
+				// disk after the secret filter.
 				const userFiles: string[] = [];
+				const fullContent = (entry: (typeof localContext.entries)[number]) =>
+					entry.rootId !== "repository" ||
+					entry.categories?.includes("skill-definition");
 				for (const entry of localContext.entries) {
-					if (entry.rootId === "repository" || entry.kind !== "file") continue;
+					if (!fullContent(entry) || entry.kind !== "file") continue;
 					if (entry.content?.status !== "available" || !entry.content.blobId)
 						continue;
 					const root = localContext.roots.find(
@@ -223,12 +232,50 @@ describe("real repository sidecar capture", () => {
 					}
 					const stored = capture.objects.get(entry.content.blobId);
 					assert(stored, `${entry.rootId}:${entry.path} was not delivered`);
-					expect(entry.content.secretFilter?.redactedBytes ?? 0).toBe(0);
-					expect(sha256(stored)).toBe(sha256(onDisk));
+					const redacted = (entry.content.secretFilter?.redactedBytes ?? 0) > 0;
+					expect(sha256(stored)).toBe(
+						redacted
+							? sha256(
+									new TextEncoder().encode(
+										filterKnownSecrets(new TextDecoder().decode(onDisk)).text,
+									),
+								)
+							: sha256(onDisk),
+					);
 					userFiles.push(
-						`${entry.rootId}:${entry.path} (${onDisk.byteLength} B, sha256 match)`,
+						`${entry.rootId}:${entry.path} (${onDisk.byteLength} B, sha256 ${redacted ? "match after secret filter" : "match"})`,
 					);
 				}
+				// Every skill definition, observed or not, has its content.
+				const contextFiles = localContext.entries.filter(
+					(entry) =>
+						entry.kind === "file" &&
+						entry.categories?.includes("skill-definition"),
+				);
+				expect(
+					contextFiles
+						.filter((entry) => entry.content?.status !== "available")
+						.map((entry) => `${entry.rootId}:${entry.path}`),
+				).toEqual([]);
+				const countContext = (
+					predicate: (entry: (typeof contextFiles)[number]) => boolean,
+				) => contextFiles.filter(predicate).length;
+				const contextCounts = {
+					skillDefinitions: countContext(
+						(entry) => entry.categories?.includes("skill-definition") ?? false,
+					),
+				};
+				// The protocol's object and aggregate limits hold with every skill.
+				const aggregateBytes = capture.input.objects.reduce(
+					(total, object) => total + object.byteLength,
+					0,
+				);
+				expect(capture.input.objects.length).toBeLessThanOrEqual(
+					REPOSITORY_EVIDENCE_MAX_OBJECTS,
+				);
+				expect(aggregateBytes).toBeLessThanOrEqual(
+					REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES,
+				);
 				if (await isFile(join(homedir(), ".claude", "CLAUDE.md")))
 					expect(
 						userFiles.some((file) =>
@@ -292,6 +339,8 @@ describe("real repository sidecar capture", () => {
 					limitsReached: localContext.coverage.limitsReached,
 					truncated: localContext.coverage.truncated ?? null,
 					objects: capture.input.objects.length,
+					aggregateBytes,
+					contextCounts,
 					entries: localContext.entries.length,
 					instructions: instructionResults,
 					userFiles,

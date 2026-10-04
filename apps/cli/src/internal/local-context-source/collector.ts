@@ -80,6 +80,13 @@ export async function collectLocalContextBundle(
 				effectiveOptions.limits.maxDiffContentBytes,
 			)
 		: blobStore;
+	const userContextBlobStore = sessionEvidence
+		? createBlobStore(
+				options.parentCapture,
+				effectiveOptions.limits.maxUserContextFiles,
+				effectiveOptions.limits.maxUserContextContentBytes,
+			)
+		: null;
 	const git = await collectGitSnapshot(
 		requestedRoot,
 		effectiveOptions.limits,
@@ -93,9 +100,16 @@ export async function collectLocalContextBundle(
 		env.fileSystem,
 		git,
 		blobStore,
-		instructionBlobStore,
+		{
+			instruction: instructionBlobStore,
+			userContext: userContextBlobStore,
+		},
 	);
-	for (const pool of [instructionBlobStore, gitBlobStore]) {
+	for (const pool of [
+		instructionBlobStore,
+		gitBlobStore,
+		userContextBlobStore,
+	]) {
 		if (pool === null || pool === blobStore) continue;
 		for (const blob of pool.blobs.values()) blobStore.blobs.set(blob.id, blob);
 	}

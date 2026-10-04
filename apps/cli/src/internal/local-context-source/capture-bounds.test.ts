@@ -126,7 +126,7 @@ async function createCanaryFixture() {
 	return { repository, skills };
 }
 
-test("bounds a clean canary-shaped capture without uploading skill resources or documentation", async () => {
+test("bounds a clean canary-shaped capture with every skill definition but no skill resources or documentation", async () => {
 	const fixture = await createCanaryFixture();
 	const defaults = getDefaultLocalContextCollectionOptions();
 	const bundle = await collectLocalContextBundle(
@@ -251,18 +251,20 @@ test("bounds a clean canary-shaped capture without uploading skill resources or 
 		reason: "capture-limit",
 	});
 	expect(bundle.manifest.coverage.limitsReached).toContain("maxManifestBytes");
-	expect(bundle.manifest.coverage.contentFiles).toBe(2);
+	// Two instruction files plus every one of the 120 skill definitions, in
+	// full, from the user-context pool.
+	expect(bundle.manifest.coverage.contentFiles).toBe(122);
 	expect(bundle.manifest.contextIndex.skills.length).toBeGreaterThan(0);
+	let definitions = 0;
 	for (const entry of bundle.manifest.entries) {
 		if (entry.kind !== "file" || !entry.categories.includes("skill-definition"))
 			continue;
-		expect(entry.content).toMatchObject({
-			status: "omitted",
-			reason: "metadata-only",
-		});
-		expect(entry.hash.status).toBe("available");
+		definitions += 1;
+		expect(entry.content.status).toBe("available");
+		expect(entry.hash).toMatchObject({ status: "available", scope: "stored" });
 	}
-	expect(bundle.blobs).toHaveLength(2);
+	expect(definitions).toBe(120);
+	expect(bundle.blobs).toHaveLength(122);
 	const resources = bundle.manifest.entries.filter(
 		(entry) =>
 			entry.kind === "file" &&
@@ -847,9 +849,9 @@ function fileEntry(
 	return entry;
 }
 
-test.each([1, 2, 3, 4])(
-	"captures instructions from their own pool, then observed skills across roots and agent definitions at a %i-blob cap",
-	async (maxBlobs) => {
+test.each([1, 2, 3, 4, 5])(
+	"captures instructions from their own pool, then every skill (observed first) from the user-context pool at a %i-file cap",
+	async (maxUserContextFiles) => {
 		const directory = await createSmallFixture({
 			"repo/AGENTS.md": "Root instructions\n",
 			"repo/nested/CLAUDE.md": "Nested instructions\n",
@@ -878,7 +880,7 @@ test.each([1, 2, 3, 4])(
 			...defaults,
 			capturePolicy: "session-evidence" as const,
 			observedSkillNames: [...observedSkillNames, "repo-skill"],
-			limits: { ...defaults.limits, maxBlobs },
+			limits: { ...defaults.limits, maxUserContextFiles },
 			additionalRoots: ["a", "z", "codex", "agents"].map((suffix) => ({
 				id: `skills-${suffix}`,
 				label: `Skills ${suffix}`,
@@ -897,45 +899,51 @@ test.each([1, 2, 3, 4])(
 			options,
 			env,
 		);
-		for (const path of ["AGENTS.md", "nested/CLAUDE.md"]) {
+		// Instructions come from their own pool, the agent definition from the
+		// general pool. Neither competes with skills.
+		for (const path of [
+			"AGENTS.md",
+			"nested/CLAUDE.md",
+			".claude/agents/reviewer.md",
+		]) {
 			const entry = fileEntry(bundle, "repository", path);
 			expect(entry.content.status).toBe("available");
 			expect(entry.hash.status).toBe("available");
 		}
-		const priority = [
+		const skillOrder = [
 			["repository", ".claude/skills/repo-skill/SKILL.md"],
 			["skills-z", "zzz-observed/SKILL.md"],
-			["repository", ".claude/agents/reviewer.md"],
+			["skills-a", "aaa-unused/SKILL.md"],
+			["skills-agents", "private/SKILL.md"],
+			["skills-codex", "private/SKILL.md"],
 		] as const;
-		for (const [index, [rootId, path]] of priority.entries()) {
+		for (const [index, [rootId, path]] of skillOrder.entries()) {
 			const entry = fileEntry(bundle, rootId, path);
-			expect(entry.content.status).toBe(
-				index < maxBlobs ? "available" : "omitted",
+			expect(entry.content).toMatchObject(
+				index < maxUserContextFiles
+					? { status: "available" }
+					: { status: "omitted", reason: "blob-count-cap" },
 			);
 			expect(entry.hash.status).toBe("available");
 		}
-		for (const [rootId, path] of [
-			["repository", "nested/CLAUDE.local.md"],
-			["repository", ".claude/settings.json"],
-			["skills-a", "aaa-unused/SKILL.md"],
-			["skills-codex", "private/SKILL.md"],
-			["skills-agents", "private/SKILL.md"],
-		]) {
-			const entry = fileEntry(bundle, rootId, path);
-			expect(entry.content).toMatchObject({
+		for (const path of ["nested/CLAUDE.local.md", ".claude/settings.json"])
+			expect(fileEntry(bundle, "repository", path).content).toMatchObject({
 				status: "omitted",
 				reason: "metadata-only",
 			});
-			expect(entry.hash.status).toBe("available");
-		}
-		expect(bundle.blobs).toHaveLength(2 + Math.min(maxBlobs, priority.length));
-		if (maxBlobs < priority.length)
+		expect(bundle.blobs).toHaveLength(
+			3 + Math.min(maxUserContextFiles, skillOrder.length),
+		);
+		if (maxUserContextFiles < skillOrder.length) {
 			expect(bundle.manifest.coverage.truncated).toEqual({
-				omittedBlobs: priority.length - maxBlobs,
+				omittedBlobs: skillOrder.length - maxUserContextFiles,
 				omittedEntries: 0,
 				reason: "capture-limit",
 			});
-		else expect(bundle.manifest.coverage.truncated).toBeUndefined();
+			expect(bundle.manifest.coverage.limitsReached).toContain(
+				"maxUserContextFiles",
+			);
+		} else expect(bundle.manifest.coverage.truncated).toBeUndefined();
 		const repeat = await collectLocalContextBundle(
 			join(directory, "repo"),
 			{ ...options, additionalRoots: [...options.additionalRoots].reverse() },
@@ -1040,8 +1048,12 @@ test("Git patches have their own pool and are cut only by their own limit", asyn
 		expect(facet.coverage).toBe("complete");
 });
 
-test("enforces the exact 2 MiB general-content boundary after instructions and hashes omitted content", async () => {
+test("enforces the exact 2 MiB general-content boundary after instructions and skills and hashes omitted content", async () => {
 	const files = Object.fromEntries([
+		...Array.from({ length: 4 }, (_, index) => [
+			`.claude/agents/big-${index}.md`,
+			`${index}${"w".repeat(512 * 1024 - 1)}`,
+		]),
 		...Array.from({ length: 4 }, (_, index) => [
 			`.claude/skills/observed-${index}/SKILL.md`,
 			`${index}${"x".repeat(512 * 1024 - 1)}`,
@@ -1065,11 +1077,12 @@ test("enforces the exact 2 MiB general-content boundary after instructions and h
 		},
 		createLocalContextSourceEnv(),
 	);
-	// Four 512 KiB instruction files come from the instruction pool; four
-	// 512 KiB observed skills fill the 2 MiB general pool exactly.
-	expect(bundle.blobs).toHaveLength(8);
+	// Four 512 KiB instruction files come from the instruction pool and four
+	// 512 KiB skills from the user-context pool; four 512 KiB agent
+	// definitions fill the 2 MiB general pool exactly.
+	expect(bundle.blobs).toHaveLength(12);
 	expect(bundle.blobs.reduce((total, blob) => total + blob.byteLength, 0)).toBe(
-		4 * 1024 * 1024,
+		6 * 1024 * 1024,
 	);
 	for (const path of [".claude/agents/reviewer.md", ".mcp.json"]) {
 		const entry = fileEntry(bundle, "repository", path);
@@ -1095,7 +1108,7 @@ test("enforces the exact 2 MiB general-content boundary after instructions and h
 		expect(facet.coverage).toBe("complete");
 });
 
-test("all skill resources, including configs and instructions, are hash-only and high-risk exclusions are unchanged", async () => {
+async function createSkillResourceFixture(): Promise<string> {
 	const directory = await createSmallFixture({
 		"AGENTS.md": "Repository instructions\n",
 		".claude/skills/demo/SKILL.md": "Definition\n",
@@ -1124,12 +1137,17 @@ test("all skill resources, including configs and instructions, are hash-only and
 		],
 		{ cwd: directory },
 	);
+	return directory;
+}
+
+test("resources of skills the session did not use, including configs and instructions, are hash-only and high-risk exclusions are unchanged", async () => {
+	const directory = await createSkillResourceFixture();
 	const bundle = await collectLocalContextBundle(
 		directory,
 		{
 			...getDefaultLocalContextCollectionOptions(),
 			capturePolicy: "session-evidence",
-			observedSkillNames: ["demo"],
+			observedSkillNames: [],
 		},
 		createLocalContextSourceEnv(),
 	);
@@ -1163,6 +1181,43 @@ test("all skill resources, including configs and instructions, are hash-only and
 		),
 	).toBe(true);
 	expect(bundle.manifest.coverage.truncated).toBeUndefined();
+});
+
+test("resources of a skill the session used are captured in full, except binaries and high-risk files", async () => {
+	const directory = await createSkillResourceFixture();
+	const bundle = await collectLocalContextBundle(
+		directory,
+		{
+			...getDefaultLocalContextCollectionOptions(),
+			capturePolicy: "session-evidence",
+			observedSkillNames: ["demo"],
+		},
+		createLocalContextSourceEnv(),
+	);
+	for (const path of [
+		".claude/skills/demo/SKILL.md",
+		".claude/skills/demo/references/AGENTS.md",
+		".claude/skills/demo/rules/rule.md",
+		".claude/skills/demo/guidelines/guidance.md",
+		".claude/skills/demo/scripts/run.sh",
+		".claude/skills/demo/config.json",
+	])
+		expect(fileEntry(bundle, "repository", path).content.status).toBe(
+			"available",
+		);
+	expect(
+		fileEntry(bundle, "repository", ".claude/skills/demo/assets/image.png")
+			.content,
+	).toMatchObject({ status: "omitted", reason: "binary" });
+	expect(
+		fileEntry(bundle, "repository", ".claude/skills/demo/.env").content,
+	).toMatchObject({ status: "omitted", reason: "high-risk-path" });
+	expect(
+		fileEntry(bundle, "repository", "docs/reference.md").content,
+	).toMatchObject({ status: "omitted", reason: "metadata-only" });
+	for (const blob of bundle.blobs)
+		expect(blob.content).not.toContain("HIGH_RISK_CANARY");
+	expect(bundle.blobs).toHaveLength(7);
 });
 
 test("large Git and exclusion inventories cannot escape the manifest byte bound", async () => {

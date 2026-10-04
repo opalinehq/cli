@@ -5,6 +5,7 @@ import { addSanitizedTextBlob } from "./blob-store.js";
 import {
 	getInstructionRank,
 	getSessionContentPriority,
+	getSessionUserContextRank,
 	INSTRUCTION_IMPORT_EVIDENCE_REASON,
 	INSTRUCTION_INCLUDE_EVIDENCE_REASON,
 	isSessionInstructionContent,
@@ -51,7 +52,21 @@ const DISCOVERY_LIMITS: ReadonlySet<string> = new Set([
 	"maxTotalEntries",
 ]);
 
-type ContentPool = "general" | "instruction";
+type ContentPool = "general" | "instruction" | "user-context";
+type DedicatedPool = Exclude<ContentPool, "general">;
+
+/** Session-evidence content pools with budgets of their own. */
+export interface DedicatedContentPools {
+	readonly instruction: BlobStore | null;
+	readonly userContext: BlobStore | null;
+}
+
+interface DedicatedPoolLimits {
+	readonly maxFileBytes: number;
+	readonly maxTotalBytes: number;
+	readonly filesLimit: string;
+	readonly bytesLimit: string;
+}
 
 interface PendingFile {
 	readonly result: {
@@ -62,6 +77,8 @@ interface PendingFile {
 	readonly entry: DiscoveredEntry;
 	readonly categories: readonly ContextFileCategory[];
 	readonly rootOrder: number;
+	/** The skill directory holding this file, if any. */
+	readonly skillDirectory: string | null;
 }
 
 interface RootSpec {
@@ -119,7 +136,7 @@ interface MutableAggregate {
 	totalEnumeratedEntries: number;
 	totalEntries: number;
 	contentBudgetBytes: number;
-	instructionBudgetBytes: number;
+	poolBudgetBytes: Record<DedicatedPool, number>;
 	hashBudgetBytes: number;
 	inventoryBytes: number;
 	materializedBytes: number;
@@ -148,7 +165,10 @@ export async function collectFileSystemContext(
 	fileSystem: LocalContextFileSystem,
 	git: GitCollectionResult,
 	blobStore: BlobStore,
-	instructionBlobStore: BlobStore | null = null,
+	pools: DedicatedContentPools = {
+		instruction: null,
+		userContext: null,
+	},
 ): Promise<FileSystemCollectionResult> {
 	const rootSpecs: readonly RootSpec[] = [
 		{
@@ -169,7 +189,7 @@ export async function collectFileSystemContext(
 		totalEnumeratedEntries: 0,
 		totalEntries: 0,
 		contentBudgetBytes: 0,
-		instructionBudgetBytes: 0,
+		poolBudgetBytes: { instruction: 0, "user-context": 0 },
 		hashBudgetBytes: 0,
 		inventoryBytes: 0,
 		materializedBytes: 0,
@@ -235,7 +255,16 @@ export async function collectFileSystemContext(
 				result.root.scope,
 			);
 			if (entry.stat.kind === "file") {
-				files.push({ result, entry, categories, rootOrder });
+				files.push({
+					result,
+					entry,
+					categories,
+					rootOrder,
+					skillDirectory: findSkillDirectory(
+						entry.path,
+						result.skillDirectories,
+					),
+				});
 			} else {
 				entries.push(
 					await buildNonFileEntry(
@@ -275,8 +304,12 @@ export async function collectFileSystemContext(
 					getContentPriority(right.categories) ||
 				compareStrings(left.entry.path, right.entry.path),
 	);
-	const instructionStore =
-		options.capturePolicy === "session-evidence" ? instructionBlobStore : null;
+	const sessionEvidence = options.capturePolicy === "session-evidence";
+	const instructionStore = sessionEvidence ? pools.instruction : null;
+	const poolStores: Readonly<Record<DedicatedPool, BlobStore | null>> = {
+		instruction: instructionStore,
+		"user-context": sessionEvidence ? pools.userContext : null,
+	};
 	const processed = new Set<string>();
 	const processFile = async (
 		file: PendingFile,
@@ -284,6 +317,7 @@ export async function collectFileSystemContext(
 	): Promise<string | undefined> => {
 		processed.add(getFileKey(file.entry));
 		let text: string | undefined;
+		const store = pool === "general" ? null : poolStores[pool];
 		entries.push(
 			await buildRegularFileEntry(
 				file.result.root,
@@ -293,10 +327,8 @@ export async function collectFileSystemContext(
 				options,
 				fileSystem,
 				git,
-				pool === "instruction" && instructionStore !== null
-					? instructionStore
-					: blobStore,
-				pool,
+				store ?? blobStore,
+				store === null ? "general" : pool,
 				aggregate,
 				file.result.coverage,
 				errors,
@@ -365,6 +397,30 @@ export async function collectFileSystemContext(
 				queue.push({ file: candidate, depth: item.depth + 1 });
 			}
 		}
+	}
+	// Then the user-context pool in rank order (observed skills, then every
+	// other skill), from its own budget.
+	if (poolStores["user-context"] !== null) {
+		const ranked = files.flatMap((file) => {
+			if (processed.has(getFileKey(file.entry))) return [];
+			const rank = getSessionUserContextRank(
+				file.categories,
+				file.skillDirectory,
+				observedSkills,
+			);
+			return rank === null || isHighRiskContentPath(file.entry.path)
+				? []
+				: [{ file, rank }];
+		});
+		ranked.sort(
+			(left, right) =>
+				left.rank - right.rank ||
+				compareStrings(
+					`${left.file.entry.rootId}\0${left.file.entry.path}`,
+					`${right.file.entry.rootId}\0${right.file.entry.path}`,
+				),
+		);
+		for (const { file } of ranked) await processFile(file, "user-context");
 	}
 	for (const file of files) {
 		if (processed.has(getFileKey(file.entry))) continue;
@@ -1060,9 +1116,9 @@ async function buildRegularFileEntry(
 	}
 
 	const contentLimitReason =
-		pool === "instruction"
-			? getInstructionLimitReason(entry.stat.size, coverage, aggregate, options)
-			: getContentLimitReason(entry.stat.size, coverage, aggregate, options);
+		pool === "general"
+			? getContentLimitReason(entry.stat.size, coverage, aggregate, options)
+			: getPoolLimitReason(pool, entry.stat.size, coverage, aggregate, options);
 	if (contentLimitReason !== null) {
 		coverage.omittedContentFiles += 1;
 		aggregate.omittedBytes += entry.stat.size;
@@ -1085,9 +1141,9 @@ async function buildRegularFileEntry(
 	try {
 		const read = await fileSystem.readFileBounded(
 			entry.absolutePath,
-			pool === "instruction"
-				? options.limits.maxInstructionContentBytesPerFile
-				: options.limits.maxContentBytesPerFile,
+			pool === "general"
+				? options.limits.maxContentBytesPerFile
+				: getDedicatedPoolLimits(pool, options).maxFileBytes,
 		);
 		if (!read.complete) {
 			coverage.omittedContentFiles += 1;
@@ -1141,13 +1197,15 @@ async function buildRegularFileEntry(
 		if (sanitized.status === "failure") {
 			if (sanitized.reason === "blob-count-cap")
 				coverage.limitsReached.add(
-					pool === "instruction" ? "maxInstructionFiles" : "maxBlobs",
+					pool === "general"
+						? "maxBlobs"
+						: getDedicatedPoolLimits(pool, options).filesLimit,
 				);
 			if (sanitized.reason === "total-content-cap")
 				coverage.limitsReached.add(
-					pool === "instruction"
-						? "maxInstructionContentBytes"
-						: "maxTotalContentBytes",
+					pool === "general"
+						? "maxTotalContentBytes"
+						: getDedicatedPoolLimits(pool, options).bytesLimit,
 				);
 			coverage.omittedContentFiles += 1;
 			aggregate.omittedBytes += entry.stat.size;
@@ -1178,8 +1236,8 @@ async function buildRegularFileEntry(
 		coverage.contentBytes += sanitized.storedByteLength;
 		coverage.hashedFiles += 1;
 		coverage.hashedBytes += sanitized.storedByteLength;
-		if (pool === "instruction") {
-			aggregate.instructionBudgetBytes += read.bytes.byteLength;
+		if (pool !== "general") {
+			aggregate.poolBudgetBytes[pool] += read.bytes.byteLength;
 		} else {
 			coverage.generalContentBytes += sanitized.storedByteLength;
 			aggregate.contentBudgetBytes += read.bytes.byteLength;
@@ -1318,22 +1376,58 @@ function getContentLimitReason(
 	return null;
 }
 
-function getInstructionLimitReason(
+function getPoolLimitReason(
+	pool: DedicatedPool,
 	size: number,
 	coverage: MutableRootCoverage,
 	aggregate: MutableAggregate,
 	options: LocalContextCollectionOptions,
 ): Extract<FileContent, { status: "omitted" }>["reason"] | null {
-	if (size > options.limits.maxInstructionContentBytesPerFile)
-		return "file-content-cap";
-	if (
-		aggregate.instructionBudgetBytes + size >
-		options.limits.maxInstructionContentBytes
-	) {
-		coverage.limitsReached.add("maxInstructionContentBytes");
+	const limits = getDedicatedPoolLimits(pool, options);
+	if (size > limits.maxFileBytes) return "file-content-cap";
+	if (aggregate.poolBudgetBytes[pool] + size > limits.maxTotalBytes) {
+		coverage.limitsReached.add(limits.bytesLimit);
 		return "total-content-cap";
 	}
 	return null;
+}
+
+function getDedicatedPoolLimits(
+	pool: DedicatedPool,
+	options: LocalContextCollectionOptions,
+): DedicatedPoolLimits {
+	switch (pool) {
+		case "instruction":
+			return {
+				maxFileBytes: options.limits.maxInstructionContentBytesPerFile,
+				maxTotalBytes: options.limits.maxInstructionContentBytes,
+				filesLimit: "maxInstructionFiles",
+				bytesLimit: "maxInstructionContentBytes",
+			};
+		case "user-context":
+			return {
+				maxFileBytes: options.limits.maxUserContextContentBytesPerFile,
+				maxTotalBytes: options.limits.maxUserContextContentBytes,
+				filesLimit: "maxUserContextFiles",
+				bytesLimit: "maxUserContextContentBytes",
+			};
+	}
+}
+
+function findSkillDirectory(
+	path: string,
+	skillDirectories: readonly string[],
+): string | null {
+	let found: string | null = null;
+	for (const directory of skillDirectories)
+		if (
+			(directory === "." ||
+				path === directory ||
+				path.startsWith(`${directory}/`)) &&
+			(found === null || directory.length > found.length)
+		)
+			found = directory;
+	return found;
 }
 
 function getHashLimitReason(
