@@ -1,5 +1,11 @@
+import { spawn } from "node:child_process";
 import { readFile, rm } from "node:fs/promises";
-import type { IngestSessionInput } from "../contracts/index.js";
+import { join } from "node:path";
+import {
+	INGEST_AGGREGATE_CONTENT_MAX_BYTES,
+	type IngestSessionInput,
+	type RepositoryEvidenceCommitOutput,
+} from "../contracts/index.js";
 import type {
 	FileBackedUploadRequest,
 	FileBackedUploadSubagentDiscovery,
@@ -11,6 +17,7 @@ import {
 	loadAutoUploadConfig,
 } from "./auto-upload-config.js";
 import type { Credentials } from "./credentials.js";
+import { type FileLease, tryAcquireFileLease } from "./file-lease.js";
 import {
 	cleanupStagedUpload,
 	createFilteredUploadSources,
@@ -36,11 +43,16 @@ import {
 	readRepositoryEvidencePauseUntil,
 } from "./repository-evidence-pause.js";
 import {
+	acquirePendingRepositoryEvidenceLease,
 	deferPendingRepositoryEvidence,
+	getRepositoryEvidenceLeaseDirectory,
+	hasDuePendingRepositoryEvidence,
+	hasPendingRepositoryEvidence,
 	normalizeRepositoryEvidenceEndpoint,
 	type PendingRepositoryEvidence,
 	readPendingRepositoryEvidence,
 	removePendingRepositoryEvidence,
+	supersedePendingRepositoryEvidence,
 	writePendingRepositoryEvidence,
 } from "./repository-evidence-pending.js";
 import {
@@ -71,8 +83,34 @@ import { allowsInsecureEndpointFromEnv } from "./upload-endpoint.js";
 
 type EvidenceLifecycle = "start" | "resume" | "checkpoint" | "end";
 
-const EVIDENCE_DELIVERY_BUDGET_MS = 20_000;
-export const EVIDENCE_TRANSCRIPT_INPUT_MAX_BYTES = 32 * 1024 * 1024;
+// Collecting the repository context and staging the transcript, up to the
+// point where the capture is spooled as a pending item.
+const EVIDENCE_CAPTURE_BUDGET_MS = 45_000;
+// Delivery inside the hook. Whatever is not delivered by then stays spooled
+// and is delivered by a detached background process.
+const EVIDENCE_INLINE_DELIVERY_BUDGET_MS = 30_000;
+// Inline delivery also ends this long after the hook received its input, so
+// a slow capture plus delivery stays inside Claude Code's default 60 s hook
+// timeout and the hook itself starts the background deliverer.
+const EVIDENCE_HOOK_SOFT_LIMIT_MS = 50_000;
+export const EVIDENCE_BACKGROUND_DELIVERY_BUDGET_MS = 15 * 60_000;
+const EVIDENCE_BACKGROUND_MAX_ITEMS = 200;
+// Per item in the background: one minute plus 256 KiB/s of evidence bytes.
+const EVIDENCE_BACKGROUND_ITEM_BASE_MS = 60_000;
+const EVIDENCE_BACKGROUND_ITEM_BYTES_PER_SECOND = 256 * 1024;
+export const EVIDENCE_TRANSCRIPT_INPUT_MAX_BYTES =
+	INGEST_AGGREGATE_CONTENT_MAX_BYTES;
+
+export class EvidenceBudgetError extends Error {
+	constructor(readonly phase: "capture" | "delivery") {
+		super(
+			phase === "capture"
+				? `Repository evidence capture exceeded its ${EVIDENCE_CAPTURE_BUDGET_MS}ms budget.`
+				: "Repository evidence delivery reached its time budget; the capture stays spooled and is delivered in the background.",
+		);
+		this.name = "EvidenceBudgetError";
+	}
+}
 
 export async function captureAndUploadSessionEvidence(input: {
 	readonly credentials: Credentials;
@@ -86,70 +124,51 @@ export async function captureAndUploadSessionEvidence(input: {
 		readonly startedAt: string;
 	};
 	readonly terminalTranscript: boolean;
+	/**
+	 * Hooks start a detached `opaline hooks evidence-deliver` process for
+	 * captures they could not deliver within their budget. In-process callers
+	 * leave spooled captures to the next hook or `upload --retry`.
+	 */
+	readonly backgroundDelivery?: "spawn" | "none";
 }): Promise<
 	{ readonly contextId: string; readonly receiptId: string } | undefined
 > {
 	if (readRepositoryEvidencePauseUntil() !== undefined) return undefined;
-	const deadlineAt = Date.now() + EVIDENCE_DELIVERY_BUDGET_MS;
-	if (!input.credentials.user) {
+	const captureDeadlineAt = Date.now() + EVIDENCE_CAPTURE_BUDGET_MS;
+	const user = input.credentials.user;
+	if (!user) {
 		throw new Error("Repository evidence requires an authenticated CLI user.");
 	}
 	requireRepositoryEvidenceApiKey(input.credentials.authType);
 	const configDir = getConfigDir();
 	const apiBase = getApiBaseOverride() ?? input.credentials.apiBaseUrl;
 	const endpoint = normalizeRepositoryEvidenceEndpoint(`${apiBase}/rpc`);
-	const metadata =
-		"kind" in input.request ? input.request.metadata : input.request;
-	const [existingPending] = await readPendingRepositoryEvidence(configDir, {
-		actorId: input.credentials.user.id,
-		endpoint,
-		sessionId: metadata.sessionId,
-		maxItems: 1,
-		isEligible: (pending) =>
-			pending.upload.input.session.source === metadata.source &&
-			pending.upload.input.organizationId === input.organizationId,
-		onError: (error) =>
-			input.onWarning?.(error instanceof Error ? error.message : String(error)),
-		onWarning: (warning) => input.onWarning?.(warning.message),
-	});
-	if (existingPending) {
-		const error = await retryOnePendingRepositoryEvidence(
-			input.credentials,
-			input.credentials.user.id,
-			endpoint,
-			configDir,
-			deadlineAt,
-			input.onWarning,
-			existingPending.upload.input.operationId,
-		);
-		if (error !== undefined) throw error;
-		return undefined;
-	}
+	// An older pending capture of this session never blocks a new one: the new
+	// capture is spooled and delivered first, older items are retried after it.
 	const materialized = await materializeEvidenceRequest(
 		input.request,
 		input.requestMaterializedAt,
 		configDir,
-		deadlineAt,
+		captureDeadlineAt,
 	);
 	const request = materialized.request;
 	const sourceId = materialized.sourceId;
 	let hasPending = false;
-	let currentPending: PendingRepositoryEvidence | undefined;
 	let contextCapture:
 		| Awaited<ReturnType<typeof collectSessionRepositoryContext>>
 		| undefined;
 	try {
 		contextCapture = await collectSessionRepositoryContext({
-			accountId: input.credentials.user.id,
+			accountId: user.id,
 			endpoint,
 			lifecycle: input.lifecycle,
 			organizationId: input.organizationId,
 			repositoryPath: request.projectPath,
-			deadlineAt,
+			deadlineAt: captureDeadlineAt,
 			observedSkillNames: extractObservedSkills(request),
 		});
 		const scope = {
-			actorId: input.credentials.user.id,
+			actorId: user.id,
 			provider: request.source,
 			providerInstanceId: contextCapture.context.localIdentity.installationId,
 			sessionId: request.sessionId,
@@ -165,7 +184,7 @@ export async function captureAndUploadSessionEvidence(input: {
 			request.projectPath,
 			gitInfo,
 		);
-		assertCaptureBudget(deadlineAt);
+		assertCaptureBudget(captureDeadlineAt);
 		const transcriptRevision = await planTranscriptRevisionFile({
 			path: transcriptSourcePath(configDir, sourceId),
 			limits: {
@@ -210,7 +229,7 @@ export async function captureAndUploadSessionEvidence(input: {
 			transcriptLastEventAt: attribution.streams[0]?.prefix.lastEventAt ?? null,
 			transcriptRevision,
 		});
-		currentPending = {
+		const currentPending: PendingRepositoryEvidence = {
 			repositorySelection: {
 				repoKey: repository.repoKey,
 				legacyKeys: [getLegacyRepositoryKey(request.projectPath, gitInfo)],
@@ -228,56 +247,91 @@ export async function captureAndUploadSessionEvidence(input: {
 					: `Transcript evidence for session ${request.sessionId} is blocked by a ${transcriptRevision.delivery.recordBytes}-byte record that exceeds the delivery limit.`,
 			);
 		}
-		assertCaptureBudget(deadlineAt);
+		assertCaptureBudget(captureDeadlineAt);
+		// Spool first: from here on the capture survives a timeout, a crash or a
+		// killed hook and is delivered by a later hook or the background process.
 		await writePendingRepositoryEvidence(currentPending, configDir);
 		hasPending = true;
-		const receipt = await uploadWithBoundedRetries(upload, input.credentials, {
-			deadlineAt,
-			endpoint,
-		});
-		await markRepositorySpoolCaptureAccepted(
-			contextCapture.context.binding,
-			contextCapture.stored.capture.captureId,
-			"local-context",
-			contextCapture.context.spoolEnv,
-		);
-		await advanceTranscriptRevision(
-			transcriptRevision.manifest,
-			deliveryScope,
-			configDir,
-		);
-		await continueAcceptedTranscript(currentPending, configDir);
-		currentPending = undefined;
-		let pendingError: unknown;
 		try {
-			pendingError = await retryOnePendingRepositoryEvidence(
-				input.credentials,
-				input.credentials.user.id,
-				endpoint,
-				configDir,
-				deadlineAt,
-				input.onWarning,
-			);
-		} catch (error) {
-			pendingError = error;
-		}
-		if (pendingError !== undefined) throw pendingError;
-		return {
-			contextId: receipt.contextId,
-			receiptId: receipt.receiptId,
-		};
-	} catch (error) {
-		if (isEvidenceCaptureDisabledError(error)) {
-			await handleDisabledCapture(
-				error,
+			await supersedePendingRepositoryEvidence(
 				currentPending,
 				configDir,
+				(warning) => input.onWarning?.(warning.message),
+			);
+		} catch (error) {
+			// Superseding is housekeeping; the new capture is already spooled.
+			input.onWarning?.(
+				`Could not supersede older pending captures: ${getErrorMessage(error)}`,
+			);
+		}
+		// Elapsed hook time on the real wall clock (hookReceivedAt comes from a
+		// Date object); the deadline itself is kept on Date.now() like every
+		// other delivery deadline.
+		const hookElapsedMs =
+			performance.timeOrigin +
+			performance.now() -
+			Date.parse(input.hookReceivedAt);
+		const deliveryDeadlineAt =
+			Date.now() +
+			Math.max(
+				0,
+				Math.min(
+					EVIDENCE_INLINE_DELIVERY_BUDGET_MS,
+					Number.isFinite(hookElapsedMs)
+						? EVIDENCE_HOOK_SOFT_LIMIT_MS - hookElapsedMs
+						: EVIDENCE_INLINE_DELIVERY_BUDGET_MS,
+				),
+			);
+		const outcome = await deliverPendingRepositoryEvidence(
+			currentPending,
+			input.credentials,
+			configDir,
+			{
+				backoffOnBudget: false,
+				deadlineAt: deliveryDeadlineAt,
+				onWarning: input.onWarning,
+			},
+		);
+		let pendingError: unknown;
+		if (outcome.status === "delivered") {
+			try {
+				pendingError = await retryOnePendingRepositoryEvidence(
+					input.credentials,
+					user.id,
+					endpoint,
+					configDir,
+					deliveryDeadlineAt,
+					input.onWarning,
+				);
+			} catch (error) {
+				pendingError = error;
+			}
+		}
+		if (input.backgroundDelivery === "spawn")
+			await scheduleBackgroundEvidenceDelivery(
+				user.id,
+				endpoint,
+				configDir,
 				input.onWarning,
 			);
-			return undefined;
+		switch (outcome.status) {
+			case "delivered":
+				if (pendingError !== undefined) throw pendingError;
+				return {
+					contextId: outcome.receipt.contextId,
+					receiptId: outcome.receipt.receiptId,
+				};
+			case "deferred":
+				throw outcome.error;
+			case "paused":
+			case "busy":
+			case "skipped":
+				return undefined;
 		}
-		if (hasPending && currentPending) {
-			await deferPendingRepositoryEvidence(currentPending, configDir);
+	} catch (error) {
+		if (isEvidenceCaptureDisabledError(error)) {
+			await handleDisabledCapture(error, undefined, configDir, input.onWarning);
+			return undefined;
 		}
 		throw error;
 	} finally {
@@ -293,6 +347,102 @@ export async function captureAndUploadSessionEvidence(input: {
 			}
 		}
 	}
+}
+
+/**
+ * Delivers spooled captures in a detached process after the hook has
+ * returned, so a slow network or a large transcript never costs a capture.
+ * One background deliverer runs at a time per configuration directory.
+ */
+export async function deliverPendingSessionEvidenceInBackground(
+	credentials: Credentials,
+	options: {
+		readonly budgetMs?: number;
+		readonly onWarning?: (message: string) => void;
+	} = {},
+): Promise<BackgroundDeliveryResult> {
+	const result = {
+		alreadyRunning: false,
+		busy: 0,
+		deferred: 0,
+		delivered: 0,
+		skipped: 0,
+	};
+	if (readRepositoryEvidencePauseUntil() !== undefined) return result;
+	if (!credentials.user) {
+		throw new Error("Repository evidence requires an authenticated CLI user.");
+	}
+	requireRepositoryEvidenceApiKey(credentials.authType);
+	const configDir = getConfigDir();
+	const endpoint = normalizeRepositoryEvidenceEndpoint(
+		`${getApiBaseOverride() ?? credentials.apiBaseUrl}/rpc`,
+	);
+	const worker = await waitForBackgroundDeliveryLease(configDir);
+	if (worker === null) return { ...result, alreadyRunning: true };
+	try {
+		const deadlineAt =
+			Date.now() + (options.budgetMs ?? EVIDENCE_BACKGROUND_DELIVERY_BUDGET_MS);
+		const attempted = new Set<string>();
+		for (
+			let index = 0;
+			index < EVIDENCE_BACKGROUND_MAX_ITEMS && Date.now() < deadlineAt;
+			index += 1
+		) {
+			if (readRepositoryEvidencePauseUntil(configDir) !== undefined) break;
+			const [pending] = await readPendingRepositoryEvidence(configDir, {
+				actorId: credentials.user.id,
+				endpoint,
+				excludeOperationIds: attempted,
+				maxItems: 1,
+				isEligible: (candidate) =>
+					(candidate.next_attempt_at ?? 0) <= Date.now() &&
+					isPendingRepositoryEvidenceAutoUploadAllowed(candidate, configDir),
+				onError: (error) =>
+					options.onWarning?.(
+						error instanceof Error ? error.message : String(error),
+					),
+				onWarning: (warning) => options.onWarning?.(warning.message),
+			});
+			if (!pending) break;
+			attempted.add(pending.upload.input.operationId);
+			const outcome = await deliverPendingRepositoryEvidence(
+				pending,
+				credentials,
+				configDir,
+				{
+					backoffOnBudget: true,
+					canUpload: () =>
+						isPendingRepositoryEvidenceAutoUploadAllowed(pending, configDir),
+					deadlineAt: Math.min(
+						deadlineAt,
+						Date.now() + getBackgroundItemBudgetMs(pending),
+					),
+					onWarning: options.onWarning,
+				},
+			);
+			if (outcome.status === "delivered") result.delivered += 1;
+			if (outcome.status === "busy") result.busy += 1;
+			if (outcome.status === "skipped") result.skipped += 1;
+			if (outcome.status === "deferred") {
+				result.deferred += 1;
+				options.onWarning?.(
+					`Repository evidence ${pending.upload.input.capture.contextId} deferred: ${getErrorMessage(outcome.error)}`,
+				);
+			}
+			if (outcome.status === "paused") break;
+		}
+		return result;
+	} finally {
+		await worker.release();
+	}
+}
+
+export interface BackgroundDeliveryResult {
+	readonly alreadyRunning: boolean;
+	readonly busy: number;
+	readonly deferred: number;
+	readonly delivered: number;
+	readonly skipped: number;
 }
 
 export async function retryPendingSessionEvidence(
@@ -334,32 +484,24 @@ export async function retryPendingSessionEvidence(
 			break;
 		}
 		attemptedOperationIds.add(pending.upload.input.operationId);
-		try {
-			await uploadWithBoundedRetries(pending.upload, credentials, {
+		const outcome = await deliverPendingRepositoryEvidence(
+			pending,
+			credentials,
+			configDir,
+			{
 				allowInsecureEndpoint: options.allowInsecureEndpoint,
-				endpoint: pending.endpoint,
-			});
-			await markPendingRepositoryCaptureAccepted(pending, configDir);
-			await advanceTranscriptRevision(
-				pending.transcriptRevision,
-				getPendingDeliveryScope(pending),
-				configDir,
+				backoffOnBudget: true,
+				deadlineAt: undefined,
+				onWarning: options.onWarning,
+			},
+		);
+		if (outcome.status === "delivered") completed++;
+		if (outcome.status === "deferred") failures.push(outcome.error);
+		if (outcome.status === "busy")
+			options.onWarning?.(
+				`Repository evidence ${pending.upload.input.capture.contextId} is being delivered by another Opaline process.`,
 			);
-			await continueAcceptedTranscript(pending, configDir);
-			completed++;
-		} catch (error) {
-			if (isEvidenceCaptureDisabledError(error)) {
-				await handleDisabledCapture(
-					error,
-					pending,
-					configDir,
-					options.onWarning,
-				);
-				break;
-			}
-			failures.push(error);
-			await deferPendingRepositoryEvidence(pending, configDir);
-		}
+		if (outcome.status === "paused") break;
 	}
 	if (failures.length > 0) {
 		throw new AggregateError(
@@ -377,7 +519,6 @@ async function retryOnePendingRepositoryEvidence(
 	configDir: string,
 	deadlineAt: number,
 	onWarning: ((message: string) => void) | undefined,
-	operationId?: string,
 ): Promise<unknown | undefined> {
 	if (
 		Date.now() >= deadlineAt ||
@@ -390,38 +531,172 @@ async function retryOnePendingRepositoryEvidence(
 		endpoint,
 		maxItems: 1,
 		isEligible: (pending) =>
-			(operationId === undefined ||
-				pending.upload.input.operationId === operationId) &&
 			(pending.next_attempt_at ?? 0) <= Date.now() &&
 			isPendingRepositoryEvidenceAutoUploadAllowed(pending, configDir),
 		onError: (error) => failures.push(error),
 		onWarning: (warning) => onWarning?.(warning.message),
 	})) {
-		try {
-			await uploadWithBoundedRetries(pending.upload, credentials, {
+		const outcome = await deliverPendingRepositoryEvidence(
+			pending,
+			credentials,
+			configDir,
+			{
+				backoffOnBudget: false,
 				canUpload: () =>
 					isPendingRepositoryEvidenceAutoUploadAllowed(pending, configDir),
 				deadlineAt,
-				endpoint: pending.endpoint,
-			});
-			await markPendingRepositoryCaptureAccepted(pending, configDir);
-			await advanceTranscriptRevision(
-				pending.transcriptRevision,
-				getPendingDeliveryScope(pending),
-				configDir,
-			);
-			await continueAcceptedTranscript(pending, configDir);
-		} catch (error) {
-			if (isEvidenceCaptureDisabledError(error)) {
-				await handleDisabledCapture(error, pending, configDir, onWarning);
-				return undefined;
-			}
-			if (error instanceof RepositoryAutoUploadDisabledError) continue;
-			failures.push(error);
-			await deferPendingRepositoryEvidence(pending, configDir);
-		}
+				onWarning,
+			},
+		);
+		if (
+			outcome.status === "deferred" &&
+			!(outcome.error instanceof EvidenceBudgetError)
+		)
+			failures.push(outcome.error);
 	}
 	return failures[0];
+}
+
+type DeliveryOutcome =
+	| {
+			readonly status: "delivered";
+			readonly receipt: RepositoryEvidenceCommitOutput;
+	  }
+	| { readonly status: "deferred"; readonly error: unknown }
+	| { readonly status: "busy" }
+	| { readonly status: "paused" }
+	| { readonly status: "skipped" };
+
+/**
+ * Delivers one spooled capture under its exclusive lease. Retryable and
+ * permanent failures keep the item with backoff. A delivery cut by its time
+ * budget keeps the item due for the background deliverer unless
+ * `backoffOnBudget` is set (the background deliverer itself backs off so an
+ * item that cannot finish in its budget does not loop).
+ */
+async function deliverPendingRepositoryEvidence(
+	pending: PendingRepositoryEvidence,
+	credentials: Credentials,
+	configDir: string,
+	options: {
+		readonly allowInsecureEndpoint?: boolean;
+		readonly backoffOnBudget: boolean;
+		readonly canUpload?: () => boolean;
+		readonly deadlineAt: number | undefined;
+		readonly onWarning: ((message: string) => void) | undefined;
+	},
+): Promise<DeliveryOutcome> {
+	const lease = await acquirePendingRepositoryEvidenceLease(pending, configDir);
+	if (lease === null) return { status: "busy" };
+	try {
+		// Another process may have delivered or superseded the item between our
+		// read and the lease.
+		if (!(await hasPendingRepositoryEvidence(pending, configDir)))
+			return { status: "busy" };
+		const receipt = await uploadWithBoundedRetries(
+			pending.upload,
+			credentials,
+			{
+				allowInsecureEndpoint: options.allowInsecureEndpoint,
+				canUpload: options.canUpload,
+				deadlineAt: options.deadlineAt,
+				endpoint: pending.endpoint,
+			},
+		);
+		await markPendingRepositoryCaptureAccepted(pending, configDir);
+		await advanceTranscriptRevision(
+			pending.transcriptRevision,
+			getPendingDeliveryScope(pending),
+			configDir,
+		);
+		await continueAcceptedTranscript(pending, configDir);
+		return { status: "delivered", receipt };
+	} catch (error) {
+		if (isEvidenceCaptureDisabledError(error)) {
+			await handleDisabledCapture(error, pending, configDir, options.onWarning);
+			return { status: "paused" };
+		}
+		if (error instanceof RepositoryAutoUploadDisabledError)
+			return { status: "skipped" };
+		if (!(error instanceof EvidenceBudgetError) || options.backoffOnBudget)
+			await deferPendingRepositoryEvidence(pending, configDir);
+		return { status: "deferred", error };
+	} finally {
+		await lease.release();
+	}
+}
+
+/**
+ * Starts the detached background deliverer when spooled captures are due.
+ * It is a separate process so the host agent's hook timeout cannot cut it.
+ */
+async function scheduleBackgroundEvidenceDelivery(
+	actorId: string,
+	endpoint: string,
+	configDir: string,
+	onWarning: ((message: string) => void) | undefined,
+): Promise<boolean> {
+	if (readRepositoryEvidencePauseUntil(configDir) !== undefined) return false;
+	// A cheap header peek: the deliverer applies the full eligibility checks.
+	if (!(await hasDuePendingRepositoryEvidence(configDir, actorId, endpoint)))
+		return false;
+	try {
+		spawnBackgroundEvidenceDelivery();
+		return true;
+	} catch (error) {
+		onWarning?.(
+			`Could not start background repository evidence delivery: ${getErrorMessage(error)}`,
+		);
+		return false;
+	}
+}
+
+function spawnBackgroundEvidenceDelivery(): void {
+	const entrypoint = process.argv[1];
+	if (!entrypoint) throw new Error("The CLI entrypoint is unknown.");
+	// Windows does not end children with their parent, and DETACHED_PROCESS
+	// interferes with console-less launches; POSIX detaches into its own group.
+	const child = spawn(
+		process.execPath,
+		[...process.execArgv, entrypoint, "hooks", "evidence-deliver"],
+		{
+			detached: process.platform !== "win32",
+			env: process.env,
+			stdio: "ignore",
+			windowsHide: true,
+		},
+	);
+	child.on("error", () => undefined);
+	child.unref();
+}
+
+async function waitForBackgroundDeliveryLease(
+	configDir: string,
+): Promise<FileLease | null> {
+	const path = join(
+		getRepositoryEvidenceLeaseDirectory(configDir),
+		"background-delivery.lease",
+	);
+	// A deliverer that is just finishing may still hold the lease; wait for it
+	// briefly so items spooled meanwhile are not left until the next hook.
+	// Elapsed time uses the monotonic clock (tests may freeze Date.now).
+	const waitUntil = performance.now() + 10_000;
+	while (true) {
+		const lease = await tryAcquireFileLease(path);
+		if (lease !== null || performance.now() >= waitUntil) return lease;
+		await new Promise((resolve) => setTimeout(resolve, 250));
+	}
+}
+
+function getBackgroundItemBudgetMs(pending: PendingRepositoryEvidence): number {
+	const bytes = [...pending.upload.objects.values()].reduce(
+		(total, object) => total + object.bytes.byteLength,
+		0,
+	);
+	return (
+		EVIDENCE_BACKGROUND_ITEM_BASE_MS +
+		Math.ceil((bytes / EVIDENCE_BACKGROUND_ITEM_BYTES_PER_SECOND) * 1000)
+	);
 }
 
 class RepositoryAutoUploadDisabledError extends Error {
@@ -534,11 +809,12 @@ async function uploadWithBoundedRetries(
 	for (let attempt = 1; attempt <= 3; attempt++) {
 		if (overrides.canUpload && !overrides.canUpload())
 			throw new RepositoryAutoUploadDisabledError();
-		const remainingMs = overrides.deadlineAt
-			? overrides.deadlineAt - Date.now()
-			: undefined;
+		const remainingMs =
+			overrides.deadlineAt === undefined
+				? undefined
+				: overrides.deadlineAt - Date.now();
 		if (remainingMs !== undefined && remainingMs <= 0) {
-			throw deliveryBudgetExceeded();
+			throw new EvidenceBudgetError("delivery");
 		}
 		try {
 			return await uploadRepositoryEvidence(upload, {
@@ -548,11 +824,19 @@ async function uploadWithBoundedRetries(
 		} catch (error) {
 			lastError = error;
 			if (isEvidenceCaptureDisabledError(error)) throw error;
+			// A request aborted by the operation deadline is a budget cut, not a
+			// server failure.
+			if (
+				overrides.deadlineAt !== undefined &&
+				Date.now() >= overrides.deadlineAt
+			)
+				throw new EvidenceBudgetError("delivery");
 			if (!isRetryableRepositoryEvidenceError(error) || attempt === 3) break;
-			const retryDelayMs = overrides.deadlineAt
-				? Math.min(attempt * 100, overrides.deadlineAt - Date.now())
-				: attempt * 100;
-			if (retryDelayMs <= 0) throw deliveryBudgetExceeded();
+			const retryDelayMs =
+				overrides.deadlineAt === undefined
+					? attempt * 100
+					: Math.min(attempt * 100, overrides.deadlineAt - Date.now());
+			if (retryDelayMs <= 0) throw new EvidenceBudgetError("delivery");
 			await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
 		}
 	}
@@ -567,12 +851,6 @@ function getPendingDeliveryScope(
 		organizationId: pending.upload.input.organizationId,
 		transcriptScope: pending.transcriptRevision.scope,
 	};
-}
-
-function deliveryBudgetExceeded(): Error {
-	return new Error(
-		`Repository evidence delivery exceeded its ${EVIDENCE_DELIVERY_BUDGET_MS}ms budget.`,
-	);
 }
 
 async function materializeEvidenceRequest(
@@ -666,7 +944,11 @@ async function materializeEvidenceRequest(
 }
 
 function assertCaptureBudget(deadlineAt: number): void {
-	if (Date.now() >= deadlineAt) throw deliveryBudgetExceeded();
+	if (Date.now() >= deadlineAt) throw new EvidenceBudgetError("capture");
+}
+
+function getErrorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 function getAttributionHookKind(

@@ -394,8 +394,18 @@ describe("local context collection from a real Git worktree", () => {
 				facet.rootId === "missing" && facet.kind === "agents-instructions",
 		);
 		assert(unavailableFacet);
-		expect(unavailableFacet.presence).toBe("unknown");
-		expect(unavailableFacet.coverage).toBe("unavailable");
+		// A missing root holds nothing: its facets are complete and absent, and
+		// the missing root is neither a coverage error nor a partial reason.
+		expect(unavailableFacet.presence).toBe("absent");
+		expect(unavailableFacet.coverage).toBe("complete");
+		expect(
+			bundle.manifest.coverage.errors.some(
+				(error) => error.rootId === "missing",
+			),
+		).toBe(false);
+		expect(bundle.manifest.coverage.partialReasons).not.toContain(
+			"missing-root:missing",
+		);
 
 		assert(bundle.manifest.git.status === "available");
 		const workingDiff = bundle.manifest.git.diffs.find(

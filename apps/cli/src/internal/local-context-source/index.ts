@@ -36,6 +36,7 @@ export type {
 	ContextIndexResourceAccess,
 	ContextPathReference,
 	ContextRegularFileEntry,
+	ContextRootInclude,
 	ContextRootManifest,
 	ContextRootOrigin,
 	ContextRootScope,
@@ -71,6 +72,7 @@ export type {
 	ParentCaptureReference,
 	RootCoverage,
 	SecretFilterMetadata,
+	UserAgentConfiguration,
 } from "./types.js";
 export {
 	LOCAL_CONTEXT_BUNDLE_SCHEMA_VERSION,

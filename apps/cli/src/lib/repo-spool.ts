@@ -33,7 +33,7 @@ const ABANDONED_MARKER_SUFFIX = ".abandoned.json";
 const ACCOUNTING_VERSION = 1;
 const WRITE_LOCK_NAME = ".write-lock";
 const WRITE_LOCK_STALE_MS = 60_000;
-const WRITE_LOCK_TIMEOUT_MS = 15_000;
+const WRITE_LOCK_TIMEOUT_MS = 30_000;
 const WRITE_LOCK_POLL_MS = 25;
 
 export const REPOSITORY_CAPTURE_LIFECYCLES = [
@@ -344,7 +344,9 @@ export async function markRepositorySpoolCaptureAccepted(
 ): Promise<boolean> {
 	const paths = getSpoolPaths(binding, env);
 	await ensureSpoolDirectories(paths);
-	const releaseLock = await acquireSpoolWriteLock(paths.root, env);
+	// Markers and the accepted head only touch this binding's files, so the
+	// binding lock suffices; other repositories' writers are not blocked.
+	const releaseLock = await acquireSpoolWriteLock(paths.binding, env);
 	try {
 		const candidate = await inspectCaptureIfPresent(
 			getCapturePath(paths, captureId),
@@ -400,7 +402,7 @@ export async function markRepositorySpoolCaptureAbandoned(
 ): Promise<boolean> {
 	const paths = getSpoolPaths(binding, env);
 	await ensureSpoolDirectories(paths);
-	const releaseLock = await acquireSpoolWriteLock(paths.root, env);
+	const releaseLock = await acquireSpoolWriteLock(paths.binding, env);
 	try {
 		const candidate = await inspectCaptureIfPresent(
 			getCapturePath(paths, captureId),
@@ -435,7 +437,13 @@ export async function removeRepositorySpoolCapture(
 ): Promise<void> {
 	const paths = getSpoolPaths(binding, env);
 	await ensureSpoolDirectories(paths);
-	const releaseLock = await acquireSpoolWriteLock(paths.root, env);
+	const releaseBindingLock = await acquireSpoolWriteLock(paths.binding, env);
+	const releaseLock = await acquireSpoolWriteLock(paths.root, env).catch(
+		async (error: unknown) => {
+			await releaseBindingLock();
+			throw error;
+		},
+	);
 	try {
 		const plan = await planBindingRetirement(paths, env, new Set());
 		const retired = plan.captures.filter(
@@ -459,6 +467,7 @@ export async function removeRepositorySpoolCapture(
 		);
 	} finally {
 		await releaseLock();
+		await releaseBindingLock();
 	}
 }
 
@@ -468,6 +477,29 @@ export async function planRepositoryBundle(
 	repositoryRoot: string,
 	captureLifecycle: RepositoryCaptureLifecycle,
 	env: RepositorySpoolEnv,
+): Promise<RepositorySpoolPlan> {
+	return planRepositoryBundleWith(
+		candidate,
+		binding,
+		repositoryRoot,
+		captureLifecycle,
+		env,
+		"verify",
+	);
+}
+
+/**
+ * `verify` hashes every stored blob the candidate relies on. `exists` only
+ * checks presence; writers use it under the global lock after verifying the
+ * same immutable blobs outside it.
+ */
+async function planRepositoryBundleWith(
+	candidate: RepositoryBundleCandidate,
+	binding: RepositorySpoolBinding,
+	repositoryRoot: string,
+	captureLifecycle: RepositoryCaptureLifecycle,
+	env: RepositorySpoolEnv,
+	blobCheck: "exists" | "verify",
 ): Promise<RepositorySpoolPlan> {
 	validateCandidate(candidate);
 	const paths = getSpoolPaths(binding, env);
@@ -510,8 +542,13 @@ export async function planRepositoryBundle(
 		};
 	}
 
-	const missingBlobIds = await findMissingBlobIds(candidate.blobs, paths, env);
-	await assertReferencedBlobsAvailable(candidate, paths, env);
+	const missingBlobIds = await findMissingBlobIds(
+		candidate.blobs,
+		paths,
+		env,
+		blobCheck,
+	);
+	await assertReferencedBlobsAvailable(candidate, paths, env, blobCheck);
 	const missingBlobIdSet = new Set(missingBlobIds);
 	const newlyMaterializedBytes = candidate.blobs.reduce(
 		(total, blob) =>
@@ -567,6 +604,52 @@ export async function writeRepositoryBundle(
 ): Promise<RepositorySpoolWriteResult> {
 	const paths = getSpoolPaths(binding, env);
 	await ensureSpoolDirectories(paths);
+	// The binding lock serializes writers of this repository binding. The
+	// global lock guards only the cross-repository state (accounting, quota,
+	// retirement) and the blob and record writes retirement must not race, so
+	// hooks of other repositories wait only for that short section. Hashing
+	// the stored blobs happens before it, verification of the result after it.
+	const releaseBindingLock = await acquireSpoolWriteLock(paths.binding, env);
+	try {
+		validateCandidate(candidate);
+		await findMissingBlobIds(candidate.blobs, paths, env, "verify");
+		await assertReferencedBlobsAvailable(candidate, paths, env, "verify");
+		const created = await commitRepositoryBundle(
+			candidate,
+			binding,
+			repositoryRoot,
+			captureLifecycle,
+			paths,
+			env,
+		);
+		const inspected = await inspectCaptureIfPresent(
+			getCapturePath(paths, candidate.captureId),
+			paths,
+			env,
+		);
+		if (inspected?.summary.integrity !== "valid") {
+			throw new RepositorySpoolCorruptionError(
+				`Capture ${candidate.captureId} was not committed intact.`,
+			);
+		}
+		return {
+			created,
+			capture: inspected.summary,
+			quota: await getSpoolUsage(env),
+		};
+	} finally {
+		await releaseBindingLock();
+	}
+}
+
+async function commitRepositoryBundle(
+	candidate: RepositoryBundleCandidate,
+	binding: RepositorySpoolBinding,
+	repositoryRoot: string,
+	captureLifecycle: RepositoryCaptureLifecycle,
+	paths: SpoolPaths,
+	env: RepositorySpoolEnv,
+): Promise<boolean> {
 	const releaseLock = await acquireSpoolWriteLock(paths.root, env);
 	try {
 		await ensureCleanAccountingLocked(env);
@@ -619,22 +702,7 @@ export async function writeRepositoryBundle(
 				env,
 			);
 		}
-
-		const inspected = await inspectCaptureIfPresent(
-			getCapturePath(paths, candidate.captureId),
-			paths,
-			env,
-		);
-		if (inspected?.summary.integrity !== "valid") {
-			throw new RepositorySpoolCorruptionError(
-				`Capture ${candidate.captureId} was not committed intact.`,
-			);
-		}
-		return {
-			created: !plan.alreadyStored,
-			capture: inspected.summary,
-			quota: await getSpoolUsage(env),
-		};
+		return !plan.alreadyStored;
 	} finally {
 		await releaseLock();
 	}
@@ -649,12 +717,13 @@ async function planWithRetirement(
 	env: RepositorySpoolEnv,
 ): Promise<RepositorySpoolPlan> {
 	try {
-		return await planRepositoryBundle(
+		return await planRepositoryBundleWith(
 			candidate,
 			binding,
 			repositoryRoot,
 			captureLifecycle,
 			env,
+			"exists",
 		);
 	} catch (error) {
 		if (!(error instanceof RepositorySpoolCapacityError)) throw error;
@@ -667,12 +736,13 @@ async function planWithRetirement(
 			]),
 		);
 		try {
-			return await planRepositoryBundle(
+			return await planRepositoryBundleWith(
 				candidate,
 				binding,
 				repositoryRoot,
 				captureLifecycle,
 				env,
+				"exists",
 			);
 		} catch (retryError) {
 			if (!(retryError instanceof RepositorySpoolCapacityError)) {
@@ -1166,11 +1236,16 @@ async function findMissingBlobIds(
 	blobs: readonly RepositorySpoolBlob[],
 	paths: SpoolPaths,
 	env: RepositorySpoolEnv,
+	blobCheck: "exists" | "verify",
 ): Promise<readonly string[]> {
 	const missing: string[] = [];
 	for (const blob of blobs) {
 		validateBlob(blob, env);
 		const path = getBlobPath(paths, blob.id);
+		if (blobCheck === "exists") {
+			if (!(await isRegularFile(path))) missing.push(blob.id);
+			continue;
+		}
 		const existing = await readFileIfPresent(path);
 		if (existing === null) {
 			missing.push(blob.id);
@@ -1190,11 +1265,19 @@ async function assertReferencedBlobsAvailable(
 	candidate: RepositoryBundleCandidate,
 	paths: SpoolPaths,
 	env: RepositorySpoolEnv,
+	blobCheck: "exists" | "verify",
 ): Promise<void> {
 	const materializedIds = new Set(candidate.blobs.map((blob) => blob.id));
 	for (const blobId of candidate.referencedBlobIds) {
 		if (materializedIds.has(blobId)) continue;
 		const path = getBlobPath(paths, blobId);
+		if (blobCheck === "exists") {
+			if (!(await isRegularFile(path)))
+				throw new RepositorySpoolCorruptionError(
+					`Capture ${candidate.captureId} references unavailable parent blob ${blobId}.`,
+				);
+			continue;
+		}
 		const content = await readFileIfPresent(path);
 		if (content === null) {
 			throw new RepositorySpoolCorruptionError(
@@ -1644,7 +1727,8 @@ async function acquireSpoolWriteLock(
 	const lockPath = join(spoolRoot, WRITE_LOCK_NAME);
 	const ownerPath = join(lockPath, "owner");
 	const ownerToken = `${process.pid}:${env.createNonce()}`;
-	const startedAt = Date.now();
+	// Monotonic elapsed time: hooks under test may freeze Date.now().
+	const startedAt = performance.now();
 	while (true) {
 		let createdLock = false;
 		try {
@@ -1685,7 +1769,7 @@ async function acquireSpoolWriteLock(
 				throw error;
 			}
 			if (await recoverStaleWriteLock(lockPath, env)) continue;
-			if (Date.now() - startedAt >= env.writeLockTimeoutMs) {
+			if (performance.now() - startedAt >= env.writeLockTimeoutMs) {
 				throw new Error(
 					"Timed out waiting for another repository spool writer. No capture was changed.",
 				);
@@ -1810,6 +1894,16 @@ async function readFileIfPresent(path: string): Promise<Buffer | null> {
 		return await readFile(path);
 	} catch (error) {
 		if (isErrorCode(error, "ENOENT")) return null;
+		throw error;
+	}
+}
+
+async function isRegularFile(path: string): Promise<boolean> {
+	try {
+		const details = await lstat(path);
+		return details.isFile();
+	} catch (error) {
+		if (isErrorCode(error, "ENOENT")) return false;
 		throw error;
 	}
 }

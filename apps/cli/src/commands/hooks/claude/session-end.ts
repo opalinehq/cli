@@ -116,6 +116,7 @@ async function runSessionEnd(): Promise<undefined | Error> {
 					organizationId,
 					request,
 					terminalTranscript: true,
+					backgroundDelivery: "spawn",
 				})
 					.then((receipt) => {
 						if (!receipt) return;

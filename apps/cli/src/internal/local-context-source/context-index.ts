@@ -25,20 +25,66 @@ const FACET_KINDS: readonly ContextIndexFacetKind[] = [
 	"package-context",
 ];
 
+// Content omitted because a capacity limit was reached. Metadata-only content
+// is a deliberate policy (skill resources, personal files) and not a cut.
+const CAPACITY_OMISSIONS: ReadonlySet<string> = new Set([
+	"blob-count-cap",
+	"file-content-cap",
+	"root-content-cap",
+	"total-content-cap",
+]);
+
+/**
+ * Builds one facet per root and kind. Coverage is decided per facet: a facet
+ * is truncated only when its own inventory or content was cut (the root's
+ * discovery stopped early, one of its resources was dropped from the manifest,
+ * or a resource's content hit a capacity limit). A missing root holds nothing,
+ * so its facets are complete and absent.
+ */
 export function buildContextIndex(
 	roots: readonly ContextRootManifest[],
 	entries: readonly ContextEntry[],
 	excludedPaths: readonly ExcludedPath[],
 	errors: readonly CoverageError[],
+	droppedEntries: readonly ContextEntry[] = [],
 ): ContextIndex {
+	const facetEntries = new Map<string, ContextEntry[]>();
+	for (const entry of entries)
+		for (const kind of getFacetKinds(entry.path, entry)) {
+			const key = getFacetKey(entry.rootId, kind);
+			const list = facetEntries.get(key) ?? [];
+			list.push(entry);
+			facetEntries.set(key, list);
+		}
+	const droppedFacets = new Set(
+		droppedEntries.flatMap((entry) =>
+			getFacetKinds(entry.path, entry).map((kind) =>
+				getFacetKey(entry.rootId, kind),
+			),
+		),
+	);
 	return {
 		facets: roots.flatMap((root) =>
 			FACET_KINDS.map((kind) =>
-				buildFacet(root, kind, entries, excludedPaths, errors),
+				buildFacet(
+					root,
+					kind,
+					facetEntries.get(getFacetKey(root.id, kind)) ?? [],
+					excludedPaths,
+					errors,
+					droppedFacets.has(getFacetKey(root.id, kind)),
+				),
 			),
 		),
 		skills: buildSkillIndex(entries),
 	};
+}
+
+export function getContextFacetKinds(
+	path: string,
+	entry: ContextEntry | undefined = undefined,
+): readonly ContextIndexFacetKind[] {
+	return getFacetKinds(path, entry);
 }
 
 export function assessContextSkillUse(
@@ -55,19 +101,20 @@ export function assessContextSkillUse(
 function buildFacet(
 	root: ContextRootManifest,
 	kind: ContextIndexFacetKind,
-	entries: readonly ContextEntry[],
+	facetEntries: readonly ContextEntry[],
 	excludedPaths: readonly ExcludedPath[],
 	errors: readonly CoverageError[],
+	lostEntries: boolean,
 ): ContextIndexFacet {
-	const resources = entries
-		.filter(
-			(entry) =>
-				entry.rootId === root.id &&
-				getFacetKinds(entry.path, entry).includes(kind),
-		)
-		.map(buildResource)
-		.sort(compareResources);
-	const coverage = getFacetCoverage(root, kind, excludedPaths, errors);
+	const resources = facetEntries.map(buildResource).sort(compareResources);
+	const coverage = getFacetCoverage(
+		root,
+		kind,
+		facetEntries,
+		excludedPaths,
+		errors,
+		lostEntries,
+	);
 	return {
 		kind,
 		rootId: root.id,
@@ -141,10 +188,12 @@ function buildSkillUse(
 function getFacetCoverage(
 	root: ContextRootManifest,
 	kind: ContextIndexFacetKind,
+	facetEntries: readonly ContextEntry[],
 	excludedPaths: readonly ExcludedPath[],
 	errors: readonly CoverageError[],
+	lostEntries: boolean,
 ): ContextIndexCoverageStatus {
-	if (root.status === "missing") return "unavailable";
+	if (root.status === "missing") return "complete";
 	if (root.status === "inaccessible") return "denied";
 	if (root.status === "limit-reached") return "truncated";
 	if (
@@ -157,9 +206,21 @@ function getFacetCoverage(
 		return "denied";
 	}
 	if (
+		lostEntries ||
+		facetEntries.some(
+			(entry) =>
+				entry.kind === "file" &&
+				entry.content.status === "omitted" &&
+				CAPACITY_OMISSIONS.has(entry.content.reason),
+		)
+	) {
+		return "truncated";
+	}
+	if (
 		excludedPaths.some(
 			(excluded) =>
 				excluded.rootId === root.id &&
+				excluded.reason !== "ignored" &&
 				getFacetKinds(excluded.path).includes(kind),
 		)
 	) {
@@ -168,16 +229,41 @@ function getFacetCoverage(
 	return "complete";
 }
 
+// Entries are immutable and classified many times while the manifest bound
+// searches for its size, so their facet kinds are memoized.
+const ENTRY_FACET_KINDS = new WeakMap<
+	ContextEntry,
+	readonly ContextIndexFacetKind[]
+>();
+
+function getFacetKey(rootId: string, kind: ContextIndexFacetKind): string {
+	return `${rootId}\0${kind}`;
+}
+
 function getFacetKinds(
 	path: string,
 	entry: ContextEntry | undefined = undefined,
+): readonly ContextIndexFacetKind[] {
+	if (entry === undefined || entry.path !== path)
+		return classifyFacetKinds(path, entry);
+	const cached = ENTRY_FACET_KINDS.get(entry);
+	if (cached !== undefined) return cached;
+	const kinds = classifyFacetKinds(path, entry);
+	ENTRY_FACET_KINDS.set(entry, kinds);
+	return kinds;
+}
+
+function classifyFacetKinds(
+	path: string,
+	entry: ContextEntry | undefined,
 ): readonly ContextIndexFacetKind[] {
 	const normalized = path.toLowerCase();
 	const name = basename(normalized);
 	const segments = normalized.split("/");
 	const categories = entry?.categories ?? classifyContextPath(path, []);
 	const kinds = new Set<ContextIndexFacetKind>();
-	if (name === "agents.md") kinds.add("agents-instructions");
+	if (name === "agents.md" || name === "agents.override.md")
+		kinds.add("agents-instructions");
 	if (name === "claude.md") kinds.add("claude-instructions");
 	if (categories.includes("plan-candidate") || segments.includes("plans")) {
 		kinds.add("plans");

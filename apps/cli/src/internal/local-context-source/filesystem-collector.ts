@@ -2,11 +2,20 @@ import { createHash } from "node:crypto";
 import { basename, dirname, relative, resolve, sep } from "node:path";
 import type { BlobStore } from "./blob-store.js";
 import { addSanitizedTextBlob } from "./blob-store.js";
-import { getSessionContentPriority } from "./capture-policy.js";
+import {
+	getInstructionRank,
+	getSessionContentPriority,
+	INSTRUCTION_IMPORT_EVIDENCE_REASON,
+	INSTRUCTION_INCLUDE_EVIDENCE_REASON,
+	isSessionInstructionContent,
+	METADATA_INCLUDE_EVIDENCE_REASON,
+	SESSION_INSTRUCTION_MAX_IMPORT_DEPTH,
+} from "./capture-policy.js";
 import {
 	type GitCollectionResult,
 	getGitFileProvenance,
 } from "./git-collector.js";
+import { findInstructionImports } from "./instruction-imports.js";
 import {
 	classifyContextPath,
 	findSkillDirectories,
@@ -19,6 +28,7 @@ import type {
 	ContextEntry,
 	ContextFileCategory,
 	ContextRegularFileEntry,
+	ContextRootInclude,
 	ContextRootManifest,
 	CoverageError,
 	ExcludedPath,
@@ -33,6 +43,26 @@ import type {
 } from "./types.js";
 
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+// Only these limits leave a root's inventory incomplete. Content and hash caps
+// are recorded per entry and cut only the facets those entries belong to.
+const DISCOVERY_LIMITS: ReadonlySet<string> = new Set([
+	"maxDepthPerRoot",
+	"maxEntriesPerRoot",
+	"maxTotalEntries",
+]);
+
+type ContentPool = "general" | "instruction";
+
+interface PendingFile {
+	readonly result: {
+		readonly root: RootSpec;
+		readonly skillDirectories: readonly string[];
+		readonly coverage: MutableRootCoverage;
+	};
+	readonly entry: DiscoveredEntry;
+	readonly categories: readonly ContextFileCategory[];
+	readonly rootOrder: number;
+}
 
 interface RootSpec {
 	readonly id: string;
@@ -40,6 +70,7 @@ interface RootSpec {
 	readonly absolutePath: string;
 	readonly origin: ContextRootManifest["origin"];
 	readonly scope: ContextRootManifest["scope"];
+	readonly include?: readonly ContextRootInclude[];
 }
 
 interface DiscoveredEntry {
@@ -54,6 +85,16 @@ interface PendingDirectory {
 	readonly absolutePath: string;
 	readonly relativePath: string;
 	readonly depth: number;
+	/** Inside a Git-ignored directory: walked after all other content. */
+	readonly ignored: boolean;
+}
+
+interface RootWalk {
+	readonly root: RootSpec;
+	readonly discovered: DiscoveredEntry[];
+	readonly deferred: PendingDirectory[];
+	readonly ignoredDirectories: ReadonlySet<string>;
+	readonly coverage: MutableRootCoverage;
 }
 
 interface MutableRootCoverage {
@@ -66,6 +107,7 @@ interface MutableRootCoverage {
 	otherCount: number;
 	contentFiles: number;
 	contentBytes: number;
+	generalContentBytes: number;
 	hashedFiles: number;
 	hashedBytes: number;
 	omittedContentFiles: number;
@@ -77,6 +119,7 @@ interface MutableAggregate {
 	totalEnumeratedEntries: number;
 	totalEntries: number;
 	contentBudgetBytes: number;
+	instructionBudgetBytes: number;
 	hashBudgetBytes: number;
 	inventoryBytes: number;
 	materializedBytes: number;
@@ -105,6 +148,7 @@ export async function collectFileSystemContext(
 	fileSystem: LocalContextFileSystem,
 	git: GitCollectionResult,
 	blobStore: BlobStore,
+	instructionBlobStore: BlobStore | null = null,
 ): Promise<FileSystemCollectionResult> {
 	const rootSpecs: readonly RootSpec[] = [
 		{
@@ -125,6 +169,7 @@ export async function collectFileSystemContext(
 		totalEnumeratedEntries: 0,
 		totalEntries: 0,
 		contentBudgetBytes: 0,
+		instructionBudgetBytes: 0,
 		hashBudgetBytes: 0,
 		inventoryBytes: 0,
 		materializedBytes: 0,
@@ -133,9 +178,9 @@ export async function collectFileSystemContext(
 		omittedBytes: 0,
 	};
 
-	const collectedRoots = [];
+	const walks = [];
 	for (const rootSpec of rootSpecs) {
-		collectedRoots.push(
+		walks.push(
 			await discoverRoot(
 				rootSpec,
 				options,
@@ -147,8 +192,41 @@ export async function collectFileSystemContext(
 			),
 		);
 	}
-	const observedSkills = new Set(options.observedSkillNames ?? []);
-	const files = [];
+	// Git-ignored directories (agent scratch space, local data, build output
+	// that is not excluded by name) are walked last, with whatever entry budget
+	// remains after every root's own content. What does not fit is recorded as
+	// an ignored exclusion, not as a cut of the repository's inventory.
+	for (const walk of walks) {
+		if (walk.walk === null || walk.walk.deferred.length === 0) continue;
+		await walkDirectories(
+			walk.walk,
+			walk.walk.deferred.splice(0),
+			options,
+			fileSystem,
+			git,
+			aggregate,
+			excludedPaths,
+			errors,
+		);
+	}
+	const collectedRoots = walks.map((walk) => ({
+		root: walk.root,
+		status: walk.status,
+		coverage: walk.coverage,
+		discovered: walk.walk?.discovered ?? [],
+		skillDirectories: findSkillDirectories(
+			(walk.walk?.discovered ?? []).map((entry) => entry.path),
+		),
+	}));
+	// Plugin skills are observed as `plugin:skill`; their definitions live in
+	// a directory named after the skill alone.
+	const observedSkills = new Set(
+		(options.observedSkillNames ?? []).flatMap((name) => {
+			const separator = name.lastIndexOf(":");
+			return separator < 0 ? [name] : [name, name.slice(separator + 1)];
+		}),
+	);
+	const files: PendingFile[] = [];
 	for (const [rootOrder, result] of collectedRoots.entries()) {
 		for (const entry of result.discovered) {
 			const categories = classifyContextPath(
@@ -173,20 +251,21 @@ export async function collectFileSystemContext(
 			}
 		}
 	}
+	const sessionPriority = (file: PendingFile) =>
+		getSessionContentPriority(
+			file.entry.rootId,
+			file.entry.path,
+			file.categories,
+			observedSkills,
+		);
+	const instructionRank = (file: PendingFile) =>
+		sessionPriority(file) <= 0
+			? getInstructionRank(file.entry.path, options.workingDirectory)
+			: 0;
 	files.sort((left, right) =>
 		options.capturePolicy === "session-evidence"
-			? getSessionContentPriority(
-					left.entry.rootId,
-					left.entry.path,
-					left.categories,
-					observedSkills,
-				) -
-					getSessionContentPriority(
-						right.entry.rootId,
-						right.entry.path,
-						right.categories,
-						observedSkills,
-					) ||
+			? sessionPriority(left) - sessionPriority(right) ||
+				instructionRank(left) - instructionRank(right) ||
 				compareStrings(
 					`${left.entry.rootId}\0${left.entry.path}`,
 					`${right.entry.rootId}\0${right.entry.path}`,
@@ -196,7 +275,15 @@ export async function collectFileSystemContext(
 					getContentPriority(right.categories) ||
 				compareStrings(left.entry.path, right.entry.path),
 	);
-	for (const file of files) {
+	const instructionStore =
+		options.capturePolicy === "session-evidence" ? instructionBlobStore : null;
+	const processed = new Set<string>();
+	const processFile = async (
+		file: PendingFile,
+		pool: ContentPool,
+	): Promise<string | undefined> => {
+		processed.add(getFileKey(file.entry));
+		let text: string | undefined;
 		entries.push(
 			await buildRegularFileEntry(
 				file.result.root,
@@ -206,18 +293,90 @@ export async function collectFileSystemContext(
 				options,
 				fileSystem,
 				git,
-				blobStore,
+				pool === "instruction" && instructionStore !== null
+					? instructionStore
+					: blobStore,
+				pool,
 				aggregate,
 				file.result.coverage,
 				errors,
+				(captured) => {
+					text = captured;
+				},
 			),
 		);
+		return text;
+	};
+	if (instructionStore !== null) {
+		// Instruction files first, then the repository files they import
+		// (breadth-first, bounded depth), all from the instruction pool.
+		const repositoryFiles = new Map(
+			files
+				.filter((file) => file.entry.rootId === "repository")
+				.map((file) => [file.entry.path, file]),
+		);
+		const queue: { readonly file: PendingFile; readonly depth: number }[] =
+			files
+				.filter((file) =>
+					isSessionInstructionContent(
+						file.entry.rootId,
+						file.entry.path,
+						file.categories,
+						file.entry.evidenceReason,
+					),
+				)
+				.map((file) => ({ file, depth: 0 }));
+		const queued = new Set(queue.map((item) => getFileKey(item.file.entry)));
+		for (let index = 0; index < queue.length; index += 1) {
+			const item = queue[index];
+			if (item === undefined) break;
+			const text = await processFile(item.file, "instruction");
+			// Imports are followed inside the repository; user-level roots list
+			// the files their instructions import explicitly.
+			if (
+				text === undefined ||
+				item.file.entry.rootId !== "repository" ||
+				item.depth >= SESSION_INSTRUCTION_MAX_IMPORT_DEPTH
+			)
+				continue;
+			for (const target of findInstructionImports(text, item.file.entry.path)) {
+				const imported = repositoryFiles.get(target);
+				if (imported === undefined) continue;
+				const key = getFileKey(imported.entry);
+				if (queued.has(key) || processed.has(key)) continue;
+				const candidate: PendingFile = {
+					...imported,
+					entry: {
+						...imported.entry,
+						evidenceReason: INSTRUCTION_IMPORT_EVIDENCE_REASON,
+					},
+				};
+				if (
+					isHighRiskContentPath(candidate.entry.path) ||
+					!isSessionInstructionContent(
+						candidate.entry.rootId,
+						candidate.entry.path,
+						candidate.categories,
+						candidate.entry.evidenceReason,
+					)
+				)
+					continue;
+				queued.add(key);
+				queue.push({ file: candidate, depth: item.depth + 1 });
+			}
+		}
+	}
+	for (const file of files) {
+		if (processed.has(getFileKey(file.entry))) continue;
+		await processFile(file, "general");
 	}
 	const roots = collectedRoots.map((result) =>
 		buildRootManifest(
 			result.root,
 			result.status ??
-				(result.coverage.limitsReached.size > 0
+				([...result.coverage.limitsReached].some((limit) =>
+					DISCOVERY_LIMITS.has(limit),
+				)
 					? "limit-reached"
 					: "collected"),
 			result.coverage,
@@ -260,9 +419,8 @@ async function discoverRoot(
 ): Promise<{
 	readonly root: RootSpec;
 	readonly status: "missing" | "inaccessible" | null;
-	readonly discovered: readonly DiscoveredEntry[];
-	readonly skillDirectories: readonly string[];
 	readonly coverage: MutableRootCoverage;
+	readonly walk: RootWalk | null;
 }> {
 	const coverage = createMutableRootCoverage();
 	const canonicalRoot = await resolveRoot(
@@ -275,33 +433,127 @@ async function discoverRoot(
 		return {
 			root: rootSpec,
 			status: canonicalRoot.status,
-			discovered: [],
-			skillDirectories: [],
 			coverage,
+			walk: null,
 		};
 	}
-
-	const discovered = await discoverRootEntries(
-		{ ...rootSpec, absolutePath: canonicalRoot.path },
+	const root = { ...rootSpec, absolutePath: canonicalRoot.path };
+	const walk: RootWalk = {
+		root,
+		discovered: [],
+		deferred: [],
+		ignoredDirectories:
+			root.id === "repository" ? getIgnoredDirectories(git) : new Set(),
+		coverage,
+	};
+	await walkDirectories(
+		walk,
+		root.include === undefined
+			? [
+					{
+						absolutePath: root.absolutePath,
+						relativePath: "",
+						depth: 0,
+						ignored: false,
+					},
+				]
+			: await discoverIncludes(
+					walk,
+					root.include,
+					options,
+					fileSystem,
+					aggregate,
+					errors,
+				),
 		options,
 		fileSystem,
 		git,
 		aggregate,
-		coverage,
 		excludedPaths,
 		errors,
 	);
-
-	const skillDirectories = findSkillDirectories(
-		discovered.map((entry) => entry.path),
-	);
-	return {
-		root: { ...rootSpec, absolutePath: canonicalRoot.path },
-		status: null,
-		discovered,
-		skillDirectories,
+	addUndiscoveredSubmodules(
+		root,
+		walk.discovered,
+		options,
+		git,
+		aggregate,
 		coverage,
-	};
+	);
+	return { root, status: null, coverage, walk };
+}
+
+/**
+ * Adds the explicitly included files of a root and returns the included
+ * directories for the regular walk. Missing paths are simply absent.
+ */
+async function discoverIncludes(
+	walk: RootWalk,
+	includes: readonly ContextRootInclude[],
+	options: LocalContextCollectionOptions,
+	fileSystem: LocalContextFileSystem,
+	aggregate: MutableAggregate,
+	errors: CoverageError[],
+): Promise<PendingDirectory[]> {
+	const { root, coverage, discovered } = walk;
+	const directories: PendingDirectory[] = [];
+	const seen = new Set<string>();
+	for (const include of [...includes].sort((left, right) =>
+		compareStrings(left.path, right.path),
+	)) {
+		if (seen.has(include.path)) continue;
+		seen.add(include.path);
+		const absolutePath = resolve(root.absolutePath, include.path);
+		if (!isContainedPath(root.absolutePath, absolutePath)) continue;
+		let stat: FileSystemStat;
+		try {
+			stat = await fileSystem.lstat(absolutePath);
+		} catch (error) {
+			const normalized = normalizeError(error);
+			if (normalized.code !== "ENOENT" && normalized.code !== "ENOTDIR")
+				pushFileSystemError(
+					errors,
+					root.id,
+					include.path,
+					"lstat",
+					error,
+					options,
+				);
+			continue;
+		}
+		if (
+			coverage.discoveredEntries >= options.limits.maxEntriesPerRoot ||
+			aggregate.totalEntries >= options.limits.maxTotalEntries
+		) {
+			coverage.limitsReached.add(
+				coverage.discoveredEntries >= options.limits.maxEntriesPerRoot
+					? "maxEntriesPerRoot"
+					: "maxTotalEntries",
+			);
+			break;
+		}
+		discovered.push({
+			rootId: root.id,
+			absolutePath,
+			path: include.path,
+			stat,
+			evidenceReason:
+				stat.kind === "file" && include.role === "instruction"
+					? INSTRUCTION_INCLUDE_EVIDENCE_REASON
+					: stat.kind === "file" && include.role === "metadata"
+						? METADATA_INCLUDE_EVIDENCE_REASON
+						: null,
+		});
+		countDiscoveredEntry(stat, coverage, aggregate);
+		if (stat.kind === "directory" && include.role === "tree")
+			directories.push({
+				absolutePath,
+				relativePath: include.path,
+				depth: include.path.split("/").length,
+				ignored: false,
+			});
+	}
+	return directories;
 }
 
 async function resolveRoot(
@@ -333,6 +585,8 @@ async function resolveRoot(
 		return { status: "available", path: canonical };
 	} catch (error) {
 		const normalized = normalizeError(error);
+		// A missing root is an absent source, not a capture error.
+		if (normalized.code === "ENOENT") return { status: "missing" };
 		pushCoverageError(
 			errors,
 			{
@@ -344,29 +598,52 @@ async function resolveRoot(
 			},
 			options,
 		);
-		return {
-			status: normalized.code === "ENOENT" ? "missing" : "inaccessible",
-		};
+		return { status: "inaccessible" };
 	}
 }
 
-async function discoverRootEntries(
-	root: RootSpec,
+/**
+ * Breadth-first walk of one root. Directories inside Git-ignored directories
+ * are queued on the walk's deferred list during the first pass and walked in
+ * a second pass (`queue` then holds only ignored directories). A discovery
+ * limit reached during the first pass truncates the root; reached during the
+ * second pass it only excludes the ignored directories that did not fit.
+ */
+async function walkDirectories(
+	walk: RootWalk,
+	queue: PendingDirectory[],
 	options: LocalContextCollectionOptions,
 	fileSystem: LocalContextFileSystem,
 	git: GitCollectionResult,
 	aggregate: MutableAggregate,
-	coverage: MutableRootCoverage,
 	excludedPaths: ExcludedPath[],
 	errors: CoverageError[],
-): Promise<DiscoveredEntry[]> {
-	const discovered: DiscoveredEntry[] = [];
-	const pending: PendingDirectory[] = [
-		{ absolutePath: root.absolutePath, relativePath: "", depth: 0 },
-	];
+): Promise<void> {
+	const { root, coverage, discovered } = walk;
+	const excludeIgnored = (
+		directories: readonly PendingDirectory[],
+		limit: string,
+	) => {
+		for (const directory of directories) {
+			excludedPaths.push({
+				rootId: root.id,
+				path: directory.relativePath,
+				reason: "ignored",
+			});
+			coverage.excludedPaths += 1;
+		}
+		coverage.limitsReached.add(`${limit}:ignored`);
+	};
+	const stopAtEntryLimit = (directory: PendingDirectory, limit: string) => {
+		if (directory.ignored) {
+			excludeIgnored([directory, ...queue.splice(0)], limit);
+		} else {
+			coverage.limitsReached.add(limit);
+		}
+	};
 
-	while (pending.length > 0) {
-		const directory = pending.shift();
+	while (queue.length > 0) {
+		const directory = queue.shift();
 		if (directory === undefined) break;
 		if (
 			root.id === "repository" &&
@@ -396,8 +673,8 @@ async function discoverRootEntries(
 				? "maxEntriesPerRoot"
 				: "maxTotalEntries";
 		if (remainingEntries <= 0) {
-			coverage.limitsReached.add(entryLimit);
-			return discovered;
+			stopAtEntryLimit(directory, entryLimit);
+			return;
 		}
 		let children: FileSystemEntry[];
 		let complete: boolean;
@@ -408,12 +685,14 @@ async function discoverRootEntries(
 			));
 			coverage.enumeratedEntries += children.length;
 			aggregate.totalEnumeratedEntries += children.length;
-			if (!complete)
-				coverage.limitsReached.add(
+			if (!complete) {
+				const limit =
 					coverage.enumeratedEntries >= options.limits.maxEntriesPerRoot
 						? "maxEntriesPerRoot"
-						: "maxTotalEntries",
-				);
+						: "maxTotalEntries";
+				if (directory.ignored) excludeIgnored([directory], limit);
+				else coverage.limitsReached.add(limit);
+			}
 		} catch (error) {
 			pushFileSystemError(
 				errors,
@@ -432,12 +711,13 @@ async function discoverRootEntries(
 				coverage.discoveredEntries >= options.limits.maxEntriesPerRoot ||
 				aggregate.totalEntries >= options.limits.maxTotalEntries
 			) {
-				coverage.limitsReached.add(
+				stopAtEntryLimit(
+					directory,
 					coverage.discoveredEntries >= options.limits.maxEntriesPerRoot
 						? "maxEntriesPerRoot"
 						: "maxTotalEntries",
 				);
-				return discovered;
+				return;
 			}
 			const relativePath = directory.relativePath
 				? `${directory.relativePath}/${child.name}`
@@ -482,27 +762,45 @@ async function discoverRootEntries(
 			countDiscoveredEntry(stat, coverage, aggregate, isSubmodule);
 
 			if (stat.kind === "directory" && !isSubmodule) {
-				if (directory.depth + 1 >= options.limits.maxDepthPerRoot) {
-					coverage.limitsReached.add("maxDepthPerRoot");
+				const child: PendingDirectory = {
+					absolutePath,
+					relativePath,
+					depth: directory.depth + 1,
+					ignored:
+						directory.ignored ||
+						(walk.ignoredDirectories.has(relativePath) &&
+							!isAgentContextDirectory(relativePath)),
+				};
+				if (child.depth >= options.limits.maxDepthPerRoot) {
+					if (child.ignored) excludeIgnored([child], "maxDepthPerRoot");
+					else coverage.limitsReached.add("maxDepthPerRoot");
+				} else if (child.ignored && !directory.ignored) {
+					walk.deferred.push(child);
 				} else {
-					pending.push({
-						absolutePath,
-						relativePath,
-						depth: directory.depth + 1,
-					});
+					queue.push(child);
 				}
 			}
 		}
 	}
-	addUndiscoveredSubmodules(
-		root,
-		discovered,
-		options,
-		git,
-		aggregate,
-		coverage,
+}
+
+/** Directories Git reports as ignored (`git status --ignored=matching`). */
+function getIgnoredDirectories(git: GitCollectionResult): ReadonlySet<string> {
+	if (git.snapshot.status !== "available") return new Set();
+	return new Set(
+		git.snapshot.statusEntries
+			.filter((entry) => entry.kind === "ignored" && entry.path.endsWith("/"))
+			.map((entry) => entry.path.slice(0, -1)),
 	);
-	return discovered;
+}
+
+/** Agent configuration stays first-class even when a repository ignores it. */
+function isAgentContextDirectory(relativePath: string): boolean {
+	return relativePath
+		.split("/")
+		.some((segment) =>
+			[".agents", ".claude", ".codex", ".cursor", ".github"].includes(segment),
+		);
 }
 
 async function isNestedGitBoundary(
@@ -671,9 +969,11 @@ async function buildRegularFileEntry(
 	fileSystem: LocalContextFileSystem,
 	git: GitCollectionResult,
 	blobStore: BlobStore,
+	pool: ContentPool,
 	aggregate: MutableAggregate,
 	coverage: MutableRootCoverage,
 	errors: CoverageError[],
+	onText: (text: string) => void,
 ): Promise<ContextRegularFileEntry> {
 	const base = buildEntryBase(root, entry, categories, git);
 	if (isHighRiskContentPath(entry.path)) {
@@ -728,12 +1028,18 @@ async function buildRegularFileEntry(
 
 	if (
 		options.capturePolicy === "session-evidence" &&
-		getSessionContentPriority(
-			root.id,
-			entry.path,
-			categories,
-			observedSkills,
-		) >= 4
+		pool === "general" &&
+		(entry.evidenceReason === METADATA_INCLUDE_EVIDENCE_REASON ||
+			// User-level agent settings may hold credentials: only their
+			// instruction files are captured, the rest is hashed (a filtered
+			// summary of hooks, MCP servers and plugins is added separately).
+			root.scope === "agent-config" ||
+			getSessionContentPriority(
+				root.id,
+				entry.path,
+				categories,
+				observedSkills,
+			) >= 4)
 	) {
 		coverage.omittedContentFiles += 1;
 		aggregate.omittedBytes += entry.stat.size;
@@ -753,12 +1059,10 @@ async function buildRegularFileEntry(
 		};
 	}
 
-	const contentLimitReason = getContentLimitReason(
-		entry.stat.size,
-		coverage,
-		aggregate,
-		options,
-	);
+	const contentLimitReason =
+		pool === "instruction"
+			? getInstructionLimitReason(entry.stat.size, coverage, aggregate, options)
+			: getContentLimitReason(entry.stat.size, coverage, aggregate, options);
 	if (contentLimitReason !== null) {
 		coverage.omittedContentFiles += 1;
 		aggregate.omittedBytes += entry.stat.size;
@@ -781,7 +1085,9 @@ async function buildRegularFileEntry(
 	try {
 		const read = await fileSystem.readFileBounded(
 			entry.absolutePath,
-			options.limits.maxContentBytesPerFile,
+			pool === "instruction"
+				? options.limits.maxInstructionContentBytesPerFile
+				: options.limits.maxContentBytesPerFile,
 		);
 		if (!read.complete) {
 			coverage.omittedContentFiles += 1;
@@ -834,9 +1140,15 @@ async function buildRegularFileEntry(
 		);
 		if (sanitized.status === "failure") {
 			if (sanitized.reason === "blob-count-cap")
-				coverage.limitsReached.add("maxBlobs");
+				coverage.limitsReached.add(
+					pool === "instruction" ? "maxInstructionFiles" : "maxBlobs",
+				);
 			if (sanitized.reason === "total-content-cap")
-				coverage.limitsReached.add("maxTotalContentBytes");
+				coverage.limitsReached.add(
+					pool === "instruction"
+						? "maxInstructionContentBytes"
+						: "maxTotalContentBytes",
+				);
 			coverage.omittedContentFiles += 1;
 			aggregate.omittedBytes += entry.stat.size;
 			return {
@@ -866,8 +1178,14 @@ async function buildRegularFileEntry(
 		coverage.contentBytes += sanitized.storedByteLength;
 		coverage.hashedFiles += 1;
 		coverage.hashedBytes += sanitized.storedByteLength;
-		aggregate.contentBudgetBytes += read.bytes.byteLength;
+		if (pool === "instruction") {
+			aggregate.instructionBudgetBytes += read.bytes.byteLength;
+		} else {
+			coverage.generalContentBytes += sanitized.storedByteLength;
+			aggregate.contentBudgetBytes += read.bytes.byteLength;
+		}
 		aggregate.hashBudgetBytes += sanitized.storedByteLength;
+		onText(text);
 		if (sanitized.reused) {
 			aggregate.reusedBytes += sanitized.storedByteLength;
 		} else {
@@ -990,9 +1308,30 @@ function getContentLimitReason(
 		coverage.limitsReached.add("maxTotalContentBytes");
 		return "total-content-cap";
 	}
-	if (coverage.contentBytes + size > options.limits.maxContentBytesPerRoot) {
+	if (
+		coverage.generalContentBytes + size >
+		options.limits.maxContentBytesPerRoot
+	) {
 		coverage.limitsReached.add("maxContentBytesPerRoot");
 		return "root-content-cap";
+	}
+	return null;
+}
+
+function getInstructionLimitReason(
+	size: number,
+	coverage: MutableRootCoverage,
+	aggregate: MutableAggregate,
+	options: LocalContextCollectionOptions,
+): Extract<FileContent, { status: "omitted" }>["reason"] | null {
+	if (size > options.limits.maxInstructionContentBytesPerFile)
+		return "file-content-cap";
+	if (
+		aggregate.instructionBudgetBytes + size >
+		options.limits.maxInstructionContentBytes
+	) {
+		coverage.limitsReached.add("maxInstructionContentBytes");
+		return "total-content-cap";
 	}
 	return null;
 }
@@ -1069,6 +1408,7 @@ function createMutableRootCoverage(): MutableRootCoverage {
 		otherCount: 0,
 		contentFiles: 0,
 		contentBytes: 0,
+		generalContentBytes: 0,
 		hashedFiles: 0,
 		hashedBytes: 0,
 		omittedContentFiles: 0,
@@ -1184,6 +1524,10 @@ function normalizeError(error: unknown): {
 		return { code, message: error.message.slice(0, 1000) };
 	}
 	return { code: "ERROR", message: "Unknown filesystem error" };
+}
+
+function getFileKey(entry: DiscoveredEntry): string {
+	return `${entry.rootId}\0${entry.path}`;
 }
 
 function compareEntries(left: ContextEntry, right: ContextEntry): number {

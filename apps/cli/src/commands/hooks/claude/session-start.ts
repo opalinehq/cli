@@ -99,6 +99,7 @@ async function runSessionStart(): Promise<undefined> {
 			organizationId,
 			request,
 			terminalTranscript: false,
+			backgroundDelivery: "spawn",
 		});
 		if (!receipt) return;
 		logger.info(
