@@ -548,3 +548,32 @@ describe("transcript slimming", () => {
 		expect(JSON.parse(slimmed).payload.item.stdout).toBeUndefined();
 	});
 });
+
+// Byte-exact fixtures shared with the Opaline API's slimming port
+// (packages/api-routes/src/__fixtures__/transcript-slim). One line is CRLF;
+// .gitattributes keeps both files unconverted.
+describe("parity fixtures shared with the API", () => {
+	const fixtureUrl = (name: string) =>
+		new URL(`./fixtures/transcript-slim/${name}`, import.meta.url);
+
+	test("slims the shared input to exactly the shared expected bytes", async () => {
+		const input = await Bun.file(fixtureUrl("input.jsonl")).text();
+		const expected = await Bun.file(fixtureUrl("expected.jsonl")).text();
+
+		expect(input.includes("\r\n")).toBe(true);
+		expect(slimTranscriptText(input)).toBe(expected);
+		expect(slimTranscriptText(expected)).toBe(expected);
+	});
+
+	test("streams the shared input record by record to the same bytes", async () => {
+		const input = await Bun.file(fixtureUrl("input.jsonl")).text();
+		const expected = await Bun.file(fixtureUrl("expected.jsonl")).text();
+		const slimmer = createTranscriptSlimmer();
+
+		const streamed = (input.match(/[^\n]*\n|[^\n]+$/gu) ?? [])
+			.map((record) => slimmer.slimRecord(record))
+			.join("");
+
+		expect(streamed).toBe(expected);
+	});
+});
