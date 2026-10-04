@@ -25,6 +25,12 @@ import {
 
 export const MAX_STREAM_RECORD_BYTES = 16 * 1024 * 1024;
 /**
+ * A raw record read for slimming may be larger: the 16 MiB record limit
+ * applies to the slimmed record (an inline screenshot shrinks to a marker).
+ * This bound only keeps the read buffer finite.
+ */
+export const MAX_SLIMMABLE_RECORD_BYTES = 128 * 1024 * 1024;
+/**
  * Raw transcript files above this size are skipped without reading them. The
  * per-session ingest limit applies to the slimmed, filtered upload instead,
  * so a raw transcript well above it can still fit once images and duplicate
@@ -303,6 +309,9 @@ async function stageFile(
 	let redactedBytes = 0;
 	let redactions: RedactionCounts = {};
 
+	const rawRecordLimit = slimmer
+		? MAX_SLIMMABLE_RECORD_BYTES
+		: MAX_STREAM_RECORD_BYTES;
 	try {
 		for await (const chunk of input) {
 			if (!(chunk instanceof Uint8Array)) {
@@ -317,30 +326,26 @@ async function stageFile(
 				checkBudget(budget);
 				const record = pending.slice(0, newlineIndex + 1);
 				pending = pending.slice(newlineIndex + 1);
-				assertRecordWithinLimit(record);
-				const result = await filterAndWriteRecord(
-					slimmer ? slimmer.slimRecord(record) : record,
-					output,
-					hash,
-				);
+				assertRecordWithinLimit(record, rawRecordLimit);
+				const slimmed = slimmer ? slimmer.slimRecord(record) : record;
+				assertRecordWithinLimit(slimmed, MAX_STREAM_RECORD_BYTES);
+				const result = await filterAndWriteRecord(slimmed, output, hash);
 				byteLength += result.byteLength;
 				filterInputBytes += result.filterInputBytes;
 				redactedBytes += result.redactedBytes;
 				redactions = mergeRedactionCounts(redactions, result.redactions);
 				newlineIndex = pending.indexOf("\n");
 			}
-			assertRecordWithinLimit(pending);
+			assertRecordWithinLimit(pending, rawRecordLimit);
 		}
 
 		pending += decoder.end();
 		checkBudget(budget);
 		if (pending.length > 0) {
-			assertRecordWithinLimit(pending);
-			const result = await filterAndWriteRecord(
-				slimmer ? slimmer.slimRecord(pending) : pending,
-				output,
-				hash,
-			);
+			assertRecordWithinLimit(pending, rawRecordLimit);
+			const slimmed = slimmer ? slimmer.slimRecord(pending) : pending;
+			assertRecordWithinLimit(slimmed, MAX_STREAM_RECORD_BYTES);
+			const result = await filterAndWriteRecord(slimmed, output, hash);
 			byteLength += result.byteLength;
 			filterInputBytes += result.filterInputBytes;
 			redactedBytes += result.redactedBytes;
@@ -385,11 +390,14 @@ async function filterAndWriteRecord(
 	};
 }
 
-function assertRecordWithinLimit(record: string): void {
+function assertRecordWithinLimit(record: string, limit: number): void {
+	// UTF-8 needs at least one byte per UTF-16 code unit: most records are
+	// decided without encoding them.
+	if (record.length <= limit / 3) return;
 	const bytes = Buffer.byteLength(record, "utf8");
-	if (bytes > MAX_STREAM_RECORD_BYTES) {
+	if (bytes > limit) {
 		throw new Error(
-			`Transcript contains a record larger than ${MAX_STREAM_RECORD_BYTES} bytes; refusing an unbounded secret-filter buffer`,
+			`Transcript contains a record larger than ${limit} bytes; refusing an unbounded secret-filter buffer`,
 		);
 	}
 }

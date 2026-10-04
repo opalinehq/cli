@@ -368,6 +368,56 @@ describe("filtered upload staging", () => {
 		}
 	});
 
+	test("applies the 16 MiB record limit to the slimmed record", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "opaline-slim-record-"));
+		temporaryDirectories.push(directory);
+		const path = join(directory, "transcript.jsonl");
+		// One 24 MiB record that is almost entirely an inline screenshot.
+		const pixels = Buffer.alloc(18 * 1024 * 1024, 7).toString("base64");
+		await writeFile(
+			path,
+			`${JSON.stringify({
+				type: "user",
+				timestamp: "2026-10-04T10:00:00.000Z",
+				message: {
+					role: "user",
+					content: [
+						{
+							type: "image",
+							source: { type: "base64", media_type: "image/png", data: pixels },
+						},
+						{ type: "text", text: "What does this show?" },
+					],
+				},
+			})}\n`,
+		);
+		const sources = (slim: boolean) => ({
+			main: { kind: "file" as const, path },
+			metadata: {
+				projectPath: "/test",
+				sessionId: "large-record",
+				source: "claude_code" as const,
+			},
+			slim,
+			subagents: [],
+		});
+
+		const staged = await stageFilteredUpload(sources(true));
+		try {
+			const uploaded = await readFile(staged.objects[0]?.path ?? "", "utf8");
+			expect(uploaded).toContain("opaline-image-omitted:v1;sha256=");
+			expect(uploaded).toContain("What does this show?");
+			expect(staged.aggregateBytes).toBeLessThan(4096);
+		} finally {
+			await cleanupStagedUpload(staged);
+		}
+		// Without slimming (repository evidence keeps exact bytes) the raw
+		// record is still refused.
+		await expect(stageFilteredUpload(sources(false))).rejects.toThrow(
+			/larger than 16777216 bytes/u,
+		);
+	});
+
 	test("keeps exact bytes when slimming is off for repository evidence", async () => {
 		const content = `${JSON.stringify({
 			type: "response_item",
