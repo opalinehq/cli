@@ -24,6 +24,12 @@ export interface AdditionalContextRoot {
 	 * files are inventoried and hashed only, `tree` directories are walked.
 	 */
 	readonly include?: readonly ContextRootInclude[];
+	/**
+	 * Directory symlinks of skill and instruction directories are followed
+	 * when their target resolves inside this directory (\$HOME for user roots).
+	 * Without it, symlinks are recorded and not followed.
+	 */
+	readonly followSymlinksWithin?: string;
 }
 
 export interface ContextRootInclude {
@@ -75,6 +81,8 @@ export interface LocalContextCollectionOptions {
 	 * that apply to it are captured before other nested instruction files.
 	 */
 	readonly workingDirectory?: string;
+	/** Symlink targets never followed into (the CLI's private config directory). */
+	readonly forbiddenSymlinkTargets?: readonly string[];
 	/**
 	 * Applied to saved tool-output text before the secret filter, so it gets
 	 * the same slimming as the transcript that references it.
@@ -282,7 +290,8 @@ export interface ContextSymlinkEntry extends ContextEntryBase {
 	readonly kind: "symlink";
 	readonly target: string;
 	readonly targetScope: "internal" | "external" | "broken" | "unknown";
-	readonly followed: false;
+	/** A followed directory symlink's contents are listed under its path. */
+	readonly followed: boolean;
 }
 
 export interface ContextOtherEntry extends ContextEntryBase {

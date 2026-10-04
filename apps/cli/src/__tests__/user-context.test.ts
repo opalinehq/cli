@@ -7,6 +7,7 @@ import {
 	mkdtemp,
 	realpath,
 	rm,
+	symlink,
 	utimes,
 	writeFile,
 } from "node:fs/promises";
@@ -21,6 +22,7 @@ import {
 } from "../internal/local-context-source/index.js";
 import {
 	getClaudeProjectKey,
+	getManagedClaudeDirectory,
 	getUserContextLocations,
 	readUserAgentSources,
 	resolveClaudeProjectMemoryDirectory,
@@ -509,14 +511,151 @@ describe("user-level context roots", () => {
 		);
 	});
 
+	test("captures Claude rules, Codex exec-policy rules, parent .claude/CLAUDE.md and managed instructions", async () => {
+		const home = await createHome();
+		const managed = join(home, "managed-root");
+		const files = {
+			".claude/rules/testing.md": "Always run the tests\n",
+			".claude/rules/frontend/react.md": "Prefer function components\n",
+			"codex/rules/default.rules":
+				'prefix_rule(pattern=["git", "status"], decision="allow")\n',
+			"work/.claude/CLAUDE.md": "Work directory instructions\n",
+			"work/repo/AGENTS.md": "Repository instructions\n",
+			"work/repo/.claude/rules/api.md": "API rules\n",
+			"managed-root/CLAUDE.md": "Managed instructions\n",
+			"managed-root/managed-settings.json":
+				'{"permissions":{"deny":["Bash(curl:*)"]}}',
+		};
+		for (const [path, content] of Object.entries(files)) {
+			await mkdir(dirname(join(home, path)), { recursive: true });
+			await writeFile(join(home, path), content);
+		}
+		const repository = join(home, "work/repo");
+		execFileSync("git", ["init", "-q"], { cwd: repository });
+		const bundle = await collectWithUserContext(
+			repository,
+			{ home, codexHome: join(home, "codex"), managedClaudeDirectory: managed },
+			[],
+		);
+		const read = (rootId: string, path: string) =>
+			readCaptured(bundle, rootId, path);
+		expect(read("claude-user-home", "rules/testing.md")).toBe(
+			files[".claude/rules/testing.md"],
+		);
+		expect(read("claude-user-home", "rules/frontend/react.md")).toBe(
+			files[".claude/rules/frontend/react.md"],
+		);
+		expect(read("repository", ".claude/rules/api.md")).toBe("API rules\n");
+		expect(read("codex-user-home", "rules/default.rules")).toBe(
+			files["codex/rules/default.rules"],
+		);
+		expect(read("home-instructions", "work/.claude/CLAUDE.md")).toBe(
+			"Work directory instructions\n",
+		);
+		expect(read("claude-managed", "CLAUDE.md")).toBe("Managed instructions\n");
+		expect(
+			bundle.manifest.roots.find((root) => root.id === "claude-managed"),
+		).toMatchObject({ origin: "admin", status: "collected" });
+		// Rules are instructions: they come from the instruction pool.
+		for (const [rootId, path] of [
+			["claude-user-home", "rules/testing.md"],
+			["repository", ".claude/rules/api.md"],
+		] as const)
+			expect(getFile(bundle, rootId, path).categories).toContain("markdown");
+		for (const facet of bundle.manifest.contextIndex.facets)
+			expect(facet.coverage).toBe("complete");
+	});
+
+	test("follows skill and instruction directory symlinks inside $HOME only, once and without cycles", async () => {
+		const home = await createHome();
+		const outside = await createHome();
+		const files = {
+			"shared/skills/linked/SKILL.md": "Linked skill\n",
+			"shared/rules/team.md": "Shared team rules\n",
+			"repo/AGENTS.md": "Repository instructions\n",
+			"elsewhere-skills/escaped/SKILL.md": "Outside the repository\n",
+		};
+		for (const [path, content] of Object.entries(files)) {
+			await mkdir(dirname(join(home, path)), { recursive: true });
+			await writeFile(join(home, path), content);
+		}
+		await mkdir(join(outside, "foreign"), { recursive: true });
+		await writeFile(join(outside, "foreign/SKILL.md"), "Outside home\n");
+		await mkdir(join(home, ".claude/skills"), { recursive: true });
+		await symlink(
+			join(home, "shared/skills/linked"),
+			join(home, ".claude/skills/linked"),
+		);
+		await symlink(
+			join(outside, "foreign"),
+			join(home, ".claude/skills/foreign"),
+		);
+		await symlink(
+			join(home, ".claude/skills"),
+			join(home, ".claude/skills/loop"),
+		);
+		await symlink(join(home, "shared/rules"), join(home, ".claude/rules"));
+		const repository = join(home, "repo");
+		await mkdir(join(repository, ".claude"), { recursive: true });
+		await symlink(
+			join(home, "elsewhere-skills"),
+			join(repository, ".claude/skills"),
+		);
+		execFileSync("git", ["init", "-q"], { cwd: repository });
+		const bundle = await collectWithUserContext(
+			repository,
+			{ home, codexHome: join(home, ".codex") },
+			[],
+		);
+		expect(readCaptured(bundle, "claude-user-skills", "linked/SKILL.md")).toBe(
+			"Linked skill\n",
+		);
+		expect(readCaptured(bundle, "claude-user-home", "rules/team.md")).toBe(
+			"Shared team rules\n",
+		);
+		const paths = bundle.manifest.entries.map(
+			(entry) => `${entry.rootId}:${entry.path}`,
+		);
+		// Outside \$HOME, outside the repository and cycles are not followed.
+		expect(paths).not.toContain("claude-user-skills:foreign/SKILL.md");
+		expect(paths).not.toContain("repository:.claude/skills/escaped/SKILL.md");
+		expect(paths.some((path) => path.includes("loop/"))).toBe(false);
+		const symlinks = bundle.manifest.entries.filter(
+			(entry) => entry.kind === "symlink",
+		);
+		expect(
+			Object.fromEntries(
+				symlinks.map((entry) => [
+					`${entry.rootId}:${entry.path}`,
+					entry.kind === "symlink" && entry.followed,
+				]),
+			),
+		).toEqual({
+			"claude-user-home:rules": true,
+			"claude-user-skills:foreign": false,
+			"claude-user-skills:linked": true,
+			"claude-user-skills:loop": false,
+			"repository:.claude/skills": false,
+		});
+		for (const blob of bundle.blobs) {
+			expect(blob.content).not.toContain("Outside home");
+			expect(blob.content).not.toContain("Outside the repository");
+		}
+	});
+
 	test("CODEX_HOME relocates Codex instructions, skills, plugins and configuration", () => {
 		expect(
 			getUserContextLocations({ CODEX_HOME: "/opt/codex-home" }, "/home/user"),
-		).toEqual({ home: "/home/user", codexHome: "/opt/codex-home" });
-		expect(getUserContextLocations({}, "/home/user")).toEqual({
+		).toMatchObject({ home: "/home/user", codexHome: "/opt/codex-home" });
+		expect(getUserContextLocations({}, "/home/user")).toMatchObject({
 			home: "/home/user",
 			codexHome: "/home/user/.codex",
 		});
+		expect(getManagedClaudeDirectory("darwin")).toBe(
+			"/Library/Application Support/ClaudeCode",
+		);
+		expect(getManagedClaudeDirectory("linux")).toBe("/etc/claude-code");
+		expect(getManagedClaudeDirectory("win32")).toBeNull();
 	});
 });
 

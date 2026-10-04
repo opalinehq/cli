@@ -8,6 +8,7 @@ import {
 	getSessionUserContextRank,
 	INSTRUCTION_IMPORT_EVIDENCE_REASON,
 	INSTRUCTION_INCLUDE_EVIDENCE_REASON,
+	isFollowableContextSymlink,
 	isSessionInstructionContent,
 	isSessionToolResult,
 	METADATA_INCLUDE_EVIDENCE_REASON,
@@ -90,6 +91,7 @@ interface RootSpec {
 	readonly origin: ContextRootManifest["origin"];
 	readonly scope: ContextRootManifest["scope"];
 	readonly include?: readonly ContextRootInclude[];
+	readonly followSymlinksWithin?: string;
 }
 
 interface DiscoveredEntry {
@@ -98,6 +100,8 @@ interface DiscoveredEntry {
 	readonly path: string;
 	readonly stat: FileSystemStat;
 	readonly evidenceReason: string | null;
+	/** A directory symlink whose target was walked under this path. */
+	readonly followed?: boolean;
 }
 
 interface PendingDirectory {
@@ -114,6 +118,8 @@ interface RootWalk {
 	readonly deferred: PendingDirectory[];
 	readonly ignoredDirectories: ReadonlySet<string>;
 	readonly coverage: MutableRootCoverage;
+	/** Canonical targets of followed symlinks, so each is walked once. */
+	readonly followedTargets: Set<string>;
 }
 
 interface MutableRootCoverage {
@@ -180,6 +186,7 @@ export async function collectFileSystemContext(
 			absolutePath: repositoryRoot,
 			origin: "repository",
 			scope: "repository",
+			followSymlinksWithin: repositoryRoot,
 		},
 		...options.additionalRoots
 			.map((root) => ({ ...root }))
@@ -515,6 +522,7 @@ async function discoverRoot(
 		ignoredDirectories:
 			root.id === "repository" ? getIgnoredDirectories(git) : new Set(),
 		coverage,
+		followedTargets: new Set([canonicalRoot.path]),
 	};
 	await walkDirectories(
 		walk,
@@ -602,6 +610,18 @@ async function discoverIncludes(
 			);
 			break;
 		}
+		// An included tree may itself be a directory symlink (for example
+		// ~/.claude/rules linked to a shared checkout).
+		const followedTarget =
+			stat.kind === "symlink" && include.role === "tree"
+				? await resolveFollowedSymlink(
+						walk,
+						absolutePath,
+						include.path,
+						options,
+						fileSystem,
+					)
+				: null;
 		discovered.push({
 			rootId: root.id,
 			absolutePath,
@@ -613,11 +633,15 @@ async function discoverIncludes(
 					: stat.kind === "file" && include.role === "metadata"
 						? METADATA_INCLUDE_EVIDENCE_REASON
 						: null,
+			...(followedTarget === null ? {} : { followed: true }),
 		});
 		countDiscoveredEntry(stat, coverage, aggregate);
-		if (stat.kind === "directory" && include.role === "tree")
+		if (
+			(stat.kind === "directory" || followedTarget !== null) &&
+			include.role === "tree"
+		)
 			directories.push({
-				absolutePath,
+				absolutePath: followedTarget ?? absolutePath,
 				relativePath: include.path,
 				depth: include.path.split("/").length,
 				ignored: false,
@@ -820,20 +844,34 @@ async function walkDirectories(
 				);
 				continue;
 			}
+			const followedTarget =
+				stat.kind === "symlink"
+					? await resolveFollowedSymlink(
+							walk,
+							absolutePath,
+							relativePath,
+							options,
+							fileSystem,
+						)
+					: null;
 			const entry: DiscoveredEntry = {
 				rootId: root.id,
 				absolutePath,
 				path: relativePath,
 				stat,
 				evidenceReason: null,
+				...(followedTarget === null ? {} : { followed: true }),
 			};
 			discovered.push(entry);
 			const isSubmodule = isRegisteredSubmodule(root, relativePath, stat, git);
 			countDiscoveredEntry(stat, coverage, aggregate, isSubmodule);
 
-			if (stat.kind === "directory" && !isSubmodule) {
+			if (
+				(stat.kind === "directory" && !isSubmodule) ||
+				followedTarget !== null
+			) {
 				const child: PendingDirectory = {
-					absolutePath,
+					absolutePath: followedTarget ?? absolutePath,
 					relativePath,
 					depth: directory.depth + 1,
 					ignored:
@@ -1010,7 +1048,13 @@ async function buildNonFileEntry(
 		} catch (error) {
 			if (normalizeError(error).code === "ENOENT") targetScope = "broken";
 		}
-		return { ...base, kind: "symlink", target, targetScope, followed: false };
+		return {
+			...base,
+			kind: "symlink",
+			target,
+			targetScope,
+			followed: entry.followed === true,
+		};
 	} catch (error) {
 		pushFileSystemError(
 			errors,
@@ -1437,6 +1481,50 @@ function getDedicatedPoolLimits(
 				bytesLimit: "maxToolResultContentBytes",
 			};
 	}
+}
+
+/**
+ * The canonical directory a skill or instruction directory symlink points
+ * to, when it may be followed: the target is a directory inside the root's
+ * symlink boundary, outside the CLI's private configuration, not an ancestor
+ * of the link (no cycles) and not walked already. Otherwise null, and the
+ * symlink is only recorded.
+ */
+async function resolveFollowedSymlink(
+	walk: RootWalk,
+	absolutePath: string,
+	relativePath: string,
+	options: LocalContextCollectionOptions,
+	fileSystem: LocalContextFileSystem,
+): Promise<string | null> {
+	const boundary = walk.root.followSymlinksWithin;
+	if (
+		boundary === undefined ||
+		!isFollowableContextSymlink(walk.root.scope, relativePath)
+	)
+		return null;
+	let target: string;
+	let canonicalBoundary: string;
+	try {
+		target = await fileSystem.realpath(absolutePath);
+		canonicalBoundary = await fileSystem.realpath(boundary);
+		if ((await fileSystem.lstat(target)).kind !== "directory") return null;
+	} catch {
+		return null;
+	}
+	if (
+		!isContainedPath(canonicalBoundary, target) ||
+		(options.forbiddenSymlinkTargets ?? []).some(
+			(forbidden) =>
+				isContainedPath(forbidden, target) ||
+				isContainedPath(target, forbidden),
+		) ||
+		isContainedPath(target, dirname(absolutePath)) ||
+		walk.followedTargets.has(target)
+	)
+		return null;
+	walk.followedTargets.add(target);
+	return target;
 }
 
 function findSkillDirectory(

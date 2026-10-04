@@ -1,5 +1,5 @@
 import { readdir, readFile, realpath, stat } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, platform } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import {
@@ -26,7 +26,8 @@ import { extractInstructionImportSpecifiers } from "../internal/local-context-so
  * installed plugins' skills, commands, agents and hooks, and the user's agent
  * configuration. Collected as additional context roots; home directories are
  * never walked, only the listed paths are read, and nothing outside $HOME is
- * read except an explicitly configured CODEX_HOME.
+ * read except an explicitly configured CODEX_HOME and, when present, Claude
+ * Code's managed instructions and settings.
  */
 
 const MAX_PARENT_LEVELS = 12;
@@ -41,6 +42,12 @@ const CLAUDE_PROJECT_KEY_MAX_LENGTH = 200;
 export interface UserContextLocations {
 	readonly home: string;
 	readonly codexHome: string;
+	/**
+	 * Claude Code's managed (administrator) instructions and settings, read
+	 * only when present: /Library/Application Support/ClaudeCode on macOS,
+	 * /etc/claude-code on Linux.
+	 */
+	readonly managedClaudeDirectory?: string | null;
 }
 
 export interface UserAgentSources extends AgentConfigurationInputs {
@@ -59,7 +66,21 @@ export function getUserContextLocations(
 			codexHome && isAbsolute(codexHome)
 				? resolve(codexHome)
 				: join(resolve(home), ".codex"),
+		managedClaudeDirectory: getManagedClaudeDirectory(platform()),
 	};
+}
+
+export function getManagedClaudeDirectory(
+	operatingSystem: NodeJS.Platform,
+): string | null {
+	switch (operatingSystem) {
+		case "darwin":
+			return "/Library/Application Support/ClaudeCode";
+		case "linux":
+			return "/etc/claude-code";
+		default:
+			return null;
+	}
 }
 
 /** Locations with symlinks resolved, so containment checks are exact. */
@@ -70,6 +91,11 @@ export async function canonicalizeUserContextLocations(
 	return {
 		home: await canonical(locations.home),
 		codexHome: await canonical(locations.codexHome),
+		managedClaudeDirectory:
+			locations.managedClaudeDirectory === undefined ||
+			locations.managedClaudeDirectory === null
+				? null
+				: await canonical(locations.managedClaudeDirectory),
 	};
 }
 
@@ -192,6 +218,7 @@ export async function resolveUserContextRoots(input: {
 				...claudeHomeIncludes,
 				metadata("settings.json"),
 				...CLAUDE_USER_EXTENSION_DIRECTORIES.map(tree),
+				tree("rules"),
 			]),
 		},
 		{
@@ -205,6 +232,8 @@ export async function resolveUserContextRoots(input: {
 				instruction("AGENTS.override.md"),
 				metadata("config.toml"),
 				metadata("hooks.json"),
+				// Exec-policy rules: which commands run without approval.
+				tree("rules"),
 			],
 		},
 		{
@@ -266,7 +295,37 @@ export async function resolveUserContextRoots(input: {
 			scope: "instructions",
 			include: uniqueIncludes(homeIncludes),
 		});
-	return withoutRepositoryOverlap(roots, input.repositoryRoot);
+	const managed = input.locations.managedClaudeDirectory;
+	if (
+		managed &&
+		(await stat(managed)
+			.then((details) => details.isDirectory())
+			.catch(() => false))
+	)
+		roots.push({
+			absolutePath: managed,
+			id: "claude-managed",
+			label: "Claude Code managed instructions and settings",
+			origin: "admin",
+			scope: "agent-config",
+			include: [
+				instruction("CLAUDE.md"),
+				metadata("managed-settings.json"),
+				metadata("managed-mcp.json"),
+			],
+		});
+	// Skill and instruction directories linked elsewhere in \$HOME (for
+	// example ~/.claude/skills/x -> ~/.agents/skills/x) are followed; nothing
+	// outside \$HOME, or outside a root that is not in \$HOME, is.
+	return withoutRepositoryOverlap(
+		roots.map((root) => ({
+			...root,
+			followSymlinksWithin: isPathWithin(home, root.absolutePath)
+				? home
+				: root.absolutePath,
+		})),
+		input.repositoryRoot,
+	);
 }
 
 /**
@@ -353,7 +412,7 @@ function withoutRepositoryOverlap(
 }
 
 /**
- * CLAUDE.md and CLAUDE.local.md in every directory from the repository's
+ * CLAUDE.md, CLAUDE.local.md and .claude/CLAUDE.md in every directory from the repository's
  * parent up to $HOME, which Claude Code loads for sessions below them. Only
  * for repositories inside $HOME.
  */
@@ -369,6 +428,7 @@ function getParentInstructionCandidates(
 		candidates.push(
 			join(directory, "CLAUDE.md"),
 			join(directory, "CLAUDE.local.md"),
+			join(directory, ".claude", "CLAUDE.md"),
 		);
 		if (directory === home) break;
 		directory = dirname(directory);

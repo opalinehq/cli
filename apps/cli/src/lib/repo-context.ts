@@ -240,6 +240,7 @@ export async function collectSessionRepositoryContext(input: {
 				maxTotalHashBytes: 256 * 1024 * 1024,
 			},
 			parentCapture,
+			forbiddenSymlinkTargets: [configBoundary.canonicalConfigDir],
 			transformToolResultText: input.toolResults?.transformText,
 		},
 		createLocalContextSourceEnv(input.deadlineAt),

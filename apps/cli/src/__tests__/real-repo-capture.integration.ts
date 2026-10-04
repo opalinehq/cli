@@ -215,7 +215,8 @@ describe("real repository sidecar capture", () => {
 				const fullContent = (entry: (typeof localContext.entries)[number]) =>
 					entry.rootId !== "repository" ||
 					entry.categories?.includes("skill-definition") ||
-					basename(entry.path).toLowerCase().endsWith(".local.md");
+					basename(entry.path).toLowerCase().endsWith(".local.md") ||
+					/(?:^|\/)\.claude\/rules\//u.test(entry.path);
 				for (const entry of localContext.entries) {
 					if (!fullContent(entry) || entry.kind !== "file") continue;
 					if (entry.content?.status !== "available" || !entry.content.blobId)
@@ -276,6 +277,16 @@ describe("real repository sidecar capture", () => {
 					userCommandsAgentsStyles: countContext(
 						(entry) => entry.rootId === "claude-user-home",
 					),
+					rules: localContext.entries.filter(
+						(entry) =>
+							entry.kind === "file" &&
+							entry.content?.status === "available" &&
+							(/(?:^|\/)\.claude\/rules\//u.test(entry.path) ||
+								(["claude-user-home", "codex-user-home"].includes(
+									entry.rootId,
+								) &&
+									entry.path.startsWith("rules/"))),
+					).length,
 					personalInstructions: localContext.entries.filter(
 						(entry) =>
 							entry.kind === "file" &&
@@ -283,6 +294,19 @@ describe("real repository sidecar capture", () => {
 							entry.content?.status === "available",
 					).length,
 				};
+				// Codex exec-policy rules are captured whenever they exist.
+				const codexRules = await readdir(join(codexHome(), "rules")).catch(
+					() => [] as string[],
+				);
+				if (codexRules.length > 0)
+					expect(
+						localContext.entries.some(
+							(entry) =>
+								entry.rootId === "codex-user-home" &&
+								entry.path.startsWith("rules/") &&
+								entry.content?.status === "available",
+						),
+					).toBe(true);
 				const memoryRoot = localContext.roots.find(
 					(root) => root.id === "claude-project-memory",
 				);

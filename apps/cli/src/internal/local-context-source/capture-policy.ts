@@ -29,6 +29,7 @@ export const SESSION_TOOL_RESULT_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
 export const SESSION_TOOL_RESULT_MAX_FILES = 256;
 
 export const CLAUDE_USER_HOME_ROOT_ID = "claude-user-home";
+export const CODEX_USER_HOME_ROOT_ID = "codex-user-home";
 export const CLAUDE_PROJECT_MEMORY_ROOT_ID = "claude-project-memory";
 export const CLAUDE_TOOL_RESULTS_ROOT_ID = "claude-tool-results";
 /** User-level Claude Code directories captured in full from ~/.claude. */
@@ -50,6 +51,7 @@ export function getSessionContentPriority(
 	observedSkillNames: ReadonlySet<string>,
 ): number {
 	if (isSessionContentPolicyExcluded(path, categories)) return 4;
+	if (isClaudeRuleFile(rootId, path)) return 0;
 	if (categories.includes("skill-definition")) {
 		return observedSkillNames.has(basename(dirname(path))) ? 1 : 4;
 	}
@@ -92,8 +94,36 @@ export function isSessionInstructionContent(
 	) {
 		return !isSessionContentPolicyExcluded(path, categories);
 	}
+	if (isClaudeRuleFile(rootId, path))
+		return !isSessionContentPolicyExcluded(path, categories);
 	if (rootId !== "repository") return false;
 	return getSessionContentPriority(rootId, path, categories, new Set()) <= 0;
+}
+
+/**
+ * Claude Code rules (`.claude/rules/**.md` in the repository, `~/.claude/rules`
+ * for the user) are loaded like CLAUDE.md, so they are instructions.
+ */
+export function isClaudeRuleFile(rootId: string, path: string): boolean {
+	if (!/\.md$/iu.test(path)) return false;
+	if (rootId === "repository") return /(?:^|\/)\.claude\/rules\//u.test(path);
+	return rootId === CLAUDE_USER_HOME_ROOT_ID && path.startsWith("rules/");
+}
+
+/**
+ * Directory symlinks followed during discovery: every one inside a skill
+ * root, and those inside or naming instruction, skill, command, agent and
+ * output-style directories elsewhere. The target must stay inside the root's
+ * symlink boundary (the repository, or \$HOME for user roots).
+ */
+export function isFollowableContextSymlink(
+	rootScope: string,
+	path: string,
+): boolean {
+	return (
+		rootScope === "skills" ||
+		/(?:^|\/)(?:skills|rules|commands|agents|output-styles)(?:\/|$)/u.test(path)
+	);
 }
 
 /**
@@ -119,8 +149,9 @@ export function getInstructionRank(
 /**
  * Rank in the user-context pool (lower first), or null for content that does
  * not belong to it: the auto-memory index, then memory files, then user-level
- * commands, agents and output styles, then observed skill definitions, then
- * every other skill definition, then the resources of observed skills.
+ * commands, agents, output styles and Codex rules, then observed skill
+ * definitions, then every other skill definition, then the resources of
+ * observed skills.
  * Resources of other skills stay hash-only.
  */
 export function getSessionUserContextRank(
@@ -139,6 +170,8 @@ export function getSessionUserContextRank(
 		)
 	)
 		return 2;
+	// Codex exec-policy rules decide which commands run without approval.
+	if (rootId === CODEX_USER_HOME_ROOT_ID && path.startsWith("rules/")) return 2;
 	const observed =
 		skillDirectory !== null && observedSkillNames.has(basename(skillDirectory));
 	if (categories.includes("skill-definition")) return observed ? 3 : 4;
