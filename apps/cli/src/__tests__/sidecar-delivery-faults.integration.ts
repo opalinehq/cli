@@ -11,6 +11,7 @@ import {
 	realpath,
 	rm,
 	stat,
+	symlink,
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -558,6 +559,47 @@ describe("sidecar delivery under faults", () => {
 			expect(runtime.tools.git).toMatch(/^\d+\.\d+/u);
 			expect(runtime.cli.version.length).toBeGreaterThan(0);
 			await expectNothingDropped(workspace, stub);
+		} finally {
+			stub.stop();
+		}
+	});
+
+	test("a user skills directory linked to the shared skills directory is captured once, not aborted", async () => {
+		const stub = startEvidenceProtocolStub();
+		try {
+			const workspace = await createWorkspace(stub, ["alpha"]);
+			const shared = join(workspace.home, ".agents", "skills");
+			await mkdir(join(shared, "shared-skill"), { recursive: true });
+			await writeFile(
+				join(shared, "shared-skill", "SKILL.md"),
+				"# Shared skill\n",
+			);
+			await mkdir(join(workspace.home, ".claude"), { recursive: true });
+			await symlink(shared, join(workspace.home, ".claude", "skills"));
+
+			expect(
+				(await runHook(workspace, "claude-end", "alpha", "linked-skills"))
+					.exitCode,
+			).toBe(0);
+			await waitFor(async () => (await countPending(workspace)) === 0, 60_000);
+			const capture = only(stub);
+			expectCompleteCapture(capture, workspace, "alpha");
+			const definitions = capture.manifest.localContext.entries.filter(
+				(entry) => entry.path.endsWith("shared-skill/SKILL.md"),
+			);
+			expect(definitions).toHaveLength(1);
+			const root = capture.manifest.localContext.roots.find(
+				(candidate) => candidate.id === definitions[0]?.rootId,
+			);
+			expect(root?.label).toBe("Claude user skills + Shared user skills");
+			expect(root).toMatchObject({
+				aliases: [
+					expect.objectContaining({
+						id: "agents-user-skills",
+						relation: "same-directory",
+					}),
+				],
+			});
 		} finally {
 			stub.stop();
 		}

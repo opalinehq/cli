@@ -67,8 +67,13 @@ export interface CommittedManifest {
 		}[];
 		readonly roots: readonly {
 			readonly id: string;
+			readonly label?: string;
 			readonly status: string;
 			readonly absolutePath: string;
+			readonly aliases?: readonly {
+				readonly id: string;
+				readonly relation: string;
+			}[];
 		}[];
 		readonly git: {
 			readonly status: string;

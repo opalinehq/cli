@@ -37,6 +37,7 @@ export type {
 	ContextIndexResourceAccess,
 	ContextPathReference,
 	ContextRegularFileEntry,
+	ContextRootAlias,
 	ContextRootInclude,
 	ContextRootManifest,
 	ContextRootOrigin,

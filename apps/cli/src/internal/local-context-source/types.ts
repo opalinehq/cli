@@ -30,6 +30,19 @@ export interface AdditionalContextRoot {
 	 * Without it, symlinks are recorded and not followed.
 	 */
 	readonly followSymlinksWithin?: string;
+	/**
+	 * Other roots that resolve to the same directory (for example
+	 * ~/.claude/skills linked to ~/.agents/skills) or lie inside this one,
+	 * merged into it so the directory is walked once.
+	 */
+	readonly aliases?: readonly ContextRootAlias[];
+}
+
+export interface ContextRootAlias {
+	readonly id: string;
+	readonly label: string;
+	readonly absolutePath: string;
+	readonly relation: "same-directory" | "nested";
 }
 
 export interface ContextRootInclude {
@@ -366,6 +379,7 @@ export interface ContextRootManifest {
 	readonly scope: ContextRootScope;
 	readonly status: "collected" | "missing" | "inaccessible" | "limit-reached";
 	readonly coverage: RootCoverage;
+	readonly aliases?: readonly ContextRootAlias[];
 }
 
 export interface ContextDocumentIndex {

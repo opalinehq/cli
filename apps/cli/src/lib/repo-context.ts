@@ -15,6 +15,7 @@ import {
 import {
 	type AdditionalContextRoot,
 	type CaptureRuntime,
+	type ContextRootAlias,
 	collectLocalContextBundle,
 	createLocalContextSourceEnv,
 	getDefaultLocalContextCollectionOptions,
@@ -52,7 +53,7 @@ import {
 const MAX_ADDITIONAL_CONTEXT_ROOTS = 16;
 const CONTEXT_ROOT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 
-interface RepositoryConfigBoundary {
+export interface RepositoryConfigBoundary {
 	readonly canonicalRepositoryRoot: string;
 	readonly canonicalConfigDir: string;
 	readonly excludedPathPrefix: string | null;
@@ -208,12 +209,15 @@ export async function collectSessionRepositoryContext(input: {
 		sources: userSources,
 		toolResultsDirectory: input.toolResults?.directory ?? null,
 	});
-	await assertAdditionalRootsSafe(additionalRoots, configBoundary);
+	const safeRoots = await resolveSafeAdditionalRoots(
+		additionalRoots,
+		configBoundary,
+	);
 	const collected = await collectLocalContextBundle(
 		context.repositoryRoot,
 		{
 			...defaults,
-			additionalRoots,
+			additionalRoots: safeRoots,
 			capturePolicy: "session-evidence",
 			observedSkillNames: input.observedSkillNames,
 			workingDirectory: await getRepositoryRelativePath(
@@ -314,10 +318,23 @@ async function getRepositoryConfigBoundary(
 	};
 }
 
-async function assertAdditionalRootsSafe(
+/**
+ * The additional roots that are safe to collect, without aborting the capture:
+ * - a root resolving to the same directory as an earlier one (for example
+ *   ~/.claude/skills linked to ~/.agents/skills) is merged into it as an
+ *   alias, keeping both labels;
+ * - a root inside another walked root is merged into that root as a nested
+ *   alias (its files are walked there), and a walked root containing earlier
+ *   ones takes them over the same way;
+ * - a root overlapping the repository (which inventories it) or the CLI's
+ *   private configuration directory is dropped.
+ * Include roots (home directories) are never walked; an include path inside
+ * the repository, a walked root or the configuration directory is dropped.
+ */
+export async function resolveSafeAdditionalRoots(
 	additionalRoots: readonly AdditionalContextRoot[],
 	configBoundary: RepositoryConfigBoundary,
-): Promise<void> {
+): Promise<readonly AdditionalContextRoot[]> {
 	if (additionalRoots.length > MAX_ADDITIONAL_CONTEXT_ROOTS) {
 		throw new Error(
 			`At most ${MAX_ADDITIONAL_CONTEXT_ROOTS} additional context roots may be collected at once.`,
@@ -338,69 +355,92 @@ async function assertAdditionalRootsSafe(
 		}
 		rootIds.add(root.id);
 	}
-	const directoryRoots = additionalRoots.filter(
-		(root) => root.include === undefined,
-	);
-	const canonicalRootPaths = await Promise.all(
-		directoryRoots.map((root) => resolveCanonicalPath(root.absolutePath)),
-	);
-	const acceptedRoots: Array<{ readonly id: string; readonly path: string }> = [
-		{ id: "repository", path: configBoundary.canonicalRepositoryRoot },
+	const forbidden = [
+		configBoundary.canonicalRepositoryRoot,
+		configBoundary.canonicalConfigDir,
 	];
-	for (const [index, root] of directoryRoots.entries()) {
-		const canonicalRootPath = canonicalRootPaths[index];
-		if (canonicalRootPath === undefined) {
-			throw new Error(
-				`Could not resolve context root ${JSON.stringify(root.id)}.`,
-			);
-		}
-		const overlappingRoot = acceptedRoots.find(
-			(accepted) =>
-				isPathWithin(accepted.path, canonicalRootPath) ||
-				isPathWithin(canonicalRootPath, accepted.path),
-		);
-		if (overlappingRoot?.path === canonicalRootPath) {
-			throw new Error(
-				`Duplicate context root path: ${JSON.stringify(root.absolutePath)}`,
-			);
-		}
-		if (overlappingRoot !== undefined) {
-			throw new Error(
-				`Context root ${JSON.stringify(root.id)} overlaps ${JSON.stringify(overlappingRoot.id)} and would duplicate inventory.`,
-			);
-		}
-		if (
-			isPathWithin(canonicalRootPath, configBoundary.canonicalConfigDir) ||
-			isPathWithin(configBoundary.canonicalConfigDir, canonicalRootPath)
-		) {
-			throw new Error(
-				`Context root ${JSON.stringify(root.id)} overlaps the private CLI configuration directory.`,
-			);
-		}
-		acceptedRoots.push({ id: root.id, path: canonicalRootPath });
+	interface Walked {
+		root: AdditionalContextRoot;
+		readonly canonical: string;
+		aliases: ContextRootAlias[];
 	}
-	// Include roots (home directories) are never walked: each included path
-	// must stay out of the repository, the walked roots and the CLI's private
-	// configuration directory.
+	const walked: Walked[] = [];
+	const alias = (
+		root: AdditionalContextRoot,
+		relation: ContextRootAlias["relation"],
+	): ContextRootAlias => ({
+		id: root.id,
+		label: root.label,
+		absolutePath: root.absolutePath,
+		relation,
+	});
 	for (const root of additionalRoots) {
-		if (root.include === undefined) continue;
-		const canonicalRoot = await resolveCanonicalPath(root.absolutePath);
-		for (const include of root.include) {
-			const target = resolve(canonicalRoot, include.path);
-			const conflict = [
-				...acceptedRoots,
-				{ id: "configuration", path: configBoundary.canonicalConfigDir },
-			].find(
-				(accepted) =>
-					isPathWithin(accepted.path, target) ||
-					(include.role === "tree" && isPathWithin(target, accepted.path)),
-			);
-			if (conflict !== undefined)
-				throw new Error(
-					`Context root ${JSON.stringify(root.id)} includes a path inside ${JSON.stringify(conflict.id)}.`,
-				);
+		if (root.include !== undefined) continue;
+		const canonical = await resolveCanonicalPath(root.absolutePath);
+		if (
+			forbidden.some(
+				(path) =>
+					isPathWithin(path, canonical) || isPathWithin(canonical, path),
+			)
+		)
+			continue;
+		const same = walked.find((entry) => entry.canonical === canonical);
+		if (same !== undefined) {
+			same.aliases.push(alias(root, "same-directory"));
+			continue;
 		}
+		const container = walked.find((entry) =>
+			isPathWithin(entry.canonical, canonical),
+		);
+		if (container !== undefined) {
+			container.aliases.push(alias(root, "nested"));
+			continue;
+		}
+		const contained = walked.filter((entry) =>
+			isPathWithin(canonical, entry.canonical),
+		);
+		const aliases: ContextRootAlias[] = contained.flatMap((entry) => [
+			alias(entry.root, "nested"),
+			...entry.aliases,
+		]);
+		for (const entry of contained) walked.splice(walked.indexOf(entry), 1);
+		walked.push({ root, canonical, aliases });
 	}
+	const walkedPaths = walked.map((entry) => entry.canonical);
+	const safe: AdditionalContextRoot[] = [];
+	for (const root of additionalRoots) {
+		if (root.include === undefined) {
+			const entry = walked.find((candidate) => candidate.root === root);
+			if (entry === undefined) continue;
+			safe.push(
+				entry.aliases.length === 0
+					? root
+					: {
+							...root,
+							label: [
+								root.label,
+								...entry.aliases
+									.filter((item) => item.relation === "same-directory")
+									.map((item) => item.label),
+							].join(" + "),
+							aliases: entry.aliases,
+						},
+			);
+			continue;
+		}
+		const canonicalRoot = await resolveCanonicalPath(root.absolutePath);
+		const include = root.include.filter((item) => {
+			const target = resolve(canonicalRoot, item.path);
+			return ![...walkedPaths, ...forbidden].some(
+				(path) =>
+					isPathWithin(path, target) ||
+					(item.role === "tree" && isPathWithin(target, path)),
+			);
+		});
+		if (include.length > 0 || root.include.length === 0)
+			safe.push({ ...root, include });
+	}
+	return safe;
 }
 
 function isMissingPathError(error: unknown): boolean {

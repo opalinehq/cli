@@ -44,6 +44,7 @@ import type {
 	ContextEntry,
 	ContextFileCategory,
 	ContextRegularFileEntry,
+	ContextRootAlias,
 	ContextRootInclude,
 	ContextRootManifest,
 	CoverageError,
@@ -105,6 +106,7 @@ interface RootSpec {
 	readonly scope: ContextRootManifest["scope"];
 	readonly include?: readonly ContextRootInclude[];
 	readonly followSymlinksWithin?: string;
+	readonly aliases?: readonly ContextRootAlias[];
 }
 
 interface DiscoveredEntry {
@@ -1754,6 +1756,9 @@ function buildRootManifest(
 		scope: root.scope,
 		status,
 		coverage: immutableCoverage,
+		...(root.aliases === undefined || root.aliases.length === 0
+			? {}
+			: { aliases: root.aliases }),
 	};
 }
 
