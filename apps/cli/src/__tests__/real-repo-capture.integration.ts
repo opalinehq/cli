@@ -18,7 +18,10 @@ import {
 	REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES,
 	REPOSITORY_EVIDENCE_MAX_OBJECTS,
 } from "../contracts/index.js";
-import { filterKnownSecrets } from "../internal/secret-filter/index.js";
+import {
+	filterContextText,
+	sanitizeMcpText,
+} from "../internal/local-context-source/credential-redaction.js";
 import { getConfigDir } from "../lib/local-state.js";
 import { readPendingRepositoryEvidence } from "../lib/repository-evidence-pending.js";
 import { captureAndUploadSessionEvidence } from "../lib/session-evidence.js";
@@ -171,13 +174,20 @@ describe("real repository sidecar capture", () => {
 						assert(entry.content?.blobId);
 						const stored = capture.objects.get(entry.content.blobId);
 						assert(stored, `${entry.path} blob was not delivered`);
-						expect(entry.content?.secretFilter?.redactedBytes ?? 0).toBe(0);
-						expect(sha256(stored)).toBe(diskHash);
+						// Stored bytes are the file after the context filter (example
+						// credentials such as postgres://user:pass@ are redacted).
+						const expected = sha256(
+							new TextEncoder().encode(
+								filterContextText(new TextDecoder().decode(onDisk)).text,
+							),
+						);
+						expect(sha256(stored)).toBe(expected);
 						instructionResults.push({
 							path: entry.path,
 							bytes: onDisk.byteLength,
 							stored: "content",
-							match: sha256(stored) === diskHash,
+							match: sha256(stored) === expected,
+							redactions: entry.content?.secretFilter?.redactedBytes ?? 0,
 						});
 					} else {
 						// Hash-only by capture policy (skill resources, personal files).
@@ -239,15 +249,18 @@ describe("real repository sidecar capture", () => {
 					}
 					const stored = capture.objects.get(entry.content.blobId);
 					assert(stored, `${entry.rootId}:${entry.path} was not delivered`);
-					const redacted = (entry.content.secretFilter?.redactedBytes ?? 0) > 0;
+					// What the capture must store: the file on disk after the
+					// structural MCP sanitizer (MCP files) and the context filter.
+					const diskText = new TextDecoder().decode(onDisk);
+					const mcp = [".mcp.json", "mcp.json", "mcp-config.json"].includes(
+						basename(entry.path).toLowerCase(),
+					)
+						? sanitizeMcpText(diskText)
+						: null;
+					const expected = filterContextText(mcp?.text ?? diskText).text;
+					const redacted = expected !== diskText;
 					expect(sha256(stored)).toBe(
-						redacted
-							? sha256(
-									new TextEncoder().encode(
-										filterKnownSecrets(new TextDecoder().decode(onDisk)).text,
-									),
-								)
-							: sha256(onDisk),
+						sha256(new TextEncoder().encode(expected)),
 					);
 					userFiles.push(
 						`${entry.rootId}:${entry.path} (${onDisk.byteLength} B, sha256 ${redacted ? "match after secret filter" : "match"})`,
@@ -417,6 +430,7 @@ describe("real repository sidecar capture", () => {
 					objects: capture.input.objects.length,
 					aggregateBytes,
 					contextCounts,
+					redactionCounts: localContext.coverage.redactionCounts ?? {},
 					memoryRoot: memoryRoot
 						? `${memoryRoot.status}: ${memoryRoot.absolutePath}`
 						: null,

@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 import {
 	FILTER_VERSION,
-	filterKnownSecrets,
 	getRedactionBudgetAnomaly,
+	mergeRedactionCounts,
+	type RedactionCounts,
 } from "../secret-filter/index.js";
+import { filterContextText } from "./credential-redaction.js";
 import type {
 	ContextBlob,
 	ParentCaptureReference,
@@ -55,13 +57,24 @@ export function createBlobStore(
 	};
 }
 
+/**
+ * Stores context text after the known-secret filter and the credential rules
+ * (credential assignments and flags, Authorization values, connection-string
+ * passwords, JWTs). `priorRedactions` are counted with them (for example the
+ * structural MCP sanitizer that already ran).
+ */
 export function addSanitizedTextBlob(
 	text: string,
 	sourceByteLength: number,
 	store: BlobStore,
+	priorRedactions: RedactionCounts = {},
 ): SanitizedBlobResult {
 	try {
-		const filtered = filterKnownSecrets(text);
+		const contextFiltered = filterContextText(text);
+		const filtered = {
+			...contextFiltered,
+			counts: mergeRedactionCounts(priorRedactions, contextFiltered.counts),
+		};
 		const anomaly = getRedactionBudgetAnomaly(
 			filtered.redactedBytes,
 			sourceByteLength,

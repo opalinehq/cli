@@ -27,6 +27,7 @@ import {
 	SKILL_SUPPORT_CAP_DETAIL,
 	SUPPORT_CAP_DETAIL,
 } from "./capture-policy.js";
+import { sanitizeMcpText } from "./credential-redaction.js";
 import {
 	type GitCollectionResult,
 	getGitFileProvenance,
@@ -1322,14 +1323,46 @@ async function buildRegularFileEntry(
 			};
 		}
 		const decoded = UTF8_DECODER.decode(read.bytes);
+		// MCP server files are rewritten structurally before any blob exists:
+		// environment and header values, credential arguments and URL
+		// credentials are replaced, names and structure kept. One that cannot
+		// be parsed is kept hash-only.
+		const mcp = isMcpDocumentPath(entry.path)
+			? sanitizeMcpText(decoded)
+			: undefined;
+		if (mcp === null) {
+			coverage.omittedContentFiles += 1;
+			aggregate.omittedBytes += entry.stat.size;
+			return {
+				...base,
+				kind: "file",
+				size: entry.stat.size,
+				hash: await hashOmittedContent(
+					entry,
+					fileSystem,
+					coverage,
+					aggregate,
+					options,
+					errors,
+				),
+				content: {
+					status: "omitted",
+					reason: "metadata-only",
+					detail: "mcp-unparsable",
+				},
+			};
+		}
 		const text =
-			pool === "tool-result" && options.transformToolResultText
-				? options.transformToolResultText(decoded)
-				: decoded;
+			mcp !== undefined
+				? mcp.text
+				: pool === "tool-result" && options.transformToolResultText
+					? options.transformToolResultText(decoded)
+					: decoded;
 		const sanitized = addSanitizedTextBlob(
 			text,
 			read.bytes.byteLength,
 			blobStore,
+			mcp?.counts,
 		);
 		if (sanitized.status === "failure") {
 			if (sanitized.reason === "blob-count-cap")
@@ -1683,6 +1716,16 @@ function getSupportBudgets(
 			detail: PLUGIN_SUPPORT_CAP_DETAIL,
 		});
 	return budgets;
+}
+
+/** MCP server configuration documents (`.mcp.json` and kin, anywhere). */
+function isMcpDocumentPath(path: string): boolean {
+	return [
+		".mcp.json",
+		"mcp.json",
+		"mcp-config.json",
+		"managed-mcp.json",
+	].includes(basename(path).toLowerCase());
 }
 
 function findSkillDirectory(

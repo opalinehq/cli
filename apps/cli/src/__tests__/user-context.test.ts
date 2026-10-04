@@ -663,7 +663,9 @@ describe("user-level context roots", () => {
 				enabledMcpjsonServers: ["github"],
 				hooks: {
 					PreToolUse: [
-						{ hooks: [{ type: "command", command: `guard ${token}` }] },
+						{
+							hooks: [{ type: "command", command: `guard ${token}` }],
+						},
 					],
 				},
 			}),
@@ -945,6 +947,69 @@ describe("user-level context roots", () => {
 					entry.path === "work/CLAUDE.md",
 			),
 		).toBe(false);
+	});
+
+	test("redacts hand-written credentials in every free-text channel and counts them", async () => {
+		const home = await createHome();
+		const opaque = "zQ7p-internal-opaque-4471";
+		const repository = join(home, "repo");
+		const memory = join(home, "memory");
+		const toolResults = join(home, "session/tool-results");
+		const files: Record<string, string> = {
+			"repo/AGENTS.md": `Instructions\nstaging password: ${opaque}\n`,
+			"repo/CLAUDE.local.md": `Personal notes\nexport DEPLOY_TOKEN=${opaque}\n`,
+			"repo/.claude/rules/db.md": `Use postgres://app:${opaque}@db.internal/app\n`,
+			"repo/.claude/skills/ops/SKILL.md": "# Ops\n",
+			"repo/.claude/skills/ops/scripts/run.sh": `curl -H "Authorization: Bearer ${opaque}" --api-key ${opaque} https://ops\n`,
+			"memory/MEMORY.md": `# Memory\n- the vault secret = ${opaque}\n`,
+			"session/tool-results/out.txt": `DATABASE_URL=mysql://root:${opaque}@10.0.0.5/app\n`,
+		};
+		// Realistic surrounding text keeps each file inside the redaction budget.
+		const prose =
+			"Keep changes small and run the checks before pushing.\n".repeat(8);
+		for (const [path, content] of Object.entries(files)) {
+			await mkdir(dirname(join(home, path)), { recursive: true });
+			await writeFile(join(home, path), `${prose}${content}`);
+		}
+		execFileSync("git", ["init", "-q"], { cwd: repository });
+		const locations = { home, codexHome: join(home, ".codex") };
+		const repositoryRoot = await realpath(repository);
+		const sources = await readUserAgentSources(locations, repositoryRoot);
+		const bundle = await collectLocalContextBundle(
+			repositoryRoot,
+			{
+				...getDefaultLocalContextCollectionOptions(),
+				additionalRoots: await resolveUserContextRoots({
+					locations,
+					memoryDirectory: memory,
+					repositoryRoot,
+					sources,
+					toolResultsDirectory: toolResults,
+				}),
+				capturePolicy: "session-evidence",
+			},
+			createLocalContextSourceEnv(),
+		);
+		const captured = [
+			["repository", "AGENTS.md"],
+			["repository", "CLAUDE.local.md"],
+			["repository", ".claude/rules/db.md"],
+			["repository", ".claude/skills/ops/scripts/run.sh"],
+			["claude-project-memory", "MEMORY.md"],
+			["claude-tool-results", "out.txt"],
+		] as const;
+		for (const [rootId, path] of captured) {
+			const text = readCaptured(bundle, rootId, path);
+			expect(text).not.toContain(opaque);
+			expect(text).toContain("[REDACTED:");
+		}
+		for (const blob of bundle.blobs) expect(blob.content).not.toContain(opaque);
+		expect(bundle.manifest.coverage.redactionCounts).toMatchObject({
+			"authorization-value": 1,
+			"connection-string-password": 2,
+			"credential-assignment": 3,
+			"credential-flag": 1,
+		});
 	});
 
 	test("CODEX_HOME relocates Codex instructions, skills, plugins and configuration", () => {

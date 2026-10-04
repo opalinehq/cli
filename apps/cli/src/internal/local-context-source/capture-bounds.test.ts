@@ -720,20 +720,24 @@ test("agent settings and other MCP package files are hash-only even when they co
 	expect(bundle.manifest.coverage.truncated).toBeUndefined();
 });
 
-test("repository MCP server files are captured in full, secret-filtered", async () => {
-	const secret = `ghp_${"D".repeat(36)}`;
+test("repository MCP server files are captured structurally sanitized: names kept, credential values removed", async () => {
+	// Opaque values no vendor pattern recognizes.
+	const opaque = "q8Zr2-internal-opaque-value";
 	const servers = (name: string) =>
 		`${JSON.stringify(
 			{
 				mcpServers: {
 					[name]: {
-						command: "npx",
-						args: ["-y", `@example/${name}-server`],
-						env: { GITHUB_TOKEN: secret, LOG_LEVEL: "info" },
+						command: `INTERNAL_API_KEY=${opaque} npx`,
+						args: ["-y", `@example/${name}-server`, "--api-key", opaque],
+						env: { INTERNAL_API_KEY: opaque, LOG_LEVEL: "info" },
 					},
-					docs: { type: "http", url: "https://mcp.example/docs" },
+					docs: {
+						type: "http",
+						url: `https://bot:${opaque}@mcp.example/docs?token=${opaque}`,
+						headers: { Authorization: opaque },
+					},
 				},
-				notes: "Shared MCP servers for this repository. ".repeat(20),
 			},
 			null,
 			2,
@@ -746,6 +750,7 @@ test("repository MCP server files are captured in full, secret-filtered", async 
 	};
 	const directory = await createSmallFixture({
 		...files,
+		"broken/.mcp.json": `{ "mcpServers": { "x": { "env": { "K": "${opaque}" } } }`,
 		"AGENTS.md": "Shared instructions\n",
 	});
 	const bundle = await collectLocalContextBundle(
@@ -762,17 +767,40 @@ test("repository MCP server files are captured in full, secret-filtered", async 
 		if (entry.content.status !== "available") continue;
 		const blobId = entry.content.blobId;
 		const blob = bundle.blobs.find((candidate) => candidate.id === blobId);
-		expect(blob?.content).toBe(filterKnownSecrets(content).text);
-		expect(blob?.content).not.toContain(secret);
-		expect(entry.content.secretFilter.redactedBytes).toBeGreaterThan(0);
+		expect(blob?.content).not.toContain(opaque);
+		const name = Object.keys(JSON.parse(content).mcpServers)[0] ?? "";
+		expect(JSON.parse(blob?.content ?? "")).toEqual({
+			mcpServers: {
+				[name]: {
+					command: "INTERNAL_API_KEY=[REDACTED] npx",
+					args: ["-y", `@example/${name}-server`, "--api-key", "[REDACTED]"],
+					env: { INTERNAL_API_KEY: "[REDACTED]", LOG_LEVEL: "[REDACTED]" },
+				},
+				docs: {
+					type: "http",
+					url: "https://mcp.example/docs",
+					headers: { Authorization: "[REDACTED]" },
+				},
+			},
+		});
+		expect(entry.content.secretFilter.counts["mcp-structural"]).toBeGreaterThan(
+			0,
+		);
 	}
+	// A file that cannot be parsed is never uploaded as text.
+	expect(fileEntry(bundle, "repository", "broken/.mcp.json").content).toEqual({
+		status: "omitted",
+		reason: "metadata-only",
+		detail: "mcp-unparsable",
+	});
+	for (const blob of bundle.blobs) expect(blob.content).not.toContain(opaque);
+	expect(
+		bundle.manifest.coverage.redactionCounts["mcp-structural"],
+	).toBeGreaterThan(0);
 	const mcp = bundle.manifest.contextIndex.facets.find(
 		(facet) => facet.rootId === "repository" && facet.kind === "mcp",
 	);
 	expect(mcp).toMatchObject({ presence: "present", coverage: "complete" });
-	expect(
-		mcp?.resources.every((resource) => resource.access.status === "readable"),
-	).toBe(true);
 });
 
 test("personal instruction files are captured in full from the instruction pool, secret-filtered", async () => {

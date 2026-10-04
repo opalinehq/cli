@@ -82,6 +82,7 @@ export interface CommittedManifest {
 		};
 		readonly coverage: {
 			readonly limitsReached: readonly string[];
+			readonly redactionCounts?: Readonly<Record<string, number>>;
 			readonly truncated?: unknown;
 		};
 		readonly userConfiguration?: UserAgentConfiguration;
