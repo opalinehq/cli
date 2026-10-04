@@ -459,8 +459,17 @@ describe("real repository sidecar capture", () => {
 						),
 						JSON.stringify(summary, null, 2),
 					);
+				// The one accepted gap: Codex does not persist hook output, so a
+				// machine with Codex hooks reports it on effective-instructions.
 				expect(
-					capture.input.coverage.filter((item) => item.status !== "complete"),
+					capture.input.coverage.filter(
+						(item) =>
+							item.status !== "complete" &&
+							!(
+								item.area === "effective-instructions" &&
+								item.reason?.startsWith("Codex does not persist hook output:")
+							),
+					),
 				).toEqual([]);
 				expect(
 					capture.manifest.contextIndex.facets.filter(

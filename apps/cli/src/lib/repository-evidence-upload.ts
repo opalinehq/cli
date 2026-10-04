@@ -192,7 +192,11 @@ export function buildRepositoryEvidenceUpload(
 	const built = {
 		input: {
 			capture,
-			coverage: buildCoverage(input.bundle, input.transcriptRevision.delivery),
+			coverage: buildCoverage(
+				input.bundle,
+				input.transcriptRevision.delivery,
+				input.session.source,
+			),
 			manifestObjectId: manifest.descriptor.objectId,
 			objects: [...objects.values()].map((object) => object.descriptor),
 			operationId: randomUUID(),
@@ -501,16 +505,24 @@ const DIFF_LABELS: Readonly<Record<GitDiff["kind"], string>> = {
 function buildCoverage(
 	bundle: LocalContextBundle,
 	transcriptDelivery: TranscriptDeliveryState,
+	source: IngestSessionInput["source"],
 ): RepositoryEvidenceInitInput["coverage"] {
 	const facets = bundle.manifest.contextIndex.facets;
+	const instructions = coverageFromFacets(
+		"effective-instructions",
+		facets.filter((facet) =>
+			["agents-instructions", "claude-instructions"].includes(facet.kind),
+		),
+	);
+	const hookGap = getHookOutputGap(bundle, source);
 	return [
 		buildGitStateCoverage(bundle),
-		coverageFromFacets(
-			"effective-instructions",
-			facets.filter((facet) =>
-				["agents-instructions", "claude-instructions"].includes(facet.kind),
-			),
-		),
+		hookGap === null
+			? instructions
+			: incompleteCoverage("effective-instructions", "partial", [
+					...(instructions.reason === null ? [] : [instructions.reason]),
+					hookGap,
+				]),
 		coverage("available-skills", getSkillInventoryGap(bundle)),
 		coverageFromFacets(
 			"package-configuration",
@@ -525,6 +537,31 @@ function buildCoverage(
 		),
 		buildTranscriptCoverage(transcriptDelivery),
 	];
+}
+
+/**
+ * Context a hook adds is captured only where the agent persists it. Claude
+ * Code writes hook results into the transcript (hook_additional_context and
+ * other hook attachments, stop_hook_summary records), which is uploaded.
+ * Codex writes no hook output to its rollout or logs, so a Codex session
+ * with hooks configured (other than Opaline's own) may have had context that
+ * no capture can recover.
+ */
+/** Opaline's own hook commands: `opaline|rudel|<runtime>/cli.js hooks codex|claude`. */
+const OPALINE_HOOK_COMMAND =
+	/(?:^|[\s"'/])(?:opaline|rudel|cli\.js)["']?\s+hooks\s+(?:codex|claude)\b/u;
+
+function getHookOutputGap(
+	bundle: LocalContextBundle,
+	source: IngestSessionInput["source"],
+): string | null {
+	if (source !== "codex") return null;
+	const hooks = (bundle.manifest.userConfiguration?.codex.hooks ?? []).filter(
+		(hook) => !OPALINE_HOOK_COMMAND.test(hook.command ?? ""),
+	);
+	if (hooks.length === 0) return null;
+	const events = [...new Set(hooks.map((hook) => hook.event))].sort();
+	return `Codex does not persist hook output: ${hooks.length} configured hook(s) (${events.join(", ")}) may have added context that is not captured`;
 }
 
 /**

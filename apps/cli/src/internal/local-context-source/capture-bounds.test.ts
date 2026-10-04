@@ -23,6 +23,7 @@ import { planTranscriptRevision } from "../../lib/transcript-revision.js";
 import { extractObservedSkills } from "../../lib/transcript-skills.js";
 import { filterKnownSecrets } from "../secret-filter/index.js";
 import { buildRepositoryEvidenceIndexRow } from "./__fixtures__/athena-evidence-index.js";
+import { summarizeUserAgentConfiguration } from "./agent-configuration.js";
 import { addSanitizedTextBlob, createBlobStore } from "./blob-store.js";
 import {
 	SESSION_CONTEXT_MAX_BLOB_BYTES,
@@ -350,6 +351,7 @@ async function buildTestUpload(
 	options: {
 		content?: string;
 		remoteHint?: RepositoryEvidenceRemoteHint | null;
+		source?: "claude_code" | "codex";
 	} = {},
 ) {
 	const content =
@@ -381,12 +383,102 @@ async function buildTestUpload(
 		firstActionBasis: "unavailable",
 		firstActionRelationship: "unknown",
 		organizationId: "fixture-workspace",
-		session: { content, sessionId: "fixture-session", source: "codex" },
+		session: {
+			content,
+			sessionId: "fixture-session",
+			source: options.source ?? "codex",
+		},
 		terminalTranscript: true,
 		transcriptLastEventAt: null,
 		transcriptRevision,
 	});
 }
+
+test("records Codex hook output as a known gap, but not for Claude Code or Opaline's own hooks", async () => {
+	const directory = await createSmallFixture({ "AGENTS.md": "Instructions\n" });
+	execFileSync("git", ["init", "-q"], { cwd: directory });
+	const collected = await collectLocalContextBundle(
+		directory,
+		{
+			...getDefaultLocalContextCollectionOptions(),
+			capturePolicy: "session-evidence",
+		},
+		createLocalContextSourceEnv(),
+	);
+	const withCodexHooks = (
+		hooks: Record<string, string[]>,
+	): LocalContextBundle => ({
+		...collected,
+		manifest: {
+			...collected.manifest,
+			userConfiguration: summarizeUserAgentConfiguration({
+				claudeSettings: {
+					path: "~/.claude/settings.json",
+					status: "absent",
+					value: undefined,
+				},
+				claudeInstalledPlugins: [],
+				codexConfig: {
+					path: "$CODEX_HOME/config.toml",
+					status: "absent",
+					value: undefined,
+				},
+				codexHooks: {
+					path: "$CODEX_HOME/hooks.json",
+					status: "parsed",
+					value: {
+						hooks: Object.fromEntries(
+							Object.entries(hooks).map(([event, commands]) => [
+								event,
+								[
+									{
+										hooks: commands.map((command) => ({
+											type: "command",
+											command,
+										})),
+									},
+								],
+							]),
+						),
+					},
+				},
+			}),
+		},
+	});
+	const instructions = async (
+		bundle: LocalContextBundle,
+		source: "claude_code" | "codex",
+	) =>
+		(await buildTestUpload(bundle, { source })).input.coverage.find(
+			(item) => item.area === "effective-instructions",
+		);
+	const hooked = withCodexHooks({
+		UserPromptSubmit: ["inject-team-context"],
+		SessionStart: [
+			"load-notes",
+			"opaline hooks codex session-start",
+			`'/home/me/.rudel/runtime/cli.js' hooks codex session-start`,
+		],
+		// A path that merely contains "rudel" is someone else's hook.
+		PostToolUse: ["/work/rudel-lab/bin/entire hooks codex post-tool-use"],
+	});
+	expect(await instructions(hooked, "codex")).toEqual({
+		area: "effective-instructions",
+		status: "partial",
+		reason:
+			"Codex does not persist hook output: 3 configured hook(s) (PostToolUse, SessionStart, UserPromptSubmit) may have added context that is not captured",
+	});
+	// Claude Code writes hook results into the uploaded transcript.
+	expect(await instructions(hooked, "claude_code")).toMatchObject({
+		status: "complete",
+	});
+	expect(
+		await instructions(
+			withCodexHooks({ Stop: ["opaline hooks codex turn-complete"] }),
+			"codex",
+		),
+	).toMatchObject({ status: "complete" });
+});
 
 test("generated hash-only and blob-limited resources pass the production Athena indexer", async () => {
 	const directory = await createSmallFixture({
