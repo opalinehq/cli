@@ -264,13 +264,24 @@ export async function captureAndUploadSessionEvidence(input: {
 				`Could not supersede older pending captures: ${getErrorMessage(error)}`,
 			);
 		}
-		const hookStartedAt = Date.parse(input.hookReceivedAt);
-		const deliveryDeadlineAt = Math.min(
-			Date.now() + EVIDENCE_INLINE_DELIVERY_BUDGET_MS,
-			Number.isFinite(hookStartedAt)
-				? hookStartedAt + EVIDENCE_HOOK_SOFT_LIMIT_MS
-				: Number.POSITIVE_INFINITY,
-		);
+		// Elapsed hook time on the real wall clock (hookReceivedAt comes from a
+		// Date object); the deadline itself is kept on Date.now() like every
+		// other delivery deadline.
+		const hookElapsedMs =
+			performance.timeOrigin +
+			performance.now() -
+			Date.parse(input.hookReceivedAt);
+		const deliveryDeadlineAt =
+			Date.now() +
+			Math.max(
+				0,
+				Math.min(
+					EVIDENCE_INLINE_DELIVERY_BUDGET_MS,
+					Number.isFinite(hookElapsedMs)
+						? EVIDENCE_HOOK_SOFT_LIMIT_MS - hookElapsedMs
+						: EVIDENCE_INLINE_DELIVERY_BUDGET_MS,
+				),
+			);
 		const outcome = await deliverPendingRepositoryEvidence(
 			currentPending,
 			input.credentials,
