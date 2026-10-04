@@ -83,6 +83,31 @@ describe("Codex thread family", () => {
 		]);
 	});
 
+	test("a resumed chat's subagents spawned weeks after the root are found", async () => {
+		const codexHome = await createCodexHome();
+		const rootStarted = Date.parse("2026-09-20T12:00:00.000Z");
+		const resumedAt = Date.parse("2026-10-04T12:00:00.000Z");
+		const root = codexThreadId(rootStarted);
+		const child = codexThreadId(rootStarted + 60_000);
+		const grandchild = codexThreadId(resumedAt);
+		await writeCodexRollout(codexHome, { threadId: root });
+		await writeCodexRollout(codexHome, { threadId: child, spawnedBy: root });
+		await writeCodexRollout(codexHome, {
+			threadId: grandchild,
+			spawnedBy: child,
+		});
+
+		const family = await resolveCodexThreadFamily(child, {
+			codexHome,
+			now: new Date(resumedAt + 3_600_000),
+		});
+
+		expect(family?.ancestors.map((thread) => thread.threadId)).toEqual([root]);
+		expect(family?.descendants.map((thread) => thread.threadId)).toEqual([
+			grandchild,
+		]);
+	});
+
 	test("returns null for an unknown thread and finds non-UUIDv7 ids by file name", async () => {
 		const codexHome = await createCodexHome();
 		await writeCodexRollout(codexHome, {

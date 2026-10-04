@@ -150,10 +150,18 @@ async function findDescendants(
 		now.getTime() + DAY_MS,
 		selfStartedAt + (CHILD_WINDOW_DAYS + 1) * DAY_MS,
 	);
+	// A chat resumed after its first week can still spawn subagents (a resumed
+	// child spawning grandchildren): also scan the most recent week.
+	const recentStart = now.getTime() - (CHILD_WINDOW_DAYS + 1) * DAY_MS;
 	const childrenByParent = new Map<string, CodexThread[]>();
 	let scanned = 0;
 	const days = dayDirectories
-		.filter((day) => day.startsAt >= windowStart && day.startsAt <= windowEnd)
+		.filter(
+			(day) =>
+				day.startsAt <= now.getTime() + DAY_MS &&
+				((day.startsAt >= windowStart && day.startsAt <= windowEnd) ||
+					day.startsAt >= recentStart),
+		)
 		.sort((left, right) => left.startsAt - right.startsAt);
 	scan: for (const day of days) {
 		for (const name of await readNames(day.path)) {

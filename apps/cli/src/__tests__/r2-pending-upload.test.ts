@@ -7,6 +7,7 @@ import {
 	findAnalysisMarkers,
 	recordAnalysisMarker,
 } from "../lib/analysis-markers.js";
+import { uploadAnalysisTargets } from "../lib/analysis-upload.js";
 import { type BatchUploadItem, batchUpload } from "../lib/batch-upload.js";
 import {
 	isRetryCandidate,
@@ -380,6 +381,74 @@ describe("pending analysis uploads and inaccessible jobs", () => {
 		expect(await findAnalysisMarkers("codex", "session-linked")).toHaveLength(
 			1,
 		);
+	});
+
+	test("one analysis's upload never replaces or clears another analysis's pending job", async () => {
+		const stub = await startStub();
+		const directory = await mkdtemp(join(tmpdir(), "opaline-two-analyses-"));
+		directories.push(directory);
+		const sessionId = "6c1d0b63-3e1f-4c9a-8b62-7a3f4d2e8f21";
+		const transcriptPath = join(directory, `${sessionId}.jsonl`);
+		await writeFile(
+			transcriptPath,
+			`${JSON.stringify({
+				message: { content: "Which runs failed?", role: "user" },
+				sessionId,
+				timestamp: "2026-10-04T10:00:00.000Z",
+				type: "user",
+			})}\n`,
+		);
+		const target = {
+			gitBranch: undefined,
+			gitSha: undefined,
+			projectPath: directory,
+			relation: "marked" as const,
+			sessionId,
+			source: "claude_code" as const,
+			transcriptPath,
+		};
+		const environment = {
+			allowInsecureEndpoint: false,
+			credentials: { authType: "api-key" as const, token: TOKEN },
+			endpoint: `${stub.baseUrl}/rpc`,
+		};
+		const jobA = "00000000-0000-4000-8000-0000000000a1";
+		const jobB = "00000000-0000-4000-8000-0000000000b1";
+		const jobBDone = "00000000-0000-4000-8000-0000000000b2";
+		stub.commit = () => ({
+			kind: "unavailable",
+			queued: true,
+			reason: "R2_INGEST_JOB_RETRY_LATER",
+		});
+		stub.status = (jobId) =>
+			jobId === jobBDone
+				? { analysisId: "analysis-b", kind: "completed" }
+				: { kind: "pending" };
+		const upload = (analysisId: string, jobId: string) => {
+			stub.nextJobId = jobId;
+			return uploadAnalysisTargets([target], analysisId, environment, {
+				previous: {},
+				statusMaxPolls: 1,
+				uploadMode: "hook",
+			});
+		};
+
+		const pendingA = await upload("analysis-a", jobA);
+		const pendingB = await upload("analysis-b", jobB);
+		const pendingJobs = await loadFailedUploads();
+		const uploadedB = await upload("analysis-b", jobBDone);
+
+		expect(pendingA.map((outcome) => outcome.status)).toEqual(["pending"]);
+		expect(pendingB.map((outcome) => outcome.status)).toEqual(["pending"]);
+		expect(pendingJobs).toMatchObject([
+			{ analysisId: "analysis-a", jobId: jobA, status: "pending" },
+			{ analysisId: "analysis-b", jobId: jobB, status: "pending" },
+		]);
+		expect(uploadedB.map((outcome) => outcome.status)).toEqual(["uploaded"]);
+		expect(await loadFailedUploads()).toMatchObject([
+			{ analysisId: "analysis-a", jobId: jobA, sessionId, status: "pending" },
+		]);
+		expect(await loadFailedUploads()).toHaveLength(1);
 	});
 
 	test("a completed job naming another session is not cleared", async () => {
