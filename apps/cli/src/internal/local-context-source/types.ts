@@ -53,8 +53,8 @@ export interface LocalContextCollectionLimits {
 	readonly maxInstructionContentBytesPerFile: number;
 	readonly maxInstructionContentBytes: number;
 	readonly maxDiffContentBytes: number;
-	// User context (skill definitions and auto-memory) and saved tool outputs
-	// have pools of their own as well.
+	// User context (skill definitions, auto-memory, user commands, agents and
+	// output styles) and saved tool outputs have pools of their own as well.
 	readonly maxUserContextFiles: number;
 	readonly maxUserContextContentBytesPerFile: number;
 	readonly maxUserContextContentBytes: number;

@@ -10,6 +10,8 @@ import {
 import {
 	CLAUDE_PROJECT_MEMORY_ROOT_ID,
 	CLAUDE_TOOL_RESULTS_ROOT_ID,
+	CLAUDE_USER_EXTENSION_DIRECTORIES,
+	CLAUDE_USER_HOME_ROOT_ID,
 } from "../internal/local-context-source/capture-policy.js";
 import type {
 	AdditionalContextRoot,
@@ -181,14 +183,15 @@ export async function resolveUserContextRoots(input: {
 		...skillRoots,
 		{
 			absolutePath: claudeDirectory,
-			id: "claude-user-home",
-			label: "Claude Code user instructions and settings",
+			id: CLAUDE_USER_HOME_ROOT_ID,
+			label: "Claude Code user instructions, settings, commands and agents",
 			origin: "user",
 			scope: "agent-config",
 			include: uniqueIncludes([
 				instruction("CLAUDE.md"),
 				...claudeHomeIncludes,
 				metadata("settings.json"),
+				...CLAUDE_USER_EXTENSION_DIRECTORIES.map(tree),
 			]),
 		},
 		{
@@ -551,6 +554,10 @@ function instruction(path: string): ContextRootInclude {
 
 function metadata(path: string): ContextRootInclude {
 	return { path, role: "metadata" };
+}
+
+function tree(path: string): ContextRootInclude {
+	return { path, role: "tree" };
 }
 
 function uniqueIncludes(

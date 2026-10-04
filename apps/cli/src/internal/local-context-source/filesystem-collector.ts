@@ -402,9 +402,9 @@ export async function collectFileSystemContext(
 			}
 		}
 	}
-	// Then the user-context pool in rank order (memory, observed skills, every
-	// other skill), then the session's saved tool outputs, each from its own
-	// budget.
+	// Then the user-context pool in rank order (memory, user commands,
+	// agents and output styles, observed skills, every other skill), then the
+	// session's saved tool outputs, each from its own budget.
 	if (poolStores["user-context"] !== null) {
 		const ranked = files.flatMap((file) => {
 			if (processed.has(getFileKey(file.entry))) return [];

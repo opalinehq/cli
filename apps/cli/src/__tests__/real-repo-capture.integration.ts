@@ -208,7 +208,7 @@ describe("real repository sidecar capture", () => {
 				).toBe(true);
 				// Every captured file outside the repository (user and parent
 				// instructions and their imports, every skill definition, the
-				// project's auto-memory),
+				// project's auto-memory, user commands, agents and output styles),
 				// and every repository skill definition and personal instruction
 				// file, is stored byte for byte as on disk after the secret filter.
 				const userFiles: string[] = [];
@@ -248,13 +248,15 @@ describe("real repository sidecar capture", () => {
 						`${entry.rootId}:${entry.path} (${onDisk.byteLength} B, sha256 ${redacted ? "match after secret filter" : "match"})`,
 					);
 				}
-				// Every skill definition (observed or not) and memory file has its
-				// content.
+				// Every skill definition (observed or not), memory file and user
+				// command, agent and output style has its content.
 				const contextFiles = localContext.entries.filter(
 					(entry) =>
 						entry.kind === "file" &&
 						(entry.categories?.includes("skill-definition") ||
-							entry.rootId === "claude-project-memory"),
+							entry.rootId === "claude-project-memory" ||
+							(entry.rootId === "claude-user-home" &&
+								/^(?:commands|agents|output-styles)\//u.test(entry.path))),
 				);
 				expect(
 					contextFiles
@@ -270,6 +272,9 @@ describe("real repository sidecar capture", () => {
 					),
 					memoryFiles: countContext(
 						(entry) => entry.rootId === "claude-project-memory",
+					),
+					userCommandsAgentsStyles: countContext(
+						(entry) => entry.rootId === "claude-user-home",
 					),
 					personalInstructions: localContext.entries.filter(
 						(entry) =>

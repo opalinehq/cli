@@ -178,6 +178,10 @@ describe("user-level context roots", () => {
 			"work/CLAUDE.md": "Work instructions, see @shared.md\n",
 			"work/shared.md": "Shared guidance\n",
 			"work/team/CLAUDE.local.md": "Personal parent instructions\n",
+			".claude/commands/ship.md": "Ship command\n",
+			".claude/commands/team/review.md": "Team review command\n",
+			".claude/agents/reviewer.md": "Reviewer agent\n",
+			".claude/output-styles/terse.md": "Terse output style\n",
 			".claude/projects/elsewhere/memory/MEMORY.md": "Other project memory\n",
 			"outside-import.md": "Imported from home\n",
 			"codex/AGENTS.md": "Codex user instructions\n",
@@ -272,6 +276,14 @@ describe("user-level context roots", () => {
 		expect(read("home-instructions", "work/team/CLAUDE.local.md")).toBe(
 			"Personal parent instructions\n",
 		);
+		// User-level commands, agents and output styles, in full.
+		for (const path of [
+			"commands/ship.md",
+			"commands/team/review.md",
+			"agents/reviewer.md",
+			"output-styles/terse.md",
+		])
+			expect(read("claude-user-home", path)).toBe(files[`.claude/${path}`]);
 		for (const [rootId, path] of [
 			["claude-user-home", "settings.json"],
 			["codex-user-home", "config.toml"],
