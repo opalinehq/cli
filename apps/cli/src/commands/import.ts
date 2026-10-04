@@ -490,16 +490,36 @@ async function runUpload(
 	if (resolvedFlags.retry) {
 		return runRetryUpload(resolvedFlags, allowPlaintextEndpoint, credentials);
 	}
-	const session = sessions[0];
-	if (!session)
+	const [first] = sessions;
+	if (first === undefined)
 		return new Error(
 			"Use `opaline upload` to select repositories, or pass a session file or --retry.",
 		);
-	return runSingleUpload(
-		resolvedFlags,
-		session,
-		allowPlaintextEndpoint,
-		credentials,
+	if (sessions.length === 1)
+		return runSingleUpload(
+			resolvedFlags,
+			first,
+			allowPlaintextEndpoint,
+			credentials,
+		);
+	// Every given session is uploaded, in order; one failure does not stop
+	// the others.
+	const failures: Error[] = [];
+	for (const session of sessions) {
+		const error = await runSingleUpload(
+			resolvedFlags,
+			session,
+			allowPlaintextEndpoint,
+			credentials,
+		);
+		if (error === undefined) continue;
+		failures.push(error);
+		process.stderr.write(`Upload of ${session} failed: ${error.message}\n`);
+	}
+	if (failures.length === 0) return undefined;
+	return new AggregateError(
+		failures,
+		`${failures.length} of ${sessions.length} session uploads failed.`,
 	);
 }
 

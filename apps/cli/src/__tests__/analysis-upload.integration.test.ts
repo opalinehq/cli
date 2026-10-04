@@ -396,6 +396,46 @@ describe("opaline import --analysis", () => {
 		expect(api.ingests.map((input) => input.sessionId)).toEqual([chat.child]);
 	});
 
+	test("a plain import uploads every session it is given", async () => {
+		const api = startApiStub();
+		const fixture = await createFixture(api.baseUrl);
+		const chat = await writeConversation(fixture);
+
+		const result = await cli(fixture, [
+			"import",
+			chat.rootPath,
+			chat.childPath,
+			chat.strangerPath,
+		]);
+
+		expect(result.exitCode).toBe(0);
+		expect(api.ingests.map((ingest) => ingest.sessionId)).toEqual([
+			chat.root,
+			chat.child,
+			chat.stranger,
+		]);
+	});
+
+	test("a multi-session import continues past a failure and exits non-zero", async () => {
+		const api = startApiStub();
+		const fixture = await createFixture(api.baseUrl);
+		const chat = await writeConversation(fixture);
+
+		const result = await cli(fixture, [
+			"import",
+			chat.rootPath,
+			join(fixture.home, "missing.jsonl"),
+			chat.childPath,
+		]);
+
+		expect(result.exitCode).not.toBe(0);
+		expect(api.ingests.map((ingest) => ingest.sessionId)).toEqual([
+			chat.root,
+			chat.child,
+		]);
+		expect(result.stderr).toContain("1 of 3 session uploads failed");
+	});
+
 	test("a plain import never sends analysisId", async () => {
 		const api = startApiStub();
 		const fixture = await createFixture(api.baseUrl);
