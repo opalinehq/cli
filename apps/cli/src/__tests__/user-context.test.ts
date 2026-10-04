@@ -286,10 +286,13 @@ describe("user-level context roots", () => {
 			"output-styles/terse.md",
 		])
 			expect(read("claude-user-home", path)).toBe(files[`.claude/${path}`]);
+		// Plugin commands and agents are supporting files, in full.
+		expect(read("claude-plugins", "mkt/plug/1.0.0/commands/review.md")).toBe(
+			"Review command\n",
+		);
 		for (const [rootId, path] of [
 			["claude-user-home", "settings.json"],
 			["codex-user-home", "config.toml"],
-			["claude-plugins", "mkt/plug/1.0.0/commands/review.md"],
 		] as const) {
 			const entry = getFile(bundle, rootId, path);
 			expect(entry.content).toMatchObject({
@@ -794,6 +797,79 @@ describe("user-level context roots", () => {
 			features: { goals: true, js_repl: false },
 			apps: { github: true, slack: false },
 		});
+	});
+
+	test("bounds the supporting files of plugins the session did not use, but not of plugins it used", async () => {
+		const home = await createHome();
+		const repository = join(home, "repo");
+		await mkdir(repository, { recursive: true });
+		execFileSync("git", ["init", "-q"], { cwd: repository });
+		const pluginFiles = (plugin: string) =>
+			Object.fromEntries([
+				[`${plugin}/skills/${plugin}-skill/SKILL.md`, `# ${plugin}\n`],
+				...[0, 1, 2, 3, 4, 5].map((index) => [
+					`${plugin}/commands/command-${index}.md`,
+					`${plugin}${index}${"c".repeat(500 * 1024)}`,
+				]),
+			]);
+		const files = {
+			...pluginFiles("used"),
+			...pluginFiles("idle"),
+		};
+		const cache = join(home, ".claude/plugins/cache/mkt");
+		for (const [path, content] of Object.entries(files)) {
+			const target = join(cache, path.replace(/^(\w+)\//u, "$1/1.0.0/"));
+			await mkdir(dirname(target), { recursive: true });
+			await writeFile(target, content);
+		}
+		await writeFile(
+			join(home, ".claude/plugins/installed_plugins.json"),
+			JSON.stringify({
+				plugins: Object.fromEntries(
+					["used", "idle"].map((plugin) => [
+						`${plugin}@mkt`,
+						[{ scope: "user", installPath: join(cache, plugin, "1.0.0") }],
+					]),
+				),
+			}),
+		);
+		const bundle = await collectWithUserContext(
+			repository,
+			{ home, codexHome: join(home, ".codex") },
+			["used:used-skill"],
+		);
+		const command = (plugin: string, index: number) =>
+			getFile(
+				bundle,
+				"claude-plugins",
+				`mkt/${plugin}/1.0.0/commands/command-${index}.md`,
+			).content;
+		// A plugin the session used is captured in full.
+		for (const index of [0, 1, 2, 3, 4, 5])
+			expect(command("used", index).status).toBe("available");
+		// Another plugin stops at its 2 MiB budget: four 500 KiB commands fit.
+		expect(
+			[0, 1, 2, 3, 4, 5].map((index) => command("idle", index).status),
+		).toEqual([
+			"available",
+			"available",
+			"available",
+			"available",
+			"omitted",
+			"omitted",
+		]);
+		expect(command("idle", 4)).toEqual({
+			status: "omitted",
+			reason: "metadata-only",
+			detail: "plugin-support-budget",
+		});
+		expect(
+			readCaptured(
+				bundle,
+				"claude-plugins",
+				"mkt/idle/1.0.0/skills/idle-skill/SKILL.md",
+			),
+		).toBe("# idle\n");
 	});
 
 	test("CODEX_HOME relocates Codex instructions, skills, plugins and configuration", () => {

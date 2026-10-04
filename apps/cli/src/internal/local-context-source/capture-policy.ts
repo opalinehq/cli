@@ -21,8 +21,25 @@ export const SESSION_DIFF_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
 // project's Claude auto-memory, and user-level Claude commands, agents and
 // output styles. Filled after the instruction pool and never shares its budget.
 export const SESSION_USER_CONTEXT_MAX_FILE_BYTES = 2 * 1024 * 1024;
-export const SESSION_USER_CONTEXT_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
-export const SESSION_USER_CONTEXT_MAX_FILES = 1024;
+export const SESSION_USER_CONTEXT_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
+export const SESSION_USER_CONTEXT_MAX_FILES = 2048;
+// Supporting files (scripts, references, templates next to SKILL.md, plugin
+// commands and agents) are captured up to these per-skill and per-plugin
+// budgets; beyond them they stay hash-only by policy.
+export const SESSION_SKILL_SUPPORT_MAX_BYTES = 1024 * 1024;
+export const SESSION_OBSERVED_SKILL_SUPPORT_MAX_BYTES = 4 * 1024 * 1024;
+export const SESSION_PLUGIN_SUPPORT_MAX_BYTES = 2 * 1024 * 1024;
+// File counts are bounded too, so supporting files cannot crowd skill
+// definitions and instructions out of the 1 MiB manifest.
+export const SESSION_SKILL_SUPPORT_MAX_FILES = 32;
+export const SESSION_OBSERVED_SKILL_SUPPORT_MAX_FILES = 128;
+export const SESSION_PLUGIN_SUPPORT_MAX_FILES = 64;
+// All supporting files together: what the manifest can list next to the
+// instructions, skill definitions and facet resources it keeps first.
+export const SESSION_SUPPORT_MAX_FILES = 512;
+export const SUPPORT_CAP_DETAIL = "support-budget";
+export const SKILL_SUPPORT_CAP_DETAIL = "skill-support-budget";
+export const PLUGIN_SUPPORT_CAP_DETAIL = "plugin-support-budget";
 // Large tool outputs Claude Code saved next to the session transcript.
 export const SESSION_TOOL_RESULT_MAX_FILE_BYTES = 2 * 1024 * 1024;
 export const SESSION_TOOL_RESULT_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
@@ -30,6 +47,8 @@ export const SESSION_TOOL_RESULT_MAX_FILES = 256;
 
 export const CLAUDE_USER_HOME_ROOT_ID = "claude-user-home";
 export const CODEX_USER_HOME_ROOT_ID = "codex-user-home";
+export const CLAUDE_PLUGINS_ROOT_ID = "claude-plugins";
+export const CODEX_PLUGINS_ROOT_ID = "codex-plugins";
 export const CLAUDE_PROJECT_MEMORY_ROOT_ID = "claude-project-memory";
 export const CLAUDE_TOOL_RESULTS_ROOT_ID = "claude-tool-results";
 /** User-level Claude Code directories captured in full from ~/.claude. */
@@ -159,9 +178,9 @@ export function getInstructionRank(
  * Rank in the user-context pool (lower first), or null for content that does
  * not belong to it: the auto-memory index, then memory files, then user-level
  * commands, agents, output styles and Codex rules, then observed skill
- * definitions, then every other skill definition, then the resources of
- * observed skills.
- * Resources of other skills stay hash-only.
+ * definitions, then every other skill definition, then plugin commands and
+ * agents, then the supporting files of observed skills, then those of every
+ * other skill. Supporting files are bounded per skill and per plugin.
  */
 export function getSessionUserContextRank(
 	rootId: string,
@@ -184,8 +203,43 @@ export function getSessionUserContextRank(
 	const observed =
 		skillDirectory !== null && observedSkillNames.has(basename(skillDirectory));
 	if (categories.includes("skill-definition")) return observed ? 3 : 4;
-	if (categories.includes("skill-resource") && observed) return 5;
+	if (isPluginCommandOrAgent(rootId, path)) return 5;
+	if (categories.includes("skill-resource")) return observed ? 6 : 7;
 	return null;
+}
+
+/**
+ * `<marketplace>/<plugin>/<version>` of a file in a plugin cache root (the
+ * layout of both Claude Code's and Codex's plugin caches), else null.
+ */
+export function getPluginDirectory(
+	rootId: string,
+	path: string,
+): string | null {
+	if (rootId !== CLAUDE_PLUGINS_ROOT_ID && rootId !== CODEX_PLUGINS_ROOT_ID)
+		return null;
+	const segments = path.split("/");
+	return segments.length > 3 ? segments.slice(0, 3).join("/") : null;
+}
+
+/** A plugin's command or agent definition. */
+export function isPluginCommandOrAgent(rootId: string, path: string): boolean {
+	const plugin = getPluginDirectory(rootId, path);
+	if (plugin === null) return false;
+	const tree = path.slice(plugin.length + 1).split("/")[0];
+	return tree === "commands" || tree === "agents";
+}
+
+/** A plugin one of whose skills (`plugin:skill`) the session used. */
+export function isObservedPlugin(
+	pluginDirectory: string,
+	observedSkillNames: ReadonlySet<string>,
+): boolean {
+	const name = pluginDirectory.split("/")[1];
+	if (name === undefined) return false;
+	for (const observed of observedSkillNames)
+		if (observed.startsWith(`${name}:`)) return true;
+	return false;
 }
 
 /** Claude Code's saved large tool outputs of the captured session. */
@@ -194,8 +248,10 @@ export function isSessionToolResult(rootId: string): boolean {
 }
 
 /**
- * MCP files, agent settings and skill resources are deliberately hash-only.
- * Omitting them is policy, not a capacity cut. Personal instruction files
+ * MCP package files, agent settings and skill resources outside the
+ * user-context pool are deliberately hash-only (supporting files of skills
+ * are captured there up to their budgets). Omitting them is policy, not a
+ * capacity cut. Personal instruction files
  * (`CLAUDE.local.md`, `*.local.md`) are loaded into the agent's context and
  * captured in full, secret-filtered, like other instructions.
  */

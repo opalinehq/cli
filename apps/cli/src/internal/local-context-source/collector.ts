@@ -3,6 +3,7 @@ import { FILTER_VERSION } from "../secret-filter/index.js";
 import { createBlobStore, getSortedBlobs } from "./blob-store.js";
 import {
 	getSessionContentPriority,
+	isPluginCommandOrAgent,
 	SESSION_CONTEXT_MAX_BLOB_BYTES,
 	SESSION_CONTEXT_MAX_BLOBS,
 	SESSION_CONTEXT_MAX_ENTRIES,
@@ -183,7 +184,7 @@ function boundSessionManifest(
 	const metadataRanks = new Map<ContextEntry, number>();
 	const rootRanks = new Map<string, number>();
 	for (const entry of manifest.entries) {
-		if (getRetentionRank(entry, observedSkills) !== 7) continue;
+		if (getRetentionRank(entry, observedSkills) !== 8) continue;
 		const rank = rootRanks.get(entry.rootId) ?? 0;
 		metadataRanks.set(entry, rank);
 		rootRanks.set(entry.rootId, rank + 1);
@@ -456,20 +457,24 @@ function getRetentionRank(
 	entry: ContextEntry,
 	observedSkills: ReadonlySet<string>,
 ): number {
+	const inFacet = getContextFacetKinds(entry.path, entry).length > 0;
 	if (
 		entry.kind === "file" &&
 		(entry.content.status === "available" || entry.content.status === "reused")
 	)
-		return 0;
-	if (
-		entry.categories.includes("skill-definition") ||
-		getContextFacetKinds(entry.path, entry).length > 0
-	)
-		return 1;
-	if (entry.kind !== "file") return 8;
-	// Remaining files keep their content priority order (-1..4 maps to 2..7).
+		// Supporting files (skill resources, plugin commands and agents) give
+		// way to instructions, skill definitions and every facet resource.
+		return !inFacet &&
+			((entry.categories.includes("skill-resource") &&
+				!entry.categories.includes("skill-definition")) ||
+				isPluginCommandOrAgent(entry.rootId, entry.path))
+			? 2
+			: 0;
+	if (entry.categories.includes("skill-definition") || inFacet) return 1;
+	if (entry.kind !== "file") return 9;
+	// Remaining files keep their content priority order (-1..4 maps to 3..8).
 	return (
-		3 +
+		4 +
 		getSessionContentPriority(
 			entry.rootId,
 			entry.path,

@@ -4,15 +4,28 @@ import type { BlobStore } from "./blob-store.js";
 import { addSanitizedTextBlob } from "./blob-store.js";
 import {
 	getInstructionRank,
+	getPluginDirectory,
 	getSessionContentPriority,
 	getSessionUserContextRank,
 	INSTRUCTION_IMPORT_EVIDENCE_REASON,
 	INSTRUCTION_INCLUDE_EVIDENCE_REASON,
 	isFollowableContextSymlink,
+	isObservedPlugin,
+	isPluginCommandOrAgent,
 	isSessionInstructionContent,
 	isSessionToolResult,
 	METADATA_INCLUDE_EVIDENCE_REASON,
+	PLUGIN_SUPPORT_CAP_DETAIL,
 	SESSION_INSTRUCTION_MAX_IMPORT_DEPTH,
+	SESSION_OBSERVED_SKILL_SUPPORT_MAX_BYTES,
+	SESSION_OBSERVED_SKILL_SUPPORT_MAX_FILES,
+	SESSION_PLUGIN_SUPPORT_MAX_BYTES,
+	SESSION_PLUGIN_SUPPORT_MAX_FILES,
+	SESSION_SKILL_SUPPORT_MAX_BYTES,
+	SESSION_SKILL_SUPPORT_MAX_FILES,
+	SESSION_SUPPORT_MAX_FILES,
+	SKILL_SUPPORT_CAP_DETAIL,
+	SUPPORT_CAP_DETAIL,
 } from "./capture-policy.js";
 import {
 	type GitCollectionResult,
@@ -325,6 +338,7 @@ export async function collectFileSystemContext(
 	const processFile = async (
 		file: PendingFile,
 		pool: ContentPool,
+		policyOmission: string | null = null,
 	): Promise<string | undefined> => {
 		processed.add(getFileKey(file.entry));
 		let text: string | undefined;
@@ -346,6 +360,7 @@ export async function collectFileSystemContext(
 				(captured) => {
 					text = captured;
 				},
+				policyOmission,
 			),
 		);
 		return text;
@@ -434,7 +449,34 @@ export async function collectFileSystemContext(
 					`${right.file.entry.rootId}\0${right.file.entry.path}`,
 				),
 		);
-		for (const { file } of ranked) await processFile(file, "user-context");
+		// Supporting files count against their skill's and (for plugins the
+		// session did not use) their plugin's budget; beyond it they are
+		// hash-only by policy.
+		const supportBytes = new Map<string, number>();
+		const supportFiles = new Map<string, number>();
+		for (const { file } of ranked) {
+			const budgets = getSupportBudgets(file, observedSkills);
+			const exceeded = budgets.find(
+				(budget) =>
+					(supportBytes.get(budget.key) ?? 0) + file.entry.stat.size >
+						budget.maxBytes ||
+					(supportFiles.get(budget.key) ?? 0) >= budget.maxFiles,
+			);
+			const text = await processFile(
+				file,
+				"user-context",
+				exceeded?.detail ?? null,
+			);
+			if (text === undefined) continue;
+			const bytes = Buffer.byteLength(text);
+			for (const budget of budgets) {
+				supportBytes.set(
+					budget.key,
+					(supportBytes.get(budget.key) ?? 0) + bytes,
+				);
+				supportFiles.set(budget.key, (supportFiles.get(budget.key) ?? 0) + 1);
+			}
+		}
 	}
 	if (poolStores["tool-result"] !== null)
 		for (const file of files)
@@ -1088,6 +1130,7 @@ async function buildRegularFileEntry(
 	coverage: MutableRootCoverage,
 	errors: CoverageError[],
 	onText: (text: string) => void,
+	policyOmission: string | null = null,
 ): Promise<ContextRegularFileEntry> {
 	const base = buildEntryBase(root, entry, categories, git);
 	if (isHighRiskContentPath(entry.path)) {
@@ -1141,19 +1184,20 @@ async function buildRegularFileEntry(
 	}
 
 	if (
-		options.capturePolicy === "session-evidence" &&
-		pool === "general" &&
-		(entry.evidenceReason === METADATA_INCLUDE_EVIDENCE_REASON ||
-			// User-level agent settings may hold credentials: only their
-			// instruction files are captured, the rest is hashed (a filtered
-			// summary of hooks, MCP servers and plugins is added separately).
-			root.scope === "agent-config" ||
-			getSessionContentPriority(
-				root.id,
-				entry.path,
-				categories,
-				observedSkills,
-			) >= 4)
+		policyOmission !== null ||
+		(options.capturePolicy === "session-evidence" &&
+			pool === "general" &&
+			(entry.evidenceReason === METADATA_INCLUDE_EVIDENCE_REASON ||
+				// User-level agent settings may hold credentials: only their
+				// instruction files are captured, the rest is hashed (a filtered
+				// summary of hooks, MCP servers and plugins is added separately).
+				root.scope === "agent-config" ||
+				getSessionContentPriority(
+					root.id,
+					entry.path,
+					categories,
+					observedSkills,
+				) >= 4))
 	) {
 		coverage.omittedContentFiles += 1;
 		aggregate.omittedBytes += entry.stat.size;
@@ -1169,7 +1213,11 @@ async function buildRegularFileEntry(
 				options,
 				errors,
 			),
-			content: { status: "omitted", reason: "metadata-only", detail: null },
+			content: {
+				status: "omitted",
+				reason: "metadata-only",
+				detail: policyOmission,
+			},
 		};
 	}
 
@@ -1525,6 +1573,58 @@ async function resolveFollowedSymlink(
 		return null;
 	walk.followedTargets.add(target);
 	return target;
+}
+
+interface SupportBudget {
+	readonly key: string;
+	readonly maxBytes: number;
+	readonly maxFiles: number;
+	readonly detail: string;
+}
+
+/**
+ * Budgets a supporting file counts against: its skill's (larger for skills the
+ * session used) and, inside a plugin the session did not use, its plugin's.
+ */
+function getSupportBudgets(
+	file: PendingFile,
+	observedSkills: ReadonlySet<string>,
+): readonly SupportBudget[] {
+	const { rootId, path } = file.entry;
+	const resource =
+		file.categories.includes("skill-resource") &&
+		!file.categories.includes("skill-definition");
+	if (!resource && !isPluginCommandOrAgent(rootId, path)) return [];
+	const budgets: SupportBudget[] = [
+		{
+			key: "support",
+			maxBytes: Number.POSITIVE_INFINITY,
+			maxFiles: SESSION_SUPPORT_MAX_FILES,
+			detail: SUPPORT_CAP_DETAIL,
+		},
+	];
+	if (resource && file.skillDirectory !== null) {
+		const observed = observedSkills.has(basename(file.skillDirectory));
+		budgets.push({
+			key: `skill\0${rootId}\0${file.skillDirectory}`,
+			maxBytes: observed
+				? SESSION_OBSERVED_SKILL_SUPPORT_MAX_BYTES
+				: SESSION_SKILL_SUPPORT_MAX_BYTES,
+			maxFiles: observed
+				? SESSION_OBSERVED_SKILL_SUPPORT_MAX_FILES
+				: SESSION_SKILL_SUPPORT_MAX_FILES,
+			detail: SKILL_SUPPORT_CAP_DETAIL,
+		});
+	}
+	const plugin = getPluginDirectory(rootId, path);
+	if (plugin !== null && !isObservedPlugin(plugin, observedSkills))
+		budgets.push({
+			key: `plugin\0${rootId}\0${plugin}`,
+			maxBytes: SESSION_PLUGIN_SUPPORT_MAX_BYTES,
+			maxFiles: SESSION_PLUGIN_SUPPORT_MAX_FILES,
+			detail: PLUGIN_SUPPORT_CAP_DETAIL,
+		});
+	return budgets;
 }
 
 function findSkillDirectory(

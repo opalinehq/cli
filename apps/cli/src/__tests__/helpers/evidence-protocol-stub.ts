@@ -56,6 +56,7 @@ export interface CommittedManifest {
 				readonly status: string;
 				readonly blobId?: string;
 				readonly reason?: string;
+				readonly detail?: string | null;
 				readonly secretFilter?: { readonly redactedBytes: number };
 			};
 			readonly hash?: {

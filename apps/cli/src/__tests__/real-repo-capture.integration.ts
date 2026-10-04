@@ -215,6 +215,7 @@ describe("real repository sidecar capture", () => {
 				const fullContent = (entry: (typeof localContext.entries)[number]) =>
 					entry.rootId !== "repository" ||
 					entry.categories?.includes("skill-definition") ||
+					entry.categories?.includes("skill-resource") ||
 					basename(entry.path).toLowerCase().endsWith(".local.md") ||
 					/(?:^|\/)\.claude\/rules\//u.test(entry.path) ||
 					[".mcp.json", "mcp.json", "mcp-config.json"].includes(
@@ -280,6 +281,23 @@ describe("real repository sidecar capture", () => {
 					userCommandsAgentsStyles: countContext(
 						(entry) => entry.rootId === "claude-user-home",
 					),
+					supportingFiles: localContext.entries.filter(
+						(entry) =>
+							entry.kind === "file" &&
+							entry.content?.status === "available" &&
+							((entry.categories?.includes("skill-resource") &&
+								!entry.categories.includes("skill-definition")) ||
+								/^[^/]+\/[^/]+\/[^/]+\/(?:commands|agents)\//u.test(
+									entry.path,
+								)),
+					).length,
+					supportingFilesOverBudget: localContext.entries.filter(
+						(entry) =>
+							entry.kind === "file" &&
+							entry.content?.status === "omitted" &&
+							entry.content.reason === "metadata-only" &&
+							entry.content.detail?.endsWith("-support-budget"),
+					).length,
 					rules: localContext.entries.filter(
 						(entry) =>
 							entry.kind === "file" &&
