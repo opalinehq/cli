@@ -34,6 +34,13 @@ const CliUserSchema = z.object({
 	id: z.string(),
 	email: z.string(),
 	name: z.string(),
+	capabilities: z
+		.object({
+			analysisLinkedUploads: z.literal(true).optional(),
+			/** The server accepts slimmed transcripts (no shrink rejection). */
+			transcriptSlimming: z.literal(true).optional(),
+		})
+		.optional(),
 });
 // Keep UUID-sized batches below common reverse-proxy URI limits.
 export const CLI_SESSION_UPLOAD_STATUS_MAX_IDS = 64;

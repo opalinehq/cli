@@ -1,3 +1,4 @@
+import { stat } from "node:fs/promises";
 import pMap from "p-map";
 import type { Source } from "../contracts/index.js";
 import { MissingTranscriptTimestampError } from "../internal/agent-adapters/index.js";
@@ -9,6 +10,7 @@ import {
 import {
 	type FailedUpload,
 	recordFailedUpload,
+	recordPendingUpload,
 	removeFailedUpload,
 } from "./failed-uploads.js";
 import type { UploadResult } from "./types.js";
@@ -20,6 +22,10 @@ export interface BatchUploadItem {
 	projectPath: string;
 	source?: Source;
 	organizationId?: string;
+	analysisId?: string;
+	analysisDestination?: FailedUpload["analysisDestination"];
+	/** Slimmed upload size from an earlier attempt; orders before raw size. */
+	uploadBytes?: number;
 }
 
 export interface BatchUploadOptions<T extends BatchUploadItem> {
@@ -41,6 +47,8 @@ export interface BatchUploadOptions<T extends BatchUploadItem> {
 
 export interface BatchUploadSummary {
 	succeeded: number;
+	/** Accepted by the server but still processing; reconciled later. */
+	pending: number;
 	failed: number;
 	skipped: number;
 	total: number;
@@ -53,13 +61,16 @@ export interface BatchUploadSummary {
 export async function batchUpload<T extends BatchUploadItem>(
 	options: BatchUploadOptions<T>,
 ): Promise<BatchUploadSummary> {
-	const { items, upload, concurrency = 5, onItemComplete, onRetry } = options;
+	const { upload, concurrency = 5, onItemComplete, onRetry } = options;
+	// Small sessions first: one heavy transcript must not hold back the rest.
+	const items = await orderBySizeAscending(options.items);
 	const recordFailure = async (
 		item: T,
 		failure: {
 			error: string;
-			status: FailedUpload["status"];
+			status: "permanent" | "retryable";
 			failureKind?: FailedUpload["failureKind"];
+			uploadBytes?: number;
 		},
 	) => {
 		await recordFailedUpload({
@@ -68,11 +79,16 @@ export async function batchUpload<T extends BatchUploadItem>(
 			projectPath: item.projectPath,
 			source: item.source,
 			organizationId: item.organizationId,
+			analysisId: item.analysisId,
+			analysisDestination: item.analysisDestination,
 			...failure,
+			// A new measurement replaces the earlier one; otherwise keep it.
+			uploadBytes: failure.uploadBytes ?? item.uploadBytes,
 		});
 	};
 	const total = items.length;
 	let succeeded = 0;
+	let pending = 0;
 	let failed = 0;
 	let skipped = 0;
 	let deferred = 0;
@@ -112,6 +128,20 @@ export async function batchUpload<T extends BatchUploadItem>(
 					redacted = mergeRedactionCounts(redacted, result.redacted ?? {});
 					redactedBytes += result.redactedBytes ?? 0;
 					await removeFailedUpload(item.sessionId);
+				} else if (result.pendingJobId !== undefined) {
+					pending++;
+					await recordPendingUpload({
+						sessionId: item.sessionId,
+						transcriptPath: item.transcriptPath,
+						projectPath: item.projectPath,
+						source: item.source,
+						organizationId: item.organizationId,
+						analysisId: item.analysisId,
+						analysisDestination: item.analysisDestination,
+						error: result.error ?? "Still processing on the server",
+						jobId: result.pendingJobId,
+						uploadBytes: result.uploadBytes ?? item.uploadBytes,
+					});
 				} else if (result.retryable === false) {
 					skipped++;
 					skippedItems.push({
@@ -122,6 +152,7 @@ export async function batchUpload<T extends BatchUploadItem>(
 						error: result.error ?? "Upload cannot be retried",
 						failureKind: result.failureKind,
 						status: "permanent",
+						uploadBytes: result.uploadBytes,
 					});
 				} else {
 					failed++;
@@ -134,6 +165,7 @@ export async function batchUpload<T extends BatchUploadItem>(
 						error,
 						failureKind: result.failureKind,
 						status: "retryable",
+						uploadBytes: result.uploadBytes,
 					});
 				}
 			} catch (err) {
@@ -176,6 +208,7 @@ export async function batchUpload<T extends BatchUploadItem>(
 
 	return {
 		succeeded,
+		pending,
 		failed,
 		skipped,
 		total,
@@ -184,4 +217,35 @@ export async function batchUpload<T extends BatchUploadItem>(
 		redacted,
 		redactedBytes,
 	};
+}
+
+/**
+ * Order uploads smallest first: by the slimmed upload size an earlier attempt
+ * measured, otherwise by the raw main transcript size. Unreadable files keep
+ * their relative order at the end, where their upload reports the real error.
+ */
+export async function orderBySizeAscending<
+	T extends { transcriptPath: string; uploadBytes?: number },
+>(items: readonly T[]): Promise<T[]> {
+	const sized = await pMap(
+		items,
+		async (item, index) => ({
+			index,
+			item,
+			size:
+				item.uploadBytes ??
+				(await stat(item.transcriptPath).then(
+					(stats) => stats.size,
+					() => Number.POSITIVE_INFINITY,
+				)),
+		}),
+		{ concurrency: 16 },
+	);
+	return sized
+		.sort((left, right) =>
+			left.size === right.size
+				? left.index - right.index
+				: left.size - right.size,
+		)
+		.map((entry) => entry.item);
 }

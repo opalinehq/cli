@@ -14,6 +14,25 @@ const SOURCE_CLI_PATH = resolve(import.meta.dir, "..", "..", "bin", "cli.ts");
 
 export const INGEST_STUB_TEST_TOKEN = "endpoint-security-test-token";
 
+/**
+ * Answers `cli.authStatus` for a server that accepts slimmed transcripts, or
+ * undefined for any other path (to compose inside `respond`).
+ */
+export function respondAsSlimmingServer(
+	info: Pick<IngestStubRespondInfo, "pathname">,
+): Response | undefined {
+	return info.pathname === "/rpc/cli/authStatus"
+		? Response.json({
+				json: {
+					id: "user-1",
+					email: "user@example.invalid",
+					name: "User",
+					capabilities: { transcriptSlimming: true },
+				},
+			})
+		: undefined;
+}
+
 export interface IngestStubRequest {
 	readonly apiKey: string | null;
 	readonly pathname: string;
@@ -24,6 +43,8 @@ export interface IngestStubRespondInfo {
 	readonly requestIndex: number;
 	readonly pathname: string;
 	readonly body: string;
+	/** Raw request body, for binary uploads such as evidence object parts. */
+	readonly rawBody: Uint8Array;
 	readonly bodyBytes: number;
 	readonly headers: Headers;
 	readonly hostname: string;
@@ -68,7 +89,8 @@ export function startIngestStub(options: IngestStubOptions = {}): IngestStub {
 		port: 0,
 		async fetch(request) {
 			const url = new URL(request.url);
-			const body = await request.text();
+			const rawBody = new Uint8Array(await request.arrayBuffer());
+			const body = new TextDecoder().decode(rawBody);
 			const requestIndex = requests.length;
 			requests.push({
 				apiKey: request.headers.get("x-api-key"),
@@ -83,6 +105,7 @@ export function startIngestStub(options: IngestStubOptions = {}): IngestStub {
 					requestIndex,
 					pathname: url.pathname,
 					body,
+					rawBody,
 					bodyBytes: Buffer.byteLength(body),
 					headers: request.headers,
 					hostname: url.hostname,

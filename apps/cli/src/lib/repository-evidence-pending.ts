@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
 	chmod,
 	mkdir,
+	open,
 	readdir,
 	readFile,
 	rename,
@@ -12,6 +13,7 @@ import {
 import { join } from "node:path";
 import { RepositoryEvidenceInitInputSchema } from "../contracts/index.js";
 import { FILTER_VERSION } from "../internal/secret-filter/index.js";
+import { type FileLease, tryAcquireFileLease } from "./file-lease.js";
 import {
 	createRepositorySpoolBinding,
 	createRepositorySpoolEnv,
@@ -273,6 +275,248 @@ export async function deferPendingRepositoryEvidence(
 		},
 		configDir,
 	);
+}
+
+/**
+ * Exclusive delivery lease for one pending capture. Only the lease holder
+ * uploads, defers or removes the item, so concurrent hooks, the background
+ * deliverer and `upload --retry` never deliver the same operation at once.
+ */
+export async function acquirePendingRepositoryEvidenceLease(
+	pending: PendingRepositoryEvidence,
+	configDir: string,
+): Promise<FileLease | null> {
+	return tryAcquireFileLease(
+		join(
+			getRepositoryEvidenceLeaseDirectory(configDir),
+			`${shortHash(pending.upload.input.operationId)}.lease`,
+		),
+	);
+}
+
+export function getRepositoryEvidenceLeaseDirectory(configDir: string): string {
+	return join(configDir, "repository-evidence-leases");
+}
+
+/**
+ * Whether an accepted capture makes a pending checkpoint redundant. Completion
+ * time proves nothing (captures can finish out of order), so both must hold:
+ * - the same context snapshot: the same Git commits, and every repository,
+ *   instruction and patch object of the checkpoint is part of the accepted
+ *   capture (a different snapshot stays its own pending item);
+ * - prefix domination: the checkpoint's whole transcript source (or, without
+ *   one, its delivered watermark) is a byte prefix of the accepted capture's
+ *   transcript source.
+ * A source that cannot be read proves nothing, so the checkpoint is kept.
+ */
+export async function isPendingCaptureDominated(
+	accepted: PendingRepositoryEvidence,
+	pending: PendingRepositoryEvidence,
+	configDir: string,
+): Promise<boolean> {
+	const acceptedCapture = accepted.upload.input.capture;
+	const pendingCapture = pending.upload.input.capture;
+	if (
+		acceptedCapture.baseGitCommit !== pendingCapture.baseGitCommit ||
+		acceptedCapture.headGitCommit !== pendingCapture.headGitCommit
+	)
+		return false;
+	const contextObjects = (item: PendingRepositoryEvidence) =>
+		item.upload.input.objects
+			.filter(
+				(object) => object.kind === "source-blob" || object.kind === "git-diff",
+			)
+			.map((object) => object.objectId);
+	const acceptedObjects = new Set(contextObjects(accepted));
+	if (
+		!contextObjects(pending).every((objectId) => acceptedObjects.has(objectId))
+	)
+		return false;
+	if (!accepted.continuation) return false;
+	const acceptedSource = transcriptSourceFile(
+		configDir,
+		accepted.continuation.sourceId,
+	);
+	let pendingPrefix: { readonly bytes: number; readonly sha256: string };
+	if (pending.continuation) {
+		const source = transcriptSourceFile(
+			configDir,
+			pending.continuation.sourceId,
+		);
+		const size = await stat(source).then(
+			(details) => details.size,
+			() => null,
+		);
+		if (size === null) return false;
+		const sha256 = await hashFilePrefix(source, size);
+		if (sha256 === null) return false;
+		pendingPrefix = { bytes: size, sha256 };
+	} else {
+		pendingPrefix = {
+			bytes: pending.transcriptRevision.watermark.byteOffset,
+			sha256: pending.transcriptRevision.watermark.prefixSha256,
+		};
+	}
+	return (
+		(await hashFilePrefix(acceptedSource, pendingPrefix.bytes)) ===
+		pendingPrefix.sha256
+	);
+}
+
+function transcriptSourceFile(configDir: string, sourceId: string): string {
+	return join(configDir, "repository-evidence-sources", `${sourceId}.jsonl`);
+}
+
+/** SHA-256 of the first `bytes` bytes, or null when the file is shorter or unreadable. */
+async function hashFilePrefix(
+	path: string,
+	bytes: number,
+): Promise<string | null> {
+	let handle: Awaited<ReturnType<typeof open>>;
+	try {
+		handle = await open(path, "r");
+	} catch {
+		return null;
+	}
+	try {
+		const hash = createHash("sha256");
+		const window = Buffer.alloc(1024 * 1024);
+		for (let offset = 0; offset < bytes; ) {
+			const { bytesRead } = await handle.read(
+				window,
+				0,
+				Math.min(window.length, bytes - offset),
+				offset,
+			);
+			if (bytesRead === 0) return null;
+			hash.update(window.subarray(0, bytesRead));
+			offset += bytesRead;
+		}
+		return hash.digest("hex");
+	} catch {
+		return null;
+	} finally {
+		await handle.close();
+	}
+}
+
+/**
+ * After a checkpoint or end capture of a session is accepted by the server,
+ * older pending checkpoints it dominates (isPendingCaptureDominated) are
+ * retired with their transcript sources. Pending captures with a different
+ * context snapshot or transcript, start captures and items another process is
+ * delivering right now are kept. Call only with an accepted capture.
+ */
+export async function supersedePendingRepositoryEvidence(
+	accepted: PendingRepositoryEvidence,
+	configDir: string,
+	onWarning: ((warning: Error) => void) | undefined = undefined,
+): Promise<number> {
+	const current = accepted;
+	const currentInput = current.upload.input;
+	if (
+		currentInput.capture.timing.lifecycle !== "checkpoint" &&
+		currentInput.capture.timing.lifecycle !== "end"
+	)
+		return 0;
+	const older = await readPendingRepositoryEvidence(configDir, {
+		actorId: current.transcriptRevision.scope.actorId,
+		endpoint: current.endpoint,
+		sessionId: currentInput.session.sessionId,
+		isEligible: (pending) =>
+			pending.upload.input.operationId !== currentInput.operationId &&
+			pending.upload.input.organizationId === currentInput.organizationId &&
+			pending.upload.input.session.source === currentInput.session.source &&
+			pending.upload.input.capture.timing.lifecycle === "checkpoint",
+		onError: (error) =>
+			onWarning?.(error instanceof Error ? error : new Error(String(error))),
+		onWarning,
+	});
+	let removed = 0;
+	for (const pending of older) {
+		if (!(await isPendingCaptureDominated(current, pending, configDir)))
+			continue;
+		const lease = await acquirePendingRepositoryEvidenceLease(
+			pending,
+			configDir,
+		);
+		if (lease === null) continue;
+		try {
+			await removePendingRepositoryEvidence(pending, configDir);
+			if (pending.continuation)
+				await rm(
+					join(
+						configDir,
+						"repository-evidence-sources",
+						`${pending.continuation.sourceId}.jsonl`,
+					),
+					{ force: true },
+				);
+			await abandonPendingRepositoryCapture(pending, configDir);
+			removed += 1;
+		} finally {
+			await lease.release();
+		}
+	}
+	return removed;
+}
+
+/**
+ * Whether any pending capture of this actor and endpoint is due, judged from
+ * the first bytes of each file (`next_attempt_at` is serialized first), so
+ * hooks can decide to start the background deliverer without parsing
+ * captures that may hold large transcripts.
+ */
+export async function hasDuePendingRepositoryEvidence(
+	configDir: string,
+	actorId: string,
+	endpoint: string,
+	now = Date.now(),
+): Promise<boolean> {
+	const directory = pendingDirectory(configDir);
+	const prefix = pendingFilePrefix(actorId, endpoint);
+	let names: readonly string[];
+	try {
+		names = (await readdir(directory)).filter(
+			(name) => name.endsWith(".json") && name.startsWith(prefix),
+		);
+	} catch (error) {
+		if (isErrorCode(error, "ENOENT")) return false;
+		throw error;
+	}
+	for (const name of names) {
+		let handle: Awaited<ReturnType<typeof open>>;
+		try {
+			handle = await open(join(directory, name), "r");
+		} catch (error) {
+			if (isErrorCode(error, "ENOENT")) continue;
+			throw error;
+		}
+		try {
+			const header = Buffer.alloc(256);
+			const { bytesRead } = await handle.read(header, 0, header.byteLength, 0);
+			const match = /^\{"next_attempt_at":(\d+)/u.exec(
+				header.subarray(0, bytesRead).toString("utf8"),
+			);
+			if (match?.[1] === undefined || Number(match[1]) <= now) return true;
+		} finally {
+			await handle.close();
+		}
+	}
+	return false;
+}
+
+export async function hasPendingRepositoryEvidence(
+	pending: PendingRepositoryEvidence,
+	configDir: string,
+): Promise<boolean> {
+	try {
+		await stat(join(pendingDirectory(configDir), pendingFileName(pending)));
+		return true;
+	} catch (error) {
+		if (isErrorCode(error, "ENOENT")) return false;
+		throw error;
+	}
 }
 
 export async function removePendingRepositoryEvidence(

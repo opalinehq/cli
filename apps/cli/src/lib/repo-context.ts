@@ -1,6 +1,12 @@
 import { realpath } from "node:fs/promises";
-import { homedir } from "node:os";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import {
+	basename,
+	dirname,
+	isAbsolute,
+	relative,
+	resolve,
+	sep,
+} from "node:path";
 import type { RepositoryEvidenceRemoteHint } from "../contracts/index.js";
 import {
 	SESSION_CONTEXT_MAX_BLOB_BYTES,
@@ -8,6 +14,8 @@ import {
 } from "../internal/local-context-source/capture-policy.js";
 import {
 	type AdditionalContextRoot,
+	type CaptureRuntime,
+	type ContextRootAlias,
 	collectLocalContextBundle,
 	createLocalContextSourceEnv,
 	getDefaultLocalContextCollectionOptions,
@@ -15,6 +23,7 @@ import {
 	getLocalContextBundleExternalObjectIds,
 	type LocalContextBundle,
 	serializeLocalContextBundle,
+	type ToolResultReferences,
 } from "../internal/local-context-source/index.js";
 import { loadCredentials } from "./credentials.js";
 import { exec } from "./exec.js";
@@ -32,11 +41,19 @@ import {
 	writeRepositoryBundle,
 } from "./repo-spool.js";
 import { resolveRepositoryEvidenceLocalIdentity } from "./repository-evidence-identity.js";
+import {
+	canonicalizeUserContextLocations,
+	getUserContextLocations,
+	readUserAgentSources,
+	resolveClaudeProjectMemoryDirectory,
+	resolveUserContextRoots,
+	summarizeUserAgentSources,
+} from "./user-context.js";
 
 const MAX_ADDITIONAL_CONTEXT_ROOTS = 16;
 const CONTEXT_ROOT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 
-interface RepositoryConfigBoundary {
+export interface RepositoryConfigBoundary {
 	readonly canonicalRepositoryRoot: string;
 	readonly canonicalConfigDir: string;
 	readonly excludedPathPrefix: string | null;
@@ -137,6 +154,13 @@ export async function collectSessionRepositoryContext(input: {
 	readonly repositoryPath: string;
 	readonly deadlineAt?: number;
 	readonly observedSkillNames?: readonly string[];
+	/** Claude Code session artifacts: saved large tool outputs. */
+	readonly toolResults?: {
+		readonly directory: string;
+		readonly references: ToolResultReferences;
+		readonly transformText: (text: string) => string;
+	};
+	readonly runtime?: CaptureRuntime;
 }): Promise<SessionRepositoryContextCapture> {
 	const resolvedContext = await resolveRepositoryContext(input.repositoryPath);
 	const context: RepositoryContext = {
@@ -158,38 +182,48 @@ export async function collectSessionRepositoryContext(input: {
 		context.spoolEnv,
 	);
 	const defaults = getDefaultLocalContextCollectionOptions();
-	const userHome = homedir();
-	const additionalRoots: readonly AdditionalContextRoot[] = [
-		{
-			absolutePath: joinPath(userHome, ".claude", "skills"),
-			id: "claude-user-skills",
-			label: "Claude user skills",
-			origin: "user",
-			scope: "skills",
-		},
-		{
-			absolutePath: joinPath(userHome, ".codex", "skills"),
-			id: "codex-user-skills",
-			label: "Codex user skills",
-			origin: "user",
-			scope: "skills",
-		},
-		{
-			absolutePath: joinPath(userHome, ".agents", "skills"),
-			id: "agents-user-skills",
-			label: "Shared user skills",
-			origin: "user",
-			scope: "skills",
-		},
+	const locations = await canonicalizeUserContextLocations(
+		getUserContextLocations(),
+	);
+	const mainWorktreeRoot = await resolveMainWorktreeRoot(
+		context.repositoryRoot,
+	);
+	const sessionPath = await resolveCanonicalPath(input.repositoryPath);
+	const projectPaths = [
+		...new Set([context.repositoryRoot, mainWorktreeRoot, sessionPath]),
 	];
-	await assertAdditionalRootsSafe(additionalRoots, configBoundary);
-	const bundle = await collectLocalContextBundle(
+	const userSources = await readUserAgentSources(
+		locations,
+		context.repositoryRoot,
+		projectPaths,
+	);
+	const memoryDirectory = await resolveClaudeProjectMemoryDirectory(
+		locations,
+		[...new Set([mainWorktreeRoot, context.repositoryRoot, sessionPath])],
+		userSources.claudeSettings.value,
+	);
+	const additionalRoots = await resolveUserContextRoots({
+		locations,
+		memoryDirectory,
+		repositoryRoot: context.repositoryRoot,
+		sources: userSources,
+		toolResultsDirectory: input.toolResults?.directory ?? null,
+	});
+	const safeRoots = await resolveSafeAdditionalRoots(
+		additionalRoots,
+		configBoundary,
+	);
+	const collected = await collectLocalContextBundle(
 		context.repositoryRoot,
 		{
 			...defaults,
-			additionalRoots,
+			additionalRoots: safeRoots,
 			capturePolicy: "session-evidence",
 			observedSkillNames: input.observedSkillNames,
+			workingDirectory: await getRepositoryRelativePath(
+				context.repositoryRoot,
+				input.repositoryPath,
+			),
 			excludedPathPrefixes:
 				configBoundary.excludedPathPrefix === null
 					? defaults.excludedPathPrefixes
@@ -208,15 +242,28 @@ export async function collectSessionRepositoryContext(input: {
 				maxHashBytesPerFile: 32 * 1024 * 1024,
 				maxHashBytesPerRoot: 128 * 1024 * 1024,
 				maxTotalContentBytes: SESSION_CONTEXT_MAX_BLOB_BYTES,
-				maxTotalEntries: 30_000,
+				maxTotalEntries: 50_000,
 				maxTotalHashBytes: 256 * 1024 * 1024,
 			},
 			parentCapture,
+			forbiddenSymlinkTargets: [configBoundary.canonicalConfigDir],
+			transformToolResultText: input.toolResults?.transformText,
 		},
 		createLocalContextSourceEnv(input.deadlineAt),
 	);
 	if (input.deadlineAt !== undefined && Date.now() >= input.deadlineAt)
 		throw new Error("Repository context capture exceeded its time budget.");
+	const bundle: LocalContextBundle = {
+		...collected,
+		manifest: {
+			...collected.manifest,
+			userConfiguration: summarizeUserAgentSources(userSources),
+			...(input.toolResults === undefined
+				? {}
+				: { toolResultReferences: input.toolResults.references }),
+			...(input.runtime === undefined ? {} : { runtime: input.runtime }),
+		},
+	};
 	const candidate = createRepositoryBundleCandidate(bundle);
 	const stored = await writeRepositoryBundle(
 		candidate,
@@ -226,6 +273,21 @@ export async function collectSessionRepositoryContext(input: {
 		context.spoolEnv,
 	);
 	return { bundle, candidate, context, stored };
+}
+
+async function getRepositoryRelativePath(
+	repositoryRoot: string,
+	path: string,
+): Promise<string | undefined> {
+	const canonicalPath = await resolveCanonicalPath(path);
+	const relativePath = relative(repositoryRoot, canonicalPath);
+	if (
+		relativePath === ".." ||
+		relativePath.startsWith(`..${sep}`) ||
+		isAbsolute(relativePath)
+	)
+		return undefined;
+	return relativePath.split(sep).join("/");
 }
 
 async function getRepositoryConfigBoundary(
@@ -256,10 +318,23 @@ async function getRepositoryConfigBoundary(
 	};
 }
 
-async function assertAdditionalRootsSafe(
+/**
+ * The additional roots that are safe to collect, without aborting the capture:
+ * - a root resolving to the same directory as an earlier one (for example
+ *   ~/.claude/skills linked to ~/.agents/skills) is merged into it as an
+ *   alias, keeping both labels;
+ * - a root inside another walked root is merged into that root as a nested
+ *   alias (its files are walked there), and a walked root containing earlier
+ *   ones takes them over the same way;
+ * - a root overlapping the repository (which inventories it) or the CLI's
+ *   private configuration directory is dropped.
+ * Include roots (home directories) are never walked; an include path inside
+ * the repository, a walked root or the configuration directory is dropped.
+ */
+export async function resolveSafeAdditionalRoots(
 	additionalRoots: readonly AdditionalContextRoot[],
 	configBoundary: RepositoryConfigBoundary,
-): Promise<void> {
+): Promise<readonly AdditionalContextRoot[]> {
 	if (additionalRoots.length > MAX_ADDITIONAL_CONTEXT_ROOTS) {
 		throw new Error(
 			`At most ${MAX_ADDITIONAL_CONTEXT_ROOTS} additional context roots may be collected at once.`,
@@ -280,44 +355,92 @@ async function assertAdditionalRootsSafe(
 		}
 		rootIds.add(root.id);
 	}
-	const canonicalRootPaths = await Promise.all(
-		additionalRoots.map((root) => resolveCanonicalPath(root.absolutePath)),
-	);
-	const acceptedRoots: Array<{ readonly id: string; readonly path: string }> = [
-		{ id: "repository", path: configBoundary.canonicalRepositoryRoot },
+	const forbidden = [
+		configBoundary.canonicalRepositoryRoot,
+		configBoundary.canonicalConfigDir,
 	];
-	for (const [index, root] of additionalRoots.entries()) {
-		const canonicalRootPath = canonicalRootPaths[index];
-		if (canonicalRootPath === undefined) {
-			throw new Error(
-				`Could not resolve context root ${JSON.stringify(root.id)}.`,
-			);
-		}
-		const overlappingRoot = acceptedRoots.find(
-			(accepted) =>
-				isPathWithin(accepted.path, canonicalRootPath) ||
-				isPathWithin(canonicalRootPath, accepted.path),
-		);
-		if (overlappingRoot?.path === canonicalRootPath) {
-			throw new Error(
-				`Duplicate context root path: ${JSON.stringify(root.absolutePath)}`,
-			);
-		}
-		if (overlappingRoot !== undefined) {
-			throw new Error(
-				`Context root ${JSON.stringify(root.id)} overlaps ${JSON.stringify(overlappingRoot.id)} and would duplicate inventory.`,
-			);
-		}
-		if (
-			isPathWithin(canonicalRootPath, configBoundary.canonicalConfigDir) ||
-			isPathWithin(configBoundary.canonicalConfigDir, canonicalRootPath)
-		) {
-			throw new Error(
-				`Context root ${JSON.stringify(root.id)} overlaps the private CLI configuration directory.`,
-			);
-		}
-		acceptedRoots.push({ id: root.id, path: canonicalRootPath });
+	interface Walked {
+		root: AdditionalContextRoot;
+		readonly canonical: string;
+		aliases: ContextRootAlias[];
 	}
+	const walked: Walked[] = [];
+	const alias = (
+		root: AdditionalContextRoot,
+		relation: ContextRootAlias["relation"],
+	): ContextRootAlias => ({
+		id: root.id,
+		label: root.label,
+		absolutePath: root.absolutePath,
+		relation,
+	});
+	for (const root of additionalRoots) {
+		if (root.include !== undefined) continue;
+		const canonical = await resolveCanonicalPath(root.absolutePath);
+		if (
+			forbidden.some(
+				(path) =>
+					isPathWithin(path, canonical) || isPathWithin(canonical, path),
+			)
+		)
+			continue;
+		const same = walked.find((entry) => entry.canonical === canonical);
+		if (same !== undefined) {
+			same.aliases.push(alias(root, "same-directory"));
+			continue;
+		}
+		const container = walked.find((entry) =>
+			isPathWithin(entry.canonical, canonical),
+		);
+		if (container !== undefined) {
+			container.aliases.push(alias(root, "nested"));
+			continue;
+		}
+		const contained = walked.filter((entry) =>
+			isPathWithin(canonical, entry.canonical),
+		);
+		const aliases: ContextRootAlias[] = contained.flatMap((entry) => [
+			alias(entry.root, "nested"),
+			...entry.aliases,
+		]);
+		for (const entry of contained) walked.splice(walked.indexOf(entry), 1);
+		walked.push({ root, canonical, aliases });
+	}
+	const walkedPaths = walked.map((entry) => entry.canonical);
+	const safe: AdditionalContextRoot[] = [];
+	for (const root of additionalRoots) {
+		if (root.include === undefined) {
+			const entry = walked.find((candidate) => candidate.root === root);
+			if (entry === undefined) continue;
+			safe.push(
+				entry.aliases.length === 0
+					? root
+					: {
+							...root,
+							label: [
+								root.label,
+								...entry.aliases
+									.filter((item) => item.relation === "same-directory")
+									.map((item) => item.label),
+							].join(" + "),
+							aliases: entry.aliases,
+						},
+			);
+			continue;
+		}
+		const canonicalRoot = await resolveCanonicalPath(root.absolutePath);
+		const include = root.include.filter((item) => {
+			const target = resolve(canonicalRoot, item.path);
+			return ![...walkedPaths, ...forbidden].some(
+				(path) =>
+					isPathWithin(path, target) ||
+					(item.role === "tree" && isPathWithin(target, path)),
+			);
+		});
+		if (include.length > 0 || root.include.length === 0)
+			safe.push({ ...root, include });
+	}
+	return safe;
 }
 
 function isMissingPathError(error: unknown): boolean {
@@ -342,8 +465,28 @@ function isPathWithin(parent: string, candidate: string): boolean {
 	);
 }
 
-function joinPath(...segments: readonly string[]): string {
-	return resolve(...segments);
+/**
+ * The main worktree of a linked worktree (Claude Code keeps one auto-memory
+ * per repository, under the main worktree's path), else the repository root.
+ */
+async function resolveMainWorktreeRoot(
+	repositoryRoot: string,
+): Promise<string> {
+	const result = await exec("git", [
+		"-C",
+		repositoryRoot,
+		"rev-parse",
+		"--path-format=absolute",
+		"--git-common-dir",
+	]);
+	const commonDirectory = result.stdout.trim();
+	if (
+		result.exitCode !== 0 ||
+		!isAbsolute(commonDirectory) ||
+		basename(commonDirectory) !== ".git"
+	)
+		return repositoryRoot;
+	return resolveCanonicalPath(dirname(commonDirectory));
 }
 
 async function resolveGitRoot(path: string): Promise<string> {

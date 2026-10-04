@@ -87,6 +87,7 @@ export interface R2IngestCommitInput {
 export interface R2IngestSuccess {
 	readonly success: true;
 	readonly sessionId: string;
+	readonly analysisId?: string;
 	readonly upgradeHint:
 		| { readonly protocol: typeof R2_INGEST_PROTOCOL }
 		| undefined;
@@ -239,7 +240,8 @@ function isR2IngestSuccess(value: unknown): value is R2IngestSuccess {
 		(value.redacted !== undefined && !isRedactionCounts(value.redacted)) ||
 		(value.redactedBytes !== undefined &&
 			!isNonNegativeInteger(value.redactedBytes)) ||
-		(value.usageChecksum !== undefined && !isSha256(value.usageChecksum))
+		(value.usageChecksum !== undefined && !isSha256(value.usageChecksum)) ||
+		(value.analysisId !== undefined && !isNonEmptyString(value.analysisId))
 	) {
 		return false;
 	}

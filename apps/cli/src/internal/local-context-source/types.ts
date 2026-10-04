@@ -17,6 +17,37 @@ export interface AdditionalContextRoot {
 	readonly absolutePath: string;
 	readonly origin: Exclude<ContextRootOrigin, "repository">;
 	readonly scope: Exclude<ContextRootScope, "repository">;
+	/**
+	 * Collect only these root-relative paths instead of walking the whole
+	 * root (home directories hold far more than agent context). Missing paths
+	 * are absent. `instruction` files go to the instruction pool, `metadata`
+	 * files are inventoried and hashed only, `tree` directories are walked.
+	 */
+	readonly include?: readonly ContextRootInclude[];
+	/**
+	 * Directory symlinks of skill and instruction directories are followed
+	 * when their target resolves inside this directory (\$HOME for user roots).
+	 * Without it, symlinks are recorded and not followed.
+	 */
+	readonly followSymlinksWithin?: string;
+	/**
+	 * Other roots that resolve to the same directory (for example
+	 * ~/.claude/skills linked to ~/.agents/skills) or lie inside this one,
+	 * merged into it so the directory is walked once.
+	 */
+	readonly aliases?: readonly ContextRootAlias[];
+}
+
+export interface ContextRootAlias {
+	readonly id: string;
+	readonly label: string;
+	readonly absolutePath: string;
+	readonly relation: "same-directory" | "nested";
+}
+
+export interface ContextRootInclude {
+	readonly path: string;
+	readonly role: "instruction" | "metadata" | "tree";
 }
 
 export interface LocalContextCollectionLimits {
@@ -35,6 +66,20 @@ export interface LocalContextCollectionLimits {
 	readonly gitCommandTimeoutMs: number;
 	readonly maxCommits: number;
 	readonly maxCoverageErrors: number;
+	// Session-evidence pools. Instruction files and patches are budgeted
+	// separately from other content so they are never crowded out.
+	readonly maxInstructionFiles: number;
+	readonly maxInstructionContentBytesPerFile: number;
+	readonly maxInstructionContentBytes: number;
+	readonly maxDiffContentBytes: number;
+	// User context (skill definitions, auto-memory, user commands, agents and
+	// output styles) and saved tool outputs have pools of their own as well.
+	readonly maxUserContextFiles: number;
+	readonly maxUserContextContentBytesPerFile: number;
+	readonly maxUserContextContentBytes: number;
+	readonly maxToolResultFiles: number;
+	readonly maxToolResultContentBytesPerFile: number;
+	readonly maxToolResultContentBytes: number;
 }
 
 export interface LocalContextCollectionOptions {
@@ -44,6 +89,18 @@ export interface LocalContextCollectionOptions {
 	readonly capturePolicy: "delta" | "session-evidence";
 	readonly parentCapture: ParentCaptureReference | null;
 	readonly observedSkillNames?: readonly string[];
+	/**
+	 * Repository-relative working directory of the session. Instruction files
+	 * that apply to it are captured before other nested instruction files.
+	 */
+	readonly workingDirectory?: string;
+	/** Symlink targets never followed into (the CLI's private config directory). */
+	readonly forbiddenSymlinkTargets?: readonly string[];
+	/**
+	 * Applied to saved tool-output text before the secret filter, so it gets
+	 * the same slimming as the transcript that references it.
+	 */
+	readonly transformToolResultText?: (text: string) => string;
 }
 
 export interface ParentCaptureReference {
@@ -246,7 +303,8 @@ export interface ContextSymlinkEntry extends ContextEntryBase {
 	readonly kind: "symlink";
 	readonly target: string;
 	readonly targetScope: "internal" | "external" | "broken" | "unknown";
-	readonly followed: false;
+	/** A followed directory symlink's contents are listed under its path. */
+	readonly followed: boolean;
 }
 
 export interface ContextOtherEntry extends ContextEntryBase {
@@ -286,7 +344,16 @@ export interface CoverageError {
 export interface ExcludedPath {
 	readonly rootId: string;
 	readonly path: string;
-	readonly reason: "vcs" | "dependency" | "generated" | "cache" | "explicit";
+	readonly reason:
+		| "vcs"
+		| "dependency"
+		| "generated"
+		| "cache"
+		| "explicit"
+		// A Git-ignored directory the entry budget did not reach.
+		| "ignored"
+		// A root or included path whose real path leaves its allowed boundary.
+		| "outside-boundary";
 }
 
 export interface RootCoverage {
@@ -312,8 +379,18 @@ export interface ContextRootManifest {
 	readonly absolutePath: string;
 	readonly origin: ContextRootOrigin;
 	readonly scope: ContextRootScope;
-	readonly status: "collected" | "missing" | "inaccessible" | "limit-reached";
+	/**
+	 * `excluded`: the root resolves (through a symlink) outside its allowed
+	 * boundary, so nothing in it was read.
+	 */
+	readonly status:
+		| "collected"
+		| "missing"
+		| "inaccessible"
+		| "limit-reached"
+		| "excluded";
 	readonly coverage: RootCoverage;
+	readonly aliases?: readonly ContextRootAlias[];
 }
 
 export interface ContextDocumentIndex {
@@ -358,6 +435,13 @@ export type ContextIndexResourceAccess =
 				| "file-content-cap"
 				| "root-content-cap"
 				| "total-content-cap";
+			/**
+			 * Present when the content was left out by capture policy (the file
+			 * is hash-only), not cut by a capacity limit. The server accepts no
+			 * access value for this yet, so the wire status and reason stay
+			 * `truncated` / `file-content-cap` for compatibility.
+			 */
+			readonly policy?: "hash-only";
 	  }
 	| {
 			readonly status: "unavailable";
@@ -513,6 +597,7 @@ export interface AggregateCoverage {
 		readonly omittedBlobs: number;
 		readonly omittedEntries: number;
 		readonly omittedMetadata?: number;
+		readonly omittedSkillDefinitions?: number;
 		readonly reason: "capture-limit";
 	};
 	readonly discoveredEntries: number;
@@ -565,12 +650,148 @@ export interface LocalContextManifest {
 	readonly contextIndex: ContextIndex;
 	readonly git: GitSnapshot;
 	readonly coverage: AggregateCoverage;
+	/** Secret-filtered user-level agent configuration (hooks, MCP, plugins). */
+	readonly userConfiguration?: UserAgentConfiguration;
+	/**
+	 * Records of the session transcript that reference a saved tool output in
+	 * the `claude-tool-results` root, so each output stays linked to the
+	 * record (stream and 1-based JSONL line) and tool call that produced it.
+	 */
+	readonly toolResultReferences?: ToolResultReferences;
+	/** Tool and agent versions on the capturing machine. */
+	readonly runtime?: CaptureRuntime;
 	readonly transport: {
 		readonly secretFilterApplied: true;
 		readonly secretFilterVersion: number;
 		readonly requiresAdditionalReview: true;
 		readonly rawContentIncluded: false;
 	};
+}
+
+export interface UserAgentHook {
+	readonly event: string;
+	readonly matcher: string | null;
+	readonly type: string | null;
+	readonly command: string | null;
+	readonly timeoutSeconds: number | null;
+	readonly async: boolean | null;
+}
+
+export interface UserAgentMcpServer {
+	readonly name: string;
+	readonly transport: "stdio" | "http" | "unknown";
+	readonly command: string | null;
+	readonly args: readonly string[];
+	readonly url: string | null;
+	readonly enabled: boolean | null;
+	readonly envKeys: readonly string[];
+	readonly headerKeys: readonly string[];
+	readonly bearerTokenEnvVar: string | null;
+}
+
+export interface UserAgentConfigurationSource {
+	readonly path: string;
+	readonly status: "parsed" | "absent" | "unreadable";
+}
+
+/** An MCP server and where it is configured. */
+export interface UserAgentScopedMcpServer extends UserAgentMcpServer {
+	readonly scope: "user" | "project" | "managed";
+}
+
+/**
+ * One layer of Claude Code's effective settings, sanitized: `env` keeps only
+ * variable names, values under credential-like keys are replaced, every string
+ * passes the inline-credential and known-secret filters, and lists and depth
+ * are bounded.
+ */
+export interface UserAgentSettingsLayer extends UserAgentConfigurationSource {
+	readonly scope:
+		| "user"
+		| "user-local"
+		| "project"
+		| "project-local"
+		| "managed";
+	readonly settings: unknown;
+}
+
+export interface UserAgentConfiguration {
+	readonly claude: {
+		readonly settings: UserAgentConfigurationSource;
+		readonly hooks: readonly UserAgentHook[];
+		readonly enabledPlugins: Readonly<Record<string, boolean>>;
+		readonly permissions: {
+			readonly defaultMode: string | null;
+			readonly allow: readonly string[];
+			readonly deny: readonly string[];
+			readonly ask: readonly string[];
+			readonly additionalDirectories: readonly string[];
+		};
+		readonly installedPlugins: readonly string[];
+		/** Every settings layer that applies to the session, lowest first. */
+		readonly settingsLayers: readonly UserAgentSettingsLayer[];
+		/**
+		 * MCP servers from ~/.claude.json (only its `mcpServers` sections: the
+		 * global one and the session project's) and managed-mcp.json.
+		 */
+		readonly mcpServers: readonly UserAgentScopedMcpServer[];
+		readonly stateFile: UserAgentConfigurationSource;
+	};
+	readonly codex: {
+		readonly config: UserAgentConfigurationSource;
+		readonly hooksFile: UserAgentConfigurationSource;
+		readonly mcpServers: readonly UserAgentMcpServer[];
+		readonly notify: readonly string[];
+		readonly hooks: readonly UserAgentHook[];
+		readonly plugins: Readonly<Record<string, boolean>>;
+		/** Enablement flags of features, apps, connectors and tools. */
+		readonly features: Readonly<Record<string, boolean>>;
+		readonly apps: Readonly<Record<string, boolean>>;
+		readonly connectors: Readonly<Record<string, boolean>>;
+		readonly tools: Readonly<Record<string, boolean>>;
+		readonly approvalPolicy: string | null;
+		readonly sandboxMode: string | null;
+	};
+	readonly truncated: boolean;
+}
+
+export interface ToolResultReference {
+	/** Path relative to the `claude-tool-results` root. */
+	readonly path: string;
+	/** Subagent stream, or null for the main transcript. */
+	readonly agentId: string | null;
+	/** 1-based JSONL line of the referencing record in its stream. */
+	readonly recordIndex: number;
+	readonly toolUseId: string | null;
+}
+
+export interface ToolResultReferences {
+	readonly references: readonly ToolResultReference[];
+	/** References beyond the manifest's bound that were not listed. */
+	readonly omitted: number;
+}
+
+export interface CaptureRuntime {
+	readonly os: {
+		readonly platform: string;
+		readonly release: string;
+		readonly arch: string;
+	};
+	/** The JavaScript runtime executing the CLI. */
+	readonly cli: { readonly runtime: "node" | "bun"; readonly version: string };
+	/** Versions of tools on PATH; null when absent or slower than the timeout. */
+	readonly tools: {
+		readonly node: string | null;
+		readonly bun: string | null;
+		readonly git: string | null;
+		readonly python: string | null;
+	};
+	/** The agent that wrote the transcript, from the transcript itself. */
+	readonly agentHost: {
+		readonly name: "claude-code" | "codex";
+		readonly version: string | null;
+		readonly originator: string | null;
+	} | null;
 }
 
 export interface LocalContextBundle {

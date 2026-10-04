@@ -1,0 +1,1115 @@
+import { afterAll, describe, expect, test } from "bun:test";
+import { strict as assert } from "node:assert";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+	mkdir,
+	mkdtemp,
+	realpath,
+	rm,
+	symlink,
+	utimes,
+	writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { summarizeUserAgentConfiguration } from "../internal/local-context-source/agent-configuration.js";
+import {
+	collectLocalContextBundle,
+	createLocalContextSourceEnv,
+	getDefaultLocalContextCollectionOptions,
+	type LocalContextBundle,
+} from "../internal/local-context-source/index.js";
+import {
+	getClaudeProjectKey,
+	getManagedClaudeDirectory,
+	getUserContextLocations,
+	readUserAgentSources,
+	resolveClaudeProjectMemoryDirectory,
+	resolveUserContextRoots,
+	summarizeUserAgentSources,
+	type UserContextLocations,
+} from "../lib/user-context.js";
+
+const directories: string[] = [];
+
+afterAll(async () => {
+	await Promise.all(
+		directories.map((directory) =>
+			rm(directory, { force: true, recursive: true }),
+		),
+	);
+});
+
+const SECRETS = {
+	bearer: "sk-live-header-0123456789abcdefghij",
+	env: "env-secret-value-0123456789",
+	argument: "argument-secret-0123456789",
+	url: "url-secret-0123456789",
+	hook: "hookbearer0123456789abcdef",
+	settingsEnv: "settings-env-secret-0123456789",
+	github: `ghp_${"A".repeat(36)}`,
+};
+
+describe("user agent configuration summary", () => {
+	test("keeps hooks, MCP servers and plugins and never keeps a credential", () => {
+		const summary = summarizeUserAgentConfiguration({
+			claudeSettings: {
+				path: "~/.claude/settings.json",
+				status: "parsed",
+				value: {
+					env: { API_TOKEN: SECRETS.settingsEnv },
+					enabledPlugins: { "atlas@atlas": true, "old@market": false },
+					permissions: { allow: ["Bash(git status)"], defaultMode: "plan" },
+					hooks: {
+						Stop: [
+							{
+								matcher: "",
+								hooks: [
+									{
+										type: "command",
+										command: `curl -H "Authorization: Bearer ${SECRETS.hook}" https://hooks.example`,
+										timeout: 30,
+									},
+								],
+							},
+						],
+					},
+				},
+			},
+			claudeInstalledPlugins: ["atlas@atlas"],
+			codexConfig: {
+				path: "$CODEX_HOME/config.toml",
+				status: "parsed",
+				value: {
+					notify: ["/usr/bin/notify", `--token=${SECRETS.github}`],
+					plugins: { "opaline@opaline": { enabled: true } },
+					mcp_servers: {
+						remote: {
+							url: `https://user:${SECRETS.url}@mcp.example/sse?key=${SECRETS.url}`,
+							http_headers: { Authorization: `Bearer ${SECRETS.bearer}` },
+						},
+						local: {
+							command: "node",
+							args: [
+								"server.js",
+								"--api-key",
+								SECRETS.argument,
+								"--port",
+								"3000",
+							],
+							env: { SECRET: SECRETS.env },
+						},
+					},
+				},
+			},
+			codexHooks: {
+				path: "$CODEX_HOME/hooks.json",
+				status: "parsed",
+				value: {
+					hooks: {
+						session_start: [
+							{ hooks: [{ type: "command", command: "opaline hooks codex" }] },
+						],
+					},
+				},
+			},
+		});
+		const serialized = JSON.stringify(summary);
+		for (const secret of Object.values(SECRETS))
+			expect(serialized).not.toContain(secret);
+		expect(summary.codex.mcpServers).toEqual([
+			{
+				name: "remote",
+				transport: "http",
+				command: null,
+				args: [],
+				url: "https://mcp.example/sse",
+				enabled: null,
+				envKeys: [],
+				headerKeys: ["Authorization"],
+				bearerTokenEnvVar: null,
+			},
+			{
+				name: "local",
+				transport: "stdio",
+				command: "node",
+				args: ["server.js", "--api-key", "[REDACTED]", "--port", "3000"],
+				url: null,
+				enabled: null,
+				envKeys: ["SECRET"],
+				headerKeys: [],
+				bearerTokenEnvVar: null,
+			},
+		]);
+		expect(summary.claude.hooks).toEqual([
+			{
+				event: "Stop",
+				matcher: "",
+				type: "command",
+				command:
+					'curl -H "Authorization: Bearer [REDACTED]" https://hooks.example',
+				timeoutSeconds: 30,
+				async: null,
+			},
+		]);
+		expect(summary.claude.enabledPlugins).toEqual({
+			"atlas@atlas": true,
+			"old@market": false,
+		});
+		expect(summary.codex.plugins).toEqual({ "opaline@opaline": true });
+		expect(summary.codex.hooks.map((hook) => hook.event)).toEqual([
+			"session_start",
+		]);
+		expect(summary.claude.permissions.allow).toEqual(["Bash(git status)"]);
+	});
+});
+
+describe("user-level context roots", () => {
+	test("captures user and parent instructions with their imports, plugins and settings, with exact bytes", async () => {
+		const home = await createHome();
+		const files = {
+			".claude/CLAUDE.md":
+				"# User\nUse @rules.md and @~/notes/style.md.\n`@ignored.md`\n",
+			".claude/rules.md": "User rules\n",
+			".claude/settings.json": JSON.stringify({
+				env: { TOKEN: SECRETS.settingsEnv },
+				hooks: { Stop: [{ hooks: [{ type: "command", command: "x" }] }] },
+			}),
+			"notes/style.md": "Style notes\n",
+			"work/CLAUDE.md": "Work instructions, see @shared.md\n",
+			"work/shared.md": "Shared guidance\n",
+			"work/team/CLAUDE.local.md": "Personal parent instructions\n",
+			".claude/commands/ship.md": "Ship command\n",
+			".claude/commands/team/review.md": "Team review command\n",
+			".claude/agents/reviewer.md": "Reviewer agent\n",
+			".claude/output-styles/terse.md": "Terse output style\n",
+			".claude/projects/elsewhere/memory/MEMORY.md": "Other project memory\n",
+			"outside-import.md": "Imported from home\n",
+			"codex/AGENTS.md": "Codex user instructions\n",
+			"codex/AGENTS.override.md": "Codex override\n",
+			"codex/config.toml": [
+				'notify = ["notify"]',
+				'[plugins."plug@mkt"]',
+				"enabled = true",
+				"[mcp_servers.remote]",
+				'url = "https://mcp.example"',
+				`http_headers = { Authorization = "Bearer ${SECRETS.bearer}" }`,
+				"",
+			].join("\n"),
+			"codex/plugins/cache/mkt/plug/v1/skills/old/SKILL.md": "Old version\n",
+			"codex/plugins/cache/mkt/plug/v2/skills/codex-skill/SKILL.md":
+				"Codex plugin skill\n",
+			"codex/plugins/cache/mkt/plug/v2/.codex-plugin/plugin.json": "{}",
+			".claude/plugins/installed_plugins.json": JSON.stringify({
+				version: 2,
+				plugins: {
+					"plug@mkt": [
+						{
+							scope: "user",
+							installPath: join(home, ".claude/plugins/cache/mkt/plug/1.0.0"),
+						},
+					],
+					"other@mkt": [
+						{
+							scope: "project",
+							projectPath: join(home, "elsewhere"),
+							installPath: join(home, ".claude/plugins/cache/mkt/other/1.0.0"),
+						},
+					],
+				},
+			}),
+			".claude/plugins/cache/mkt/plug/1.0.0/skills/observed/SKILL.md":
+				"Observed plugin skill\n",
+			".claude/plugins/cache/mkt/plug/1.0.0/skills/unused/SKILL.md":
+				"Unused plugin skill\n",
+			".claude/plugins/cache/mkt/plug/1.0.0/commands/review.md":
+				"Review command\n",
+			".claude/plugins/cache/mkt/plug/1.0.0/.claude-plugin/plugin.json": "{}",
+			".claude/plugins/cache/mkt/other/1.0.0/skills/other/SKILL.md":
+				"Other project's plugin\n",
+			"work/team/repo/AGENTS.md": "Repository instructions\n",
+		};
+		for (const [path, content] of Object.entries(files)) {
+			await mkdir(dirname(join(home, path)), { recursive: true });
+			await writeFile(join(home, path), content);
+		}
+		const old = new Date(Date.now() - 60_000);
+		await utimes(join(home, "codex/plugins/cache/mkt/plug/v1"), old, old);
+		const repository = join(home, "work/team/repo");
+		execFileSync("git", ["init", "-q"], { cwd: repository });
+		const locations: UserContextLocations = {
+			home,
+			codexHome: join(home, "codex"),
+		};
+		const bundle = await collectWithUserContext(repository, locations, [
+			"plug:observed",
+		]);
+		const read = (rootId: string, path: string) =>
+			readCaptured(bundle, rootId, path);
+		expect(read("claude-user-home", "CLAUDE.md")).toBe(
+			files[".claude/CLAUDE.md"],
+		);
+		expect(read("claude-user-home", "rules.md")).toBe("User rules\n");
+		expect(read("home-instructions", "notes/style.md")).toBe("Style notes\n");
+		expect(read("home-instructions", "work/CLAUDE.md")).toBe(
+			files["work/CLAUDE.md"],
+		);
+		expect(read("home-instructions", "work/shared.md")).toBe(
+			"Shared guidance\n",
+		);
+		expect(read("codex-user-home", "AGENTS.md")).toBe(
+			"Codex user instructions\n",
+		);
+		expect(read("codex-user-home", "AGENTS.override.md")).toBe(
+			"Codex override\n",
+		);
+		expect(
+			read("claude-plugins", "mkt/plug/1.0.0/skills/observed/SKILL.md"),
+		).toBe("Observed plugin skill\n");
+		// Every available skill definition, observed or not, in full.
+		expect(
+			read("claude-plugins", "mkt/plug/1.0.0/skills/unused/SKILL.md"),
+		).toBe("Unused plugin skill\n");
+		expect(
+			read("codex-plugins", "mkt/plug/v2/skills/codex-skill/SKILL.md"),
+		).toBe("Codex plugin skill\n");
+		// Personal instructions above the repository are loaded by Claude Code.
+		expect(read("home-instructions", "work/team/CLAUDE.local.md")).toBe(
+			"Personal parent instructions\n",
+		);
+		// User-level commands, agents and output styles, in full.
+		for (const path of [
+			"commands/ship.md",
+			"commands/team/review.md",
+			"agents/reviewer.md",
+			"output-styles/terse.md",
+		])
+			expect(read("claude-user-home", path)).toBe(files[`.claude/${path}`]);
+		// Plugin commands and agents are supporting files, in full.
+		expect(read("claude-plugins", "mkt/plug/1.0.0/commands/review.md")).toBe(
+			"Review command\n",
+		);
+		for (const [rootId, path] of [
+			["claude-user-home", "settings.json"],
+			["codex-user-home", "config.toml"],
+		] as const) {
+			const entry = getFile(bundle, rootId, path);
+			expect(entry.content).toMatchObject({
+				status: "omitted",
+				reason: "metadata-only",
+			});
+			expect(entry.hash).toMatchObject({
+				status: "available",
+				scope: "source",
+			});
+		}
+		const paths = bundle.manifest.entries.map(
+			(entry) => `${entry.rootId}:${entry.path}`,
+		);
+		expect(paths).not.toContain(
+			"claude-plugins:mkt/other/1.0.0/skills/other/SKILL.md",
+		);
+		expect(paths.some((path) => path.includes("mkt/plug/v1"))).toBe(false);
+		expect(paths).toContain(
+			"codex-plugins:mkt/plug/v2/skills/codex-skill/SKILL.md",
+		);
+		expect(paths).not.toContain("claude-user-home:ignored.md");
+		// Other projects' memory and session data are never read.
+		expect(paths.some((path) => path.includes("projects/"))).toBe(false);
+		expect(
+			bundle.manifest.contextIndex.skills.map((skill) => skill.name),
+		).toEqual(["codex-skill", "observed", "unused"]);
+		for (const blob of bundle.blobs) {
+			for (const secret of Object.values(SECRETS))
+				expect(blob.content).not.toContain(secret);
+		}
+		for (const facet of bundle.manifest.contextIndex.facets)
+			expect(facet.coverage).toBe("complete");
+		const facet = (rootId: string, kind: string) =>
+			bundle.manifest.contextIndex.facets.find(
+				(candidate) => candidate.rootId === rootId && candidate.kind === kind,
+			)?.presence;
+		expect(facet("claude-user-home", "claude-instructions")).toBe("present");
+		expect(facet("claude-user-home", "hooks")).toBe("present");
+		expect(facet("codex-user-home", "agents-instructions")).toBe("present");
+		expect(facet("codex-user-home", "mcp")).toBe("present");
+		expect(facet("home-instructions", "claude-instructions")).toBe("present");
+		const summary = JSON.stringify(
+			summarizeUserAgentSources(
+				await readUserAgentSources(locations, repository),
+			),
+		);
+		for (const secret of Object.values(SECRETS))
+			expect(summary).not.toContain(secret);
+		expect(summary).toContain('"plug@mkt"');
+	});
+
+	test("a home without agent configuration records every user root as absent", async () => {
+		const home = await createHome();
+		const repository = join(home, "repo");
+		await mkdir(repository, { recursive: true });
+		await writeFile(join(repository, "AGENTS.md"), "Instructions\n");
+		execFileSync("git", ["init", "-q"], { cwd: repository });
+		const bundle = await collectWithUserContext(
+			repository,
+			{ home, codexHome: join(home, ".codex") },
+			[],
+		);
+		expect(
+			bundle.manifest.roots
+				.filter((root) => root.id !== "repository")
+				.map((root) => [root.id, root.status]),
+		).toEqual(
+			expect.arrayContaining([
+				["claude-user-home", "missing"],
+				["codex-user-home", "missing"],
+				["claude-plugins", "missing"],
+				["codex-plugins", "missing"],
+				["home-instructions", "collected"],
+			]),
+		);
+		for (const facet of bundle.manifest.contextIndex.facets.filter(
+			(candidate) => candidate.rootId !== "repository",
+		)) {
+			expect(facet.coverage).toBe("complete");
+			expect(facet.presence).toBe("absent");
+		}
+		expect(bundle.manifest.coverage.errors).toEqual([]);
+	});
+
+	test("a repository at $HOME keeps its own inventory and skips overlapping user roots", async () => {
+		const home = await createHome();
+		await mkdir(join(home, ".claude/skills/demo"), { recursive: true });
+		await writeFile(join(home, ".claude/CLAUDE.md"), "User instructions\n");
+		await writeFile(join(home, ".claude/skills/demo/SKILL.md"), "Skill\n");
+		execFileSync("git", ["init", "-q"], { cwd: home });
+		const bundle = await collectWithUserContext(
+			home,
+			{ home, codexHome: join(home, ".codex") },
+			[],
+		);
+		const rootIds = bundle.manifest.roots.map((root) => root.id);
+		expect(rootIds).not.toContain("claude-user-skills");
+		expect(rootIds).not.toContain("claude-user-home");
+		expect(readCaptured(bundle, "repository", ".claude/CLAUDE.md")).toBe(
+			"User instructions\n",
+		);
+	});
+
+	test("captures the session project's Claude auto-memory in full, index first, secret-filtered", async () => {
+		const home = await createHome();
+		const repository = join(home, "repo");
+		await mkdir(repository, { recursive: true });
+		await writeFile(join(repository, "AGENTS.md"), "Instructions\n");
+		execFileSync("git", ["init", "-q"], { cwd: repository });
+		const memory = join(
+			home,
+			".claude/projects",
+			getClaudeProjectKey(repository),
+			"memory",
+		);
+		const secret = `ghp_${"B".repeat(36)}`;
+		const files = {
+			"MEMORY.md": "# Memory Index\n- [Style](style.md) — house style\n",
+			"style.md": `${"Prefer named exports.\n".repeat(20)}Token ${secret}\n`,
+			"nested/topic.md": "Nested memory topic\n",
+		};
+		for (const [path, content] of Object.entries(files)) {
+			await mkdir(dirname(join(memory, path)), { recursive: true });
+			await writeFile(join(memory, path), content);
+		}
+		const locations = { home, codexHome: join(home, ".codex") };
+		const memoryDirectory = await resolveClaudeProjectMemoryDirectory(
+			locations,
+			[await realpath(repository)],
+			undefined,
+		);
+		expect(memoryDirectory).toBe(memory);
+		const bundle = await collectWithUserContext(
+			repository,
+			locations,
+			[],
+			memoryDirectory,
+		);
+		expect(readCaptured(bundle, "claude-project-memory", "MEMORY.md")).toBe(
+			files["MEMORY.md"],
+		);
+		expect(
+			readCaptured(bundle, "claude-project-memory", "nested/topic.md"),
+		).toBe(files["nested/topic.md"]);
+		const style = readCaptured(bundle, "claude-project-memory", "style.md");
+		expect(style).not.toContain(secret);
+		expect(style).toContain("Prefer named exports.");
+		const root = bundle.manifest.roots.find(
+			(candidate) => candidate.id === "claude-project-memory",
+		);
+		expect(root).toMatchObject({ origin: "user", status: "collected" });
+		for (const facet of bundle.manifest.contextIndex.facets)
+			expect(facet.coverage).toBe("complete");
+	});
+
+	test("finds auto-memory under the main worktree, then the repository, and honours autoMemoryDirectory", async () => {
+		const home = await createHome();
+		const main = join(home, "code", "main");
+		await mkdir(main, { recursive: true });
+		await writeFile(join(main, "README.md"), "main\n");
+		execFileSync("git", ["init", "-q"], { cwd: main });
+		execFileSync("git", ["add", "."], { cwd: main });
+		execFileSync(
+			"git",
+			[
+				"-c",
+				"user.name=Fixture",
+				"-c",
+				"user.email=fixture@example.com",
+				"commit",
+				"-qm",
+				"Fixture",
+			],
+			{ cwd: main },
+		);
+		const worktree = join(home, "work", "feature");
+		execFileSync("git", ["worktree", "add", "-q", worktree], { cwd: main });
+		const locations = { home, codexHome: join(home, ".codex") };
+		const projects = join(home, ".claude/projects");
+		const roots = [await realpath(main), await realpath(worktree)];
+		// Nothing exists yet: the main worktree's directory is reported (absent).
+		expect(
+			await resolveClaudeProjectMemoryDirectory(locations, roots, undefined),
+		).toBe(join(projects, getClaudeProjectKey(roots[0] ?? ""), "memory"));
+		// Only the worktree has memory: it is used.
+		const worktreeMemory = join(
+			projects,
+			getClaudeProjectKey(roots[1] ?? ""),
+			"memory",
+		);
+		await mkdir(worktreeMemory, { recursive: true });
+		expect(
+			await resolveClaudeProjectMemoryDirectory(locations, roots, undefined),
+		).toBe(worktreeMemory);
+		// The main worktree's memory wins once it exists, as in Claude Code.
+		const mainMemory = join(
+			projects,
+			getClaudeProjectKey(roots[0] ?? ""),
+			"memory",
+		);
+		await mkdir(mainMemory, { recursive: true });
+		expect(
+			await resolveClaudeProjectMemoryDirectory(locations, roots, undefined),
+		).toBe(mainMemory);
+		// The setting relocates memory inside $HOME; paths outside are ignored.
+		expect(
+			await resolveClaudeProjectMemoryDirectory(locations, roots, {
+				autoMemoryDirectory: "~/notes/memory",
+			}),
+		).toBe(join(home, "notes/memory"));
+		expect(
+			await resolveClaudeProjectMemoryDirectory(locations, roots, {
+				autoMemoryDirectory: "/etc/memory",
+			}),
+		).toBe(mainMemory);
+		expect(getClaudeProjectKey("/Users/me/conductor/athena.v2_x")).toBe(
+			"-Users-me-conductor-athena-v2-x",
+		);
+	});
+
+	test("captures Claude rules, Codex exec-policy rules, parent .claude/CLAUDE.md and managed instructions", async () => {
+		const home = await createHome();
+		const managed = join(home, "managed-root");
+		const files = {
+			".claude/rules/testing.md": "Always run the tests\n",
+			".claude/rules/frontend/react.md": "Prefer function components\n",
+			"codex/rules/default.rules":
+				'prefix_rule(pattern=["git", "status"], decision="allow")\n',
+			"work/.claude/CLAUDE.md": "Work directory instructions\n",
+			"work/repo/AGENTS.md": "Repository instructions\n",
+			"work/repo/.claude/rules/api.md": "API rules\n",
+			"managed-root/CLAUDE.md": "Managed instructions\n",
+			"managed-root/managed-settings.json":
+				'{"permissions":{"deny":["Bash(curl:*)"]}}',
+		};
+		for (const [path, content] of Object.entries(files)) {
+			await mkdir(dirname(join(home, path)), { recursive: true });
+			await writeFile(join(home, path), content);
+		}
+		const repository = join(home, "work/repo");
+		execFileSync("git", ["init", "-q"], { cwd: repository });
+		const bundle = await collectWithUserContext(
+			repository,
+			{ home, codexHome: join(home, "codex"), managedClaudeDirectory: managed },
+			[],
+		);
+		const read = (rootId: string, path: string) =>
+			readCaptured(bundle, rootId, path);
+		expect(read("claude-user-home", "rules/testing.md")).toBe(
+			files[".claude/rules/testing.md"],
+		);
+		expect(read("claude-user-home", "rules/frontend/react.md")).toBe(
+			files[".claude/rules/frontend/react.md"],
+		);
+		expect(read("repository", ".claude/rules/api.md")).toBe("API rules\n");
+		expect(read("codex-user-home", "rules/default.rules")).toBe(
+			files["codex/rules/default.rules"],
+		);
+		expect(read("home-instructions", "work/.claude/CLAUDE.md")).toBe(
+			"Work directory instructions\n",
+		);
+		expect(read("claude-managed", "CLAUDE.md")).toBe("Managed instructions\n");
+		expect(
+			bundle.manifest.roots.find((root) => root.id === "claude-managed"),
+		).toMatchObject({ origin: "admin", status: "collected" });
+		// Rules are instructions: they come from the instruction pool.
+		for (const [rootId, path] of [
+			["claude-user-home", "rules/testing.md"],
+			["repository", ".claude/rules/api.md"],
+		] as const)
+			expect(getFile(bundle, rootId, path).categories).toContain("markdown");
+		for (const facet of bundle.manifest.contextIndex.facets)
+			expect(facet.coverage).toBe("complete");
+	});
+
+	test("follows skill and instruction directory symlinks inside $HOME only, once and without cycles", async () => {
+		const home = await createHome();
+		const outside = await createHome();
+		const files = {
+			"shared/skills/linked/SKILL.md": "Linked skill\n",
+			"shared/rules/team.md": "Shared team rules\n",
+			"repo/AGENTS.md": "Repository instructions\n",
+			"elsewhere-skills/escaped/SKILL.md": "Outside the repository\n",
+		};
+		for (const [path, content] of Object.entries(files)) {
+			await mkdir(dirname(join(home, path)), { recursive: true });
+			await writeFile(join(home, path), content);
+		}
+		await mkdir(join(outside, "foreign"), { recursive: true });
+		await writeFile(join(outside, "foreign/SKILL.md"), "Outside home\n");
+		await mkdir(join(home, ".claude/skills"), { recursive: true });
+		await symlink(
+			join(home, "shared/skills/linked"),
+			join(home, ".claude/skills/linked"),
+		);
+		await symlink(
+			join(outside, "foreign"),
+			join(home, ".claude/skills/foreign"),
+		);
+		await symlink(
+			join(home, ".claude/skills"),
+			join(home, ".claude/skills/loop"),
+		);
+		await symlink(join(home, "shared/rules"), join(home, ".claude/rules"));
+		const repository = join(home, "repo");
+		await mkdir(join(repository, ".claude"), { recursive: true });
+		await symlink(
+			join(home, "elsewhere-skills"),
+			join(repository, ".claude/skills"),
+		);
+		execFileSync("git", ["init", "-q"], { cwd: repository });
+		const bundle = await collectWithUserContext(
+			repository,
+			{ home, codexHome: join(home, ".codex") },
+			[],
+		);
+		expect(readCaptured(bundle, "claude-user-skills", "linked/SKILL.md")).toBe(
+			"Linked skill\n",
+		);
+		expect(readCaptured(bundle, "claude-user-home", "rules/team.md")).toBe(
+			"Shared team rules\n",
+		);
+		const paths = bundle.manifest.entries.map(
+			(entry) => `${entry.rootId}:${entry.path}`,
+		);
+		// Outside \$HOME, outside the repository and cycles are not followed.
+		expect(paths).not.toContain("claude-user-skills:foreign/SKILL.md");
+		expect(paths).not.toContain("repository:.claude/skills/escaped/SKILL.md");
+		expect(paths.some((path) => path.includes("loop/"))).toBe(false);
+		const symlinks = bundle.manifest.entries.filter(
+			(entry) => entry.kind === "symlink",
+		);
+		expect(
+			Object.fromEntries(
+				symlinks.map((entry) => [
+					`${entry.rootId}:${entry.path}`,
+					entry.kind === "symlink" && entry.followed,
+				]),
+			),
+		).toEqual({
+			"claude-user-home:rules": true,
+			"claude-user-skills:foreign": false,
+			"claude-user-skills:linked": true,
+			"claude-user-skills:loop": false,
+			"repository:.claude/skills": false,
+		});
+		for (const blob of bundle.blobs) {
+			expect(blob.content).not.toContain("Outside home");
+			expect(blob.content).not.toContain("Outside the repository");
+		}
+	});
+
+	test("summarizes every settings layer and only the MCP sections of ~/.claude.json, without secrets", async () => {
+		const home = await createHome();
+		const repository = join(home, "repo");
+		const managed = join(home, "managed-root");
+		const token = `ghp_${"E".repeat(36)}`;
+		const files: Record<string, string> = {
+			".claude/settings.json": JSON.stringify({ model: "opus" }),
+			".claude/settings.local.json": JSON.stringify({
+				env: { ANTHROPIC_API_KEY: "sk-ant-local-0123456789", DEBUG: "1" },
+				permissions: { allow: ["Bash(npm test)"] },
+				apiKeyHelper: "/usr/local/bin/print-key --token abc123secretvalue",
+				statusLine: { type: "command", command: "status --api-key=xyz987" },
+			}),
+			"repo/.claude/settings.json": JSON.stringify({
+				enabledMcpjsonServers: ["github"],
+				hooks: {
+					PreToolUse: [
+						{
+							hooks: [
+								{ type: "command", command: `guard ${token}` },
+								{
+									type: "command",
+									command:
+										"INTERNAL_API_KEY=opaque-hook-value-1 export SVC_TOKEN=opaque-hook-value-2 run-guard --client-secret opaque-hook-value-3",
+								},
+							],
+						},
+					],
+				},
+			}),
+			"repo/.claude/settings.local.json": JSON.stringify({
+				permissions: { deny: ["Read(.env)"] },
+			}),
+			"managed-root/managed-settings.json": JSON.stringify({
+				permissions: { disableBypassPermissionsMode: "disable" },
+				hooks: {
+					PreToolUse: [
+						{
+							hooks: [
+								{
+									type: "command",
+									command:
+										"CORP_AUTH_PASSWORD=opaque-hook-value-4 audit --password 'opaque hook value 5'",
+								},
+							],
+						},
+					],
+				},
+			}),
+			"managed-root/managed-mcp.json": JSON.stringify({
+				mcpServers: {
+					company: { type: "http", url: "https://mcp.corp/x?k=1" },
+				},
+			}),
+			".claude.json": JSON.stringify({
+				userID: "PRIVATE_USER_ID_CANARY",
+				oauthAccount: { emailAddress: "PRIVATE_EMAIL_CANARY" },
+				mcpServers: {
+					linear: { type: "sse", url: "https://user:pw@mcp.linear.app/sse" },
+				},
+				projects: {
+					[repository]: {
+						history: [{ display: "PRIVATE_HISTORY_CANARY" }],
+						allowedTools: ["PRIVATE_ALLOWED_TOOL_CANARY"],
+						mcpServers: {
+							db: {
+								command: "db-mcp",
+								args: ["--password", "hunter2hunter2"],
+								env: { DB_URL: "postgres://u:secret@db/x" },
+							},
+						},
+					},
+					[join(home, "other")]: {
+						mcpServers: { other: { command: "PRIVATE_OTHER_PROJECT" } },
+					},
+				},
+			}),
+			"codex/config.toml": [
+				'approval_policy = "on-request"',
+				'sandbox_mode = "workspace-write"',
+				"[features]",
+				"goals = true",
+				"js_repl = false",
+				"[apps.github]",
+				"enabled = true",
+				"[apps.slack]",
+				"enabled = false",
+				`token = "${token}"`,
+				"",
+			].join("\n"),
+		};
+		for (const [path, content] of Object.entries(files)) {
+			await mkdir(dirname(join(home, path)), { recursive: true });
+			await writeFile(join(home, path), content);
+		}
+		await mkdir(repository, { recursive: true });
+		const locations = {
+			home,
+			codexHome: join(home, "codex"),
+			managedClaudeDirectory: managed,
+		};
+		const summary = summarizeUserAgentSources(
+			await readUserAgentSources(locations, repository, [repository]),
+		);
+		const serialized = JSON.stringify(summary);
+		for (const secret of [
+			token,
+			"sk-ant-local-0123456789",
+			"abc123secretvalue",
+			"xyz987",
+			"hunter2hunter2",
+			"postgres://u:secret",
+			"user:pw",
+			"PRIVATE_USER_ID_CANARY",
+			"PRIVATE_EMAIL_CANARY",
+			"PRIVATE_HISTORY_CANARY",
+			"PRIVATE_ALLOWED_TOOL_CANARY",
+			"PRIVATE_OTHER_PROJECT",
+			"opaque-hook-value",
+			"opaque hook value",
+		])
+			expect(serialized).not.toContain(secret);
+		expect(serialized).toContain(
+			"INTERNAL_API_KEY=[REDACTED] export SVC_TOKEN=[REDACTED] run-guard --client-secret [REDACTED]",
+		);
+		expect(
+			summary.claude.settingsLayers.map((layer) => [
+				layer.scope,
+				layer.path,
+				layer.status,
+			]),
+		).toEqual([
+			["user", "~/.claude/settings.json", "parsed"],
+			["user-local", "~/.claude/settings.local.json", "parsed"],
+			["project", ".claude/settings.json", "parsed"],
+			["project-local", ".claude/settings.local.json", "parsed"],
+			["managed", join(managed, "managed-settings.json"), "parsed"],
+		]);
+		expect(summary.claude.settingsLayers[1]?.settings).toMatchObject({
+			env: ["ANTHROPIC_API_KEY", "DEBUG"],
+			permissions: { allow: ["Bash(npm test)"] },
+			apiKeyHelper: "[REDACTED]",
+			statusLine: { type: "command", command: "status --api-key=[REDACTED]" },
+		});
+		expect(summary.claude.settingsLayers[3]?.settings).toEqual({
+			permissions: { deny: ["Read(.env)"] },
+		});
+		expect(
+			summary.claude.mcpServers.map((server) => [
+				server.scope,
+				server.name,
+				server.transport,
+				server.url,
+				server.args,
+				server.envKeys,
+			]),
+		).toEqual([
+			["user", "linear", "http", "https://mcp.linear.app/sse", [], []],
+			[
+				"project",
+				"db",
+				"stdio",
+				null,
+				["--password", "[REDACTED]"],
+				["DB_URL"],
+			],
+			["managed", "company", "http", "https://mcp.corp/x", [], []],
+		]);
+		expect(summary.claude.stateFile).toEqual({
+			path: "~/.claude.json",
+			status: "parsed",
+		});
+		expect(summary.codex).toMatchObject({
+			approvalPolicy: "on-request",
+			sandboxMode: "workspace-write",
+			features: { goals: true, js_repl: false },
+			apps: { github: true, slack: false },
+		});
+	});
+
+	test("bounds the supporting files of plugins the session did not use, but not of plugins it used", async () => {
+		const home = await createHome();
+		const repository = join(home, "repo");
+		await mkdir(repository, { recursive: true });
+		execFileSync("git", ["init", "-q"], { cwd: repository });
+		const pluginFiles = (plugin: string) =>
+			Object.fromEntries([
+				[`${plugin}/skills/${plugin}-skill/SKILL.md`, `# ${plugin}\n`],
+				...[0, 1, 2, 3, 4, 5].map((index) => [
+					`${plugin}/commands/command-${index}.md`,
+					`${plugin}${index}${"c".repeat(500 * 1024)}`,
+				]),
+			]);
+		const files = {
+			...pluginFiles("used"),
+			...pluginFiles("idle"),
+		};
+		const cache = join(home, ".claude/plugins/cache/mkt");
+		for (const [path, content] of Object.entries(files)) {
+			const target = join(cache, path.replace(/^(\w+)\//u, "$1/1.0.0/"));
+			await mkdir(dirname(target), { recursive: true });
+			await writeFile(target, content);
+		}
+		await writeFile(
+			join(home, ".claude/plugins/installed_plugins.json"),
+			JSON.stringify({
+				plugins: Object.fromEntries(
+					["used", "idle"].map((plugin) => [
+						`${plugin}@mkt`,
+						[{ scope: "user", installPath: join(cache, plugin, "1.0.0") }],
+					]),
+				),
+			}),
+		);
+		const bundle = await collectWithUserContext(
+			repository,
+			{ home, codexHome: join(home, ".codex") },
+			["used:used-skill"],
+		);
+		const command = (plugin: string, index: number) =>
+			getFile(
+				bundle,
+				"claude-plugins",
+				`mkt/${plugin}/1.0.0/commands/command-${index}.md`,
+			).content;
+		// A plugin the session used is captured in full.
+		for (const index of [0, 1, 2, 3, 4, 5])
+			expect(command("used", index).status).toBe("available");
+		// Another plugin stops at its 2 MiB budget: four 500 KiB commands fit.
+		expect(
+			[0, 1, 2, 3, 4, 5].map((index) => command("idle", index).status),
+		).toEqual([
+			"available",
+			"available",
+			"available",
+			"available",
+			"omitted",
+			"omitted",
+		]);
+		expect(command("idle", 4)).toEqual({
+			status: "omitted",
+			reason: "metadata-only",
+			detail: "plugin-support-budget",
+		});
+		expect(
+			readCaptured(
+				bundle,
+				"claude-plugins",
+				"mkt/idle/1.0.0/skills/idle-skill/SKILL.md",
+			),
+		).toBe("# idle\n");
+	});
+
+	test("never reads a root or an included path whose real path leaves $HOME", async () => {
+		const home = await createHome();
+		const outside = await createHome();
+		await mkdir(join(outside, "skills/foreign"), { recursive: true });
+		await writeFile(
+			join(outside, "skills/foreign/SKILL.md"),
+			"OUTSIDE_ROOT_CANARY\n",
+		);
+		await mkdir(join(outside, "work"), { recursive: true });
+		await writeFile(
+			join(outside, "work/CLAUDE.md"),
+			"OUTSIDE_INCLUDE_CANARY\n",
+		);
+		await mkdir(join(home, ".claude"), { recursive: true });
+		await symlink(join(outside, "skills"), join(home, ".claude/skills"));
+		// The repository's parent directory is a link to a directory outside.
+		await symlink(join(outside, "work"), join(home, "work"));
+		const repository = join(home, "code/repo");
+		await mkdir(repository, { recursive: true });
+		await writeFile(join(repository, "AGENTS.md"), "Instructions\n");
+		execFileSync("git", ["init", "-q"], { cwd: repository });
+		const repositoryRoot = await realpath(repository);
+		const locations = { home, codexHome: join(home, ".codex") };
+		const sources = await readUserAgentSources(locations, repositoryRoot);
+		const additionalRoots = [
+			...(await resolveUserContextRoots({
+				locations,
+				repositoryRoot,
+				sources,
+			})),
+			{
+				absolutePath: home,
+				followSymlinksWithin: home,
+				id: "linked-parent",
+				include: [{ path: "work/CLAUDE.md", role: "instruction" as const }],
+				label: "Linked parent",
+				origin: "user" as const,
+				scope: "instructions" as const,
+			},
+		];
+		const bundle = await collectLocalContextBundle(
+			repositoryRoot,
+			{
+				...getDefaultLocalContextCollectionOptions(),
+				additionalRoots,
+				capturePolicy: "session-evidence",
+			},
+			createLocalContextSourceEnv(),
+		);
+		for (const blob of bundle.blobs) {
+			expect(blob.content).not.toContain("OUTSIDE_ROOT_CANARY");
+			expect(blob.content).not.toContain("OUTSIDE_INCLUDE_CANARY");
+		}
+		expect(
+			bundle.manifest.roots.find((root) => root.id === "claude-user-skills"),
+		).toMatchObject({ status: "excluded" });
+		expect(bundle.manifest.coverage.excludedPaths).toEqual(
+			expect.arrayContaining([
+				{ rootId: "claude-user-skills", path: "", reason: "outside-boundary" },
+				{
+					rootId: "linked-parent",
+					path: "work/CLAUDE.md",
+					reason: "outside-boundary",
+				},
+			]),
+		);
+		expect(
+			bundle.manifest.entries.some(
+				(entry) =>
+					entry.rootId === "claude-user-skills" ||
+					entry.path === "work/CLAUDE.md",
+			),
+		).toBe(false);
+	});
+
+	test("redacts hand-written credentials in every free-text channel and counts them", async () => {
+		const home = await createHome();
+		const opaque = "zQ7p-internal-opaque-4471";
+		const repository = join(home, "repo");
+		const memory = join(home, "memory");
+		const toolResults = join(home, "session/tool-results");
+		const files: Record<string, string> = {
+			"repo/AGENTS.md": `Instructions\nstaging password: ${opaque}\n`,
+			"repo/CLAUDE.local.md": `Personal notes\nexport DEPLOY_TOKEN=${opaque}\n`,
+			"repo/.claude/rules/db.md": `Use postgres://app:${opaque}@db.internal/app\n`,
+			"repo/.claude/skills/ops/SKILL.md": "# Ops\n",
+			"repo/.claude/skills/ops/scripts/run.sh": `curl -H "Authorization: Bearer ${opaque}" --api-key ${opaque} https://ops\n`,
+			"memory/MEMORY.md": `# Memory\n- the vault secret = ${opaque}\n`,
+			"session/tool-results/out.txt": `DATABASE_URL=mysql://root:${opaque}@10.0.0.5/app\n`,
+		};
+		// Realistic surrounding text keeps each file inside the redaction budget.
+		const prose =
+			"Keep changes small and run the checks before pushing.\n".repeat(8);
+		for (const [path, content] of Object.entries(files)) {
+			await mkdir(dirname(join(home, path)), { recursive: true });
+			await writeFile(join(home, path), `${prose}${content}`);
+		}
+		execFileSync("git", ["init", "-q"], { cwd: repository });
+		const locations = { home, codexHome: join(home, ".codex") };
+		const repositoryRoot = await realpath(repository);
+		const sources = await readUserAgentSources(locations, repositoryRoot);
+		const bundle = await collectLocalContextBundle(
+			repositoryRoot,
+			{
+				...getDefaultLocalContextCollectionOptions(),
+				additionalRoots: await resolveUserContextRoots({
+					locations,
+					memoryDirectory: memory,
+					repositoryRoot,
+					sources,
+					toolResultsDirectory: toolResults,
+				}),
+				capturePolicy: "session-evidence",
+			},
+			createLocalContextSourceEnv(),
+		);
+		const captured = [
+			["repository", "AGENTS.md"],
+			["repository", "CLAUDE.local.md"],
+			["repository", ".claude/rules/db.md"],
+			["repository", ".claude/skills/ops/scripts/run.sh"],
+			["claude-project-memory", "MEMORY.md"],
+			["claude-tool-results", "out.txt"],
+		] as const;
+		for (const [rootId, path] of captured) {
+			const text = readCaptured(bundle, rootId, path);
+			expect(text).not.toContain(opaque);
+			expect(text).toContain("[REDACTED:");
+		}
+		for (const blob of bundle.blobs) expect(blob.content).not.toContain(opaque);
+		expect(bundle.manifest.coverage.redactionCounts).toMatchObject({
+			"authorization-value": 1,
+			"connection-string-password": 2,
+			"credential-assignment": 3,
+			"credential-flag": 1,
+		});
+	});
+
+	test("CODEX_HOME relocates Codex instructions, skills, plugins and configuration", () => {
+		expect(
+			getUserContextLocations({ CODEX_HOME: "/opt/codex-home" }, "/home/user"),
+		).toMatchObject({ home: "/home/user", codexHome: "/opt/codex-home" });
+		expect(getUserContextLocations({}, "/home/user")).toMatchObject({
+			home: "/home/user",
+			codexHome: "/home/user/.codex",
+		});
+		expect(getManagedClaudeDirectory("darwin")).toBe(
+			"/Library/Application Support/ClaudeCode",
+		);
+		expect(getManagedClaudeDirectory("linux")).toBe("/etc/claude-code");
+		expect(getManagedClaudeDirectory("win32")).toBeNull();
+	});
+});
+
+async function collectWithUserContext(
+	repository: string,
+	locations: UserContextLocations,
+	observedSkillNames: readonly string[],
+	memoryDirectory: string | null = null,
+): Promise<LocalContextBundle> {
+	const repositoryRoot = await realpath(repository);
+	const sources = await readUserAgentSources(locations, repositoryRoot);
+	const additionalRoots = await resolveUserContextRoots({
+		locations,
+		memoryDirectory,
+		repositoryRoot,
+		sources,
+	});
+	return collectLocalContextBundle(
+		repositoryRoot,
+		{
+			...getDefaultLocalContextCollectionOptions(),
+			additionalRoots,
+			capturePolicy: "session-evidence",
+			observedSkillNames,
+		},
+		createLocalContextSourceEnv(),
+	);
+}
+
+async function createHome(): Promise<string> {
+	const home = await realpath(
+		await mkdtemp(join(tmpdir(), "opaline-user-context-")),
+	);
+	directories.push(home);
+	return home;
+}
+
+function getFile(bundle: LocalContextBundle, rootId: string, path: string) {
+	const entry = bundle.manifest.entries.find(
+		(candidate) => candidate.rootId === rootId && candidate.path === path,
+	);
+	assert(entry?.kind === "file", `Missing ${rootId}:${path}`);
+	return entry;
+}
+
+function readCaptured(
+	bundle: LocalContextBundle,
+	rootId: string,
+	path: string,
+): string {
+	const entry = getFile(bundle, rootId, path);
+	assert(
+		entry.content.status === "available",
+		`${rootId}:${path} is ${entry.content.status}`,
+	);
+	const blobId = entry.content.blobId;
+	const blob = bundle.blobs.find((candidate) => candidate.id === blobId);
+	assert(blob);
+	expect(createHash("sha256").update(blob.content).digest("hex")).toBe(
+		blobId.slice("sha256:".length),
+	);
+	return blob.content;
+}

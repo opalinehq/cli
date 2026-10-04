@@ -1,5 +1,8 @@
 import { ORPCError } from "@orpc/client";
-import type { IngestSessionInput } from "../contracts/index.js";
+import {
+	INGEST_DIRECT_CONTENT_MAX_BYTES,
+	type IngestSessionInput,
+} from "../contracts/index.js";
 import type { FileBackedUploadRequest } from "../internal/agent-adapters/index.js";
 import {
 	getRedactionBudgetAnomaly,
@@ -21,6 +24,7 @@ import {
 	isR2IngestStatusOutput,
 	type R2IngestCommitInput,
 	type R2IngestInitInput,
+	type R2IngestStatusOutput,
 	type R2IngestSuccess,
 	type R2IngestUploadObject,
 } from "./r2-ingest-contract.js";
@@ -42,11 +46,27 @@ const COMMITTED_JOB_IN_PROGRESS_REASONS = new Set([
 	"R2_INGEST_JOB_BUSY",
 	"R2_INGEST_JOB_RETRY_LATER",
 ]);
+// The server accepted the uploaded objects but its materialization queue was
+// full. Repeating the commit only queues again; the job is finished by the
+// server's recovery worker and confirmed by status polling or reconciliation.
+const MATERIALIZATION_QUEUED_REASON = "R2_INGEST_GATE_QUEUE_TIMEOUT";
+// Server job failures that are not caused by the transcript itself: a fresh
+// upload of the same session can succeed.
+const RETRYABLE_JOB_FAILURE_CODES = new Set([
+	"R2_INGEST_JOB_EXPIRED",
+	"R2_INGEST_ATTEMPTS_EXHAUSTED",
+]);
 
 export interface R2UploadFlowConfig {
 	readonly authType: "api-key" | "bearer";
 	readonly endpoint: URL;
-	readonly maxAggregateBytes: number;
+	/** Per-session limit for an upload with this slimming outcome. */
+	readonly maxAggregateBytes: (slimming: TranscriptSlimming) => number;
+	/**
+	 * Asked only when slimming changes the transcript: whether the server
+	 * accepts slimmed transcripts. Otherwise the upload is restaged unslimmed.
+	 */
+	readonly canSlim: () => Promise<boolean>;
 	readonly multipartBaseDelayMs: number | undefined;
 	readonly onProgress: ((progress: R2MultipartProgress) => void) | undefined;
 	readonly onTransferProgress?: (progress: UploadTransferProgress) => void;
@@ -54,13 +74,26 @@ export interface R2UploadFlowConfig {
 		| ((attempt: number, maxAttempts: number, error: string) => void)
 		| undefined;
 	readonly statusPollIntervalMs: number | undefined;
+	/** Status polls before an accepted job is left to later reconciliation. */
+	readonly statusMaxPolls: number | undefined;
 	readonly token: string;
+	/** Receives the slimmed, filtered session size once it is staged. */
+	readonly onStaged?: (aggregateBytes: number) => void;
 }
+
+/**
+ * `applied`: slimmed for a server that accepts it; `unchanged`: slimming
+ * changes nothing in this transcript; `unsupported`: the server does not
+ * accept slimmed transcripts, so it is sent unslimmed.
+ */
+export type TranscriptSlimming = "applied" | "unchanged" | "unsupported";
 
 export type R2UploadFlowResult =
 	| {
 			readonly actualBytes: number;
 			readonly maxBytes: number;
+			/** Slimming of the measured upload. */
+			readonly slimming: TranscriptSlimming;
 			readonly status: "too-large";
 	  }
 	| {
@@ -101,15 +134,52 @@ export class R2IngestFlowError extends Error {
 	}
 }
 
+/**
+ * The server accepted the upload but had not finished processing it when the
+ * local polling window ended. The job keeps running server-side; callers record
+ * it as pending and reconcile it later with `ingest.status`.
+ */
+export class R2IngestPendingError extends Error {
+	readonly jobId: string;
+
+	constructor(jobId: string) {
+		super(
+			"Opaline accepted the upload and is still processing it; it will be checked again on the next upload or `opaline upload --retry`.",
+		);
+		this.name = "R2IngestPendingError";
+		this.jobId = jobId;
+	}
+}
+
+export function isRetryableR2JobFailure(code: string | undefined): boolean {
+	return code !== undefined && RETRYABLE_JOB_FAILURE_CODES.has(code);
+}
+
 export async function uploadSessionViaR2(
 	request: IngestSessionInput | FileBackedUploadRequest,
 	config: R2UploadFlowConfig,
 ): Promise<R2UploadFlowResult> {
-	const staged = await stageFilteredUpload(
-		createFilteredUploadSources(request),
+	let staged = await stageFilteredUpload(
+		createFilteredUploadSources(request, { slim: true }),
 	);
+	// Slimming that changed nothing needs no negotiation; slimmed bytes go
+	// only to a server that accepts them.
+	let slimming: TranscriptSlimming =
+		staged.aggregateBytes < staged.unslimmedBytes ? "applied" : "unchanged";
+	if (slimming === "applied" && !(await config.canSlim())) {
+		await cleanupStagedUpload(staged);
+		staged = await stageFilteredUpload(
+			createFilteredUploadSources(request, { slim: false }),
+		);
+		slimming = "unsupported";
+	}
+	config.onStaged?.(staged.aggregateBytes);
 	try {
-		const preflight = getPreflightFailure(staged, config.maxAggregateBytes);
+		const preflight = getPreflightFailure(
+			staged,
+			config.maxAggregateBytes(slimming),
+			slimming,
+		);
 		if (preflight) return preflight;
 		return await uploadStagedSession(staged, config);
 	} finally {
@@ -132,9 +202,11 @@ export function isR2InitUnsupported(error: unknown): boolean {
 function getPreflightFailure(
 	staged: StagedFilteredUpload,
 	maxAggregateBytes: number,
+	slimming: TranscriptSlimming,
 ): Exclude<R2UploadFlowResult, { readonly status: "success" }> | null {
 	const main = staged.objects.find((object) => object.kind === "main");
 	if (!main || main.byteLength === 0) return { status: "empty-main" };
+	// The filter ran over the raw input, as in 0.11.
 	const anomaly = getRedactionBudgetAnomaly(
 		staged.redactedBytes,
 		staged.inputBytes,
@@ -145,6 +217,7 @@ function getPreflightFailure(
 		return {
 			actualBytes: staged.aggregateBytes,
 			maxBytes: maxAggregateBytes,
+			slimming,
 			status: "too-large",
 		};
 	}
@@ -170,6 +243,12 @@ async function uploadStagedSession(
 			config.onRetry,
 		);
 	} catch (error) {
+		if (isServerSessionSizeRejection(error, staged.aggregateBytes)) {
+			throw new R2IngestFlowError(
+				formatServerSessionSizeRejection(staged.aggregateBytes),
+				true,
+			);
+		}
 		throw new R2IngestInitError(error, isRetryableRpcError(error));
 	}
 	if (!isR2IngestInitOutput(initCall.value)) {
@@ -232,7 +311,11 @@ async function uploadStagedSession(
 		}
 		commitResult = commitCall.value.result;
 	} catch (error) {
-		if (!isCommittedJobInProgressError(error)) throw error;
+		if (
+			!isCommittedJobInProgressError(error) &&
+			!isMaterializationQueuedError(error)
+		)
+			throw error;
 	}
 	const statusCall = await pollJobStatus(client, initCall.value.jobId, config);
 	const serverResult = statusCall.result ?? commitResult;
@@ -259,6 +342,44 @@ async function uploadStagedSession(
 	};
 }
 
+/**
+ * Servers released before the 256 MiB limit reject a larger session at init:
+ * the size check answers 413, or input validation answers 400 with an issue
+ * about object sizes (`objects[n].byteLength` above the limit, or the
+ * "Aggregate transcript content exceeds N bytes" refinement on `objects`).
+ * Only those are size rejections; any other 400 (for example "Choose an
+ * organization with --org or opaline set-org") keeps the server's message.
+ */
+export function isServerSessionSizeRejection(
+	error: unknown,
+	aggregateBytes: number,
+): boolean {
+	if (aggregateBytes <= INGEST_DIRECT_CONTENT_MAX_BYTES) return false;
+	if (!(error instanceof ORPCError)) return false;
+	if (error.status === 413) return true;
+	if (error.status !== 400) return false;
+	const issues = isRecord(error.data) ? error.data.issues : undefined;
+	if (!Array.isArray(issues)) return false;
+	return issues.some((issue) => {
+		if (!isRecord(issue)) return false;
+		const message = typeof issue.message === "string" ? issue.message : "";
+		const path = Array.isArray(issue.path)
+			? issue.path.map((key) => (isRecord(key) ? String(key.key) : String(key)))
+			: [];
+		return (
+			path.some((key) =>
+				/^(?:byteLength|expected_total_bytes|expectedTotalBytes)$/u.test(key),
+			) || /exceeds \d+ bytes|too (?:large|big)/iu.test(message)
+		);
+	});
+}
+
+function formatServerSessionSizeRejection(aggregateBytes: number): string {
+	const size = (aggregateBytes / (1024 * 1024)).toFixed(2);
+	const limit = INGEST_DIRECT_CONTENT_MAX_BYTES / (1024 * 1024);
+	return `The Opaline server does not accept sessions this large yet: this session is ${size} MiB after slimming, and the server still accepts up to ${limit} MiB. It stays queued; retry with \`opaline upload --retry\` after the server is updated.`;
+}
+
 async function pollJobStatus(
 	client: ReturnType<typeof createR2IngestRpcClient>,
 	jobId: string,
@@ -268,11 +389,23 @@ async function pollJobStatus(
 	readonly result: R2IngestSuccess | null;
 }> {
 	let maxAttempts = 1;
-	for (let poll = 0; poll < STATUS_MAX_POLLS; poll += 1) {
-		const statusCall = await callRpcWithRetry(
-			() => client.ingest.status({ jobId }),
-			config.onRetry,
-		);
+	const maxPolls = Math.max(1, config.statusMaxPolls ?? STATUS_MAX_POLLS);
+	for (let poll = 0; poll < maxPolls; poll += 1) {
+		let statusCall: {
+			readonly attempts: number;
+			readonly value: R2IngestStatusOutput;
+		};
+		try {
+			statusCall = await callRpcWithRetry(
+				() => client.ingest.status({ jobId }),
+				config.onRetry,
+			);
+		} catch (error) {
+			// The job was accepted; an unreachable status endpoint does not make
+			// it fail. Leave it to reconciliation instead of re-uploading.
+			if (isRetryableRpcError(error)) throw new R2IngestPendingError(jobId);
+			throw error;
+		}
 		maxAttempts = Math.max(maxAttempts, statusCall.attempts);
 		if (!isR2IngestStatusOutput(statusCall.value)) {
 			throw new R2IngestFlowError(
@@ -290,19 +423,22 @@ async function pollJobStatus(
 			return { attempts: maxAttempts, result: statusCall.value.result };
 		}
 		if (statusCall.value.status === "failed") {
-			const detail =
-				statusCall.value.error?.message ?? "unknown processing error";
 			throw new R2IngestFlowError(
-				`R2 ingest job failed after upload: ${detail}`,
-				false,
+				formatR2JobFailure(statusCall.value.error),
+				isRetryableR2JobFailure(statusCall.value.error?.code),
 			);
 		}
-		await delay(config.statusPollIntervalMs ?? STATUS_POLL_INTERVAL_MS);
+		if (poll + 1 < maxPolls) {
+			await delay(config.statusPollIntervalMs ?? STATUS_POLL_INTERVAL_MS);
+		}
 	}
-	throw new R2IngestFlowError(
-		"R2 ingest job did not finish within the local status polling window",
-		true,
-	);
+	throw new R2IngestPendingError(jobId);
+}
+
+export function formatR2JobFailure(
+	error: { readonly code: string; readonly message: string } | null,
+): string {
+	return `R2 ingest job failed after upload: ${error?.message ?? "unknown processing error"}`;
 }
 
 function buildInitInput(staged: StagedFilteredUpload): R2IngestInitInput {
@@ -375,7 +511,11 @@ async function callRpcWithRetry<TValue>(
 		try {
 			return { attempts: attempt, value: await operation() };
 		} catch (error) {
-			if (!isRetryableRpcError(error) || attempt === RPC_MAX_ATTEMPTS) {
+			if (
+				!isRetryableRpcError(error) ||
+				isMaterializationQueuedError(error) ||
+				attempt === RPC_MAX_ATTEMPTS
+			) {
 				throw error;
 			}
 			const detail =
@@ -404,6 +544,17 @@ function isCommittedJobInProgressError(error: unknown): boolean {
 	const reason = error.data.reason;
 	return (
 		typeof reason === "string" && COMMITTED_JOB_IN_PROGRESS_REASONS.has(reason)
+	);
+}
+
+// Older APIs answer a full materialization queue with the gate's own reason;
+// current APIs mark the job for their recovery worker and say `queued: true`.
+function isMaterializationQueuedError(error: unknown): boolean {
+	return (
+		error instanceof ORPCError &&
+		isRecord(error.data) &&
+		(error.data.reason === MATERIALIZATION_QUEUED_REASON ||
+			error.data.queued === true)
 	);
 }
 

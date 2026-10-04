@@ -1,4 +1,16 @@
 import { isAbsolute } from "node:path";
+import {
+	SESSION_DIFF_MAX_TOTAL_BYTES,
+	SESSION_INSTRUCTION_MAX_FILE_BYTES,
+	SESSION_INSTRUCTION_MAX_FILES,
+	SESSION_INSTRUCTION_MAX_TOTAL_BYTES,
+	SESSION_TOOL_RESULT_MAX_FILE_BYTES,
+	SESSION_TOOL_RESULT_MAX_FILES,
+	SESSION_TOOL_RESULT_MAX_TOTAL_BYTES,
+	SESSION_USER_CONTEXT_MAX_FILE_BYTES,
+	SESSION_USER_CONTEXT_MAX_FILES,
+	SESSION_USER_CONTEXT_MAX_TOTAL_BYTES,
+} from "./capture-policy.js";
 import type {
 	LocalContextCollectionLimits,
 	LocalContextCollectionOptions,
@@ -34,6 +46,16 @@ export const DEFAULT_LOCAL_CONTEXT_COLLECTION_LIMITS: LocalContextCollectionLimi
 		gitCommandTimeoutMs: 15_000,
 		maxCommits: 100,
 		maxCoverageErrors: 1000,
+		maxInstructionFiles: SESSION_INSTRUCTION_MAX_FILES,
+		maxInstructionContentBytesPerFile: SESSION_INSTRUCTION_MAX_FILE_BYTES,
+		maxInstructionContentBytes: SESSION_INSTRUCTION_MAX_TOTAL_BYTES,
+		maxDiffContentBytes: SESSION_DIFF_MAX_TOTAL_BYTES,
+		maxUserContextFiles: SESSION_USER_CONTEXT_MAX_FILES,
+		maxUserContextContentBytesPerFile: SESSION_USER_CONTEXT_MAX_FILE_BYTES,
+		maxUserContextContentBytes: SESSION_USER_CONTEXT_MAX_TOTAL_BYTES,
+		maxToolResultFiles: SESSION_TOOL_RESULT_MAX_FILES,
+		maxToolResultContentBytesPerFile: SESSION_TOOL_RESULT_MAX_FILE_BYTES,
+		maxToolResultContentBytes: SESSION_TOOL_RESULT_MAX_TOTAL_BYTES,
 	};
 
 export function getDefaultLocalContextCollectionOptions(): LocalContextCollectionOptions {
@@ -51,6 +73,18 @@ export function validateLocalContextCollectionOptions(
 ): void {
 	validateLimits(options.limits);
 	validateAdditionalRootIds(options);
+	const workingDirectory = options.workingDirectory;
+	if (
+		workingDirectory !== undefined &&
+		(workingDirectory.startsWith("/") ||
+			workingDirectory === ".." ||
+			workingDirectory.startsWith("../") ||
+			workingDirectory.includes("/../"))
+	) {
+		throw new Error(
+			`Invalid working directory: ${JSON.stringify(workingDirectory)}`,
+		);
+	}
 	for (const prefix of options.excludedPathPrefixes) {
 		if (
 			prefix.length === 0 ||
@@ -104,6 +138,21 @@ function validateAdditionalRootIds(
 			throw new Error(
 				`Invalid context root scope: ${JSON.stringify(root.scope)}`,
 			);
+		}
+		for (const include of root.include ?? []) {
+			const segments = include.path.split("/");
+			if (
+				include.path.length === 0 ||
+				include.path.startsWith("/") ||
+				segments.some(
+					(segment) => segment === ".." || segment === "." || segment === "",
+				) ||
+				!["instruction", "metadata", "tree"].includes(include.role)
+			) {
+				throw new Error(
+					`Invalid include ${JSON.stringify(include.path)} for context root ${JSON.stringify(root.id)}.`,
+				);
+			}
 		}
 		ids.add(root.id);
 	}

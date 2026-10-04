@@ -3,12 +3,14 @@ import { FILTER_VERSION } from "../secret-filter/index.js";
 import { createBlobStore, getSortedBlobs } from "./blob-store.js";
 import {
 	getSessionContentPriority,
+	isPluginCommandOrAgent,
 	SESSION_CONTEXT_MAX_BLOB_BYTES,
 	SESSION_CONTEXT_MAX_BLOBS,
 	SESSION_CONTEXT_MAX_ENTRIES,
 	SESSION_CONTEXT_MAX_MANIFEST_BYTES,
+	SESSION_CONTEXT_MAX_METADATA_LIST_BYTES,
 } from "./capture-policy.js";
-import { buildContextIndex } from "./context-index.js";
+import { buildContextIndex, getContextFacetKinds } from "./context-index.js";
 import { collectFileSystemContext } from "./filesystem-collector.js";
 import { checkGitConsistency, collectGitSnapshot } from "./git-collector.js";
 import { filterContextMetadata } from "./metadata-filter.js";
@@ -19,7 +21,6 @@ import {
 	type ContextDocumentIndex,
 	type ContextEntry,
 	type ContextPathReference,
-	type GitDiff,
 	LOCAL_CONTEXT_BUNDLE_SCHEMA_VERSION,
 	LOCAL_CONTEXT_COLLECTOR_VERSION,
 	LOCAL_CONTEXT_LIFECYCLE,
@@ -58,18 +59,43 @@ export async function collectLocalContextBundle(
 		throw new Error("The capture ID provider returned an empty value.");
 	}
 	const requestedRoot = resolve(repositoryRoot);
+	const sessionEvidence = options.capturePolicy === "session-evidence";
 	const blobStore = createBlobStore(
 		options.parentCapture,
 		effectiveOptions.limits.maxBlobs,
-		options.capturePolicy === "session-evidence"
-			? effectiveOptions.limits.maxTotalContentBytes
-			: undefined,
+		sessionEvidence ? effectiveOptions.limits.maxTotalContentBytes : undefined,
 	);
-	const gitBlobStore =
-		options.capturePolicy === "session-evidence"
-			? createBlobStore(options.parentCapture, 2)
-			: blobStore;
-	let git = await collectGitSnapshot(
+	// Session evidence budgets instructions and patches in their own pools, so
+	// neither can be crowded out by the other or by general content.
+	const instructionBlobStore = sessionEvidence
+		? createBlobStore(
+				options.parentCapture,
+				effectiveOptions.limits.maxInstructionFiles,
+				effectiveOptions.limits.maxInstructionContentBytes,
+			)
+		: null;
+	const gitBlobStore = sessionEvidence
+		? createBlobStore(
+				options.parentCapture,
+				2,
+				effectiveOptions.limits.maxDiffContentBytes,
+			)
+		: blobStore;
+	const userContextBlobStore = sessionEvidence
+		? createBlobStore(
+				options.parentCapture,
+				effectiveOptions.limits.maxUserContextFiles,
+				effectiveOptions.limits.maxUserContextContentBytes,
+			)
+		: null;
+	const toolResultBlobStore = sessionEvidence
+		? createBlobStore(
+				options.parentCapture,
+				effectiveOptions.limits.maxToolResultFiles,
+				effectiveOptions.limits.maxToolResultContentBytes,
+			)
+		: null;
+	const git = await collectGitSnapshot(
 		requestedRoot,
 		effectiveOptions.limits,
 		env.git,
@@ -82,35 +108,20 @@ export async function collectLocalContextBundle(
 		env.fileSystem,
 		git,
 		blobStore,
+		{
+			instruction: instructionBlobStore,
+			userContext: userContextBlobStore,
+			toolResult: toolResultBlobStore,
+		},
 	);
-	if (gitBlobStore !== blobStore && git.snapshot.status === "available") {
-		const snapshot = {
-			...git.snapshot,
-			diffs: git.snapshot.diffs.map((diff): GitDiff => {
-				if (diff.blobId === null || blobStore.blobs.has(diff.blobId))
-					return diff;
-				const blob = gitBlobStore.blobs.get(diff.blobId);
-				if (!blob) return diff;
-				const omissionReason =
-					blobStore.blobs.size >= blobStore.maxBlobs
-						? "blob-count-cap"
-						: blobStore.materializedBytes + blob.byteLength > blobStore.maxBytes
-							? "total-content-cap"
-							: null;
-				if (omissionReason !== null)
-					return {
-						...diff,
-						blobId: null,
-						storedByteLength: 0,
-						reconstructable: false,
-						omissionReason,
-					};
-				blobStore.blobs.set(blob.id, blob);
-				blobStore.materializedBytes += blob.byteLength;
-				return diff;
-			}),
-		};
-		git = { ...git, snapshot };
+	for (const pool of [
+		instructionBlobStore,
+		gitBlobStore,
+		userContextBlobStore,
+		toolResultBlobStore,
+	]) {
+		if (pool === null || pool === blobStore) continue;
+		for (const blob of pool.blobs.values()) blobStore.blobs.set(blob.id, blob);
 	}
 	const blobs = getSortedBlobs(blobStore);
 	const documents = buildDocumentIndex(fileSystem.entries);
@@ -173,39 +184,24 @@ function boundSessionManifest(
 	const metadataRanks = new Map<ContextEntry, number>();
 	const rootRanks = new Map<string, number>();
 	for (const entry of manifest.entries) {
-		if (
-			entry.kind !== "file" ||
-			getSessionContentPriority(
-				entry.rootId,
-				entry.path,
-				entry.categories,
-				observedSkills,
-			) < 4
-		)
-			continue;
+		if (getRetentionRank(entry, observedSkills) !== 8) continue;
 		const rank = rootRanks.get(entry.rootId) ?? 0;
 		metadataRanks.set(entry, rank);
 		rootRanks.set(entry.rootId, rank + 1);
 	}
-	const prioritizedEntries = [...manifest.entries].sort((left, right) => {
-		const priority = (entry: ContextEntry) =>
-			entry.kind === "file"
-				? getSessionContentPriority(
-						entry.rootId,
-						entry.path,
-						entry.categories,
-						observedSkills,
-					)
-				: 5;
-		return (
-			priority(left) - priority(right) ||
+	// Entries with captured content come first, then every facet resource and
+	// skill definition, so the manifest bound drops plain inventory before
+	// anything a facet or the skill index depends on.
+	const prioritizedEntries = [...manifest.entries].sort(
+		(left, right) =>
+			getRetentionRank(left, observedSkills) -
+				getRetentionRank(right, observedSkills) ||
 			(metadataRanks.get(left) ?? 0) - (metadataRanks.get(right) ?? 0) ||
 			compareStrings(
 				`${left.rootId}\0${left.path}`,
 				`${right.rootId}\0${right.path}`,
-			)
-		);
-	});
+			),
+	);
 	const omittedContent = manifest.entries.filter(
 		(entry) =>
 			entry.kind === "file" &&
@@ -234,6 +230,7 @@ function boundSessionManifest(
 					`${right.rootId}\0${right.path}`,
 				),
 			);
+		const droppedEntries = prioritizedEntries.slice(entryCount);
 		const retainedBlobIds = new Set(
 			entries.flatMap((entry) =>
 				entry.kind === "file" &&
@@ -247,14 +244,20 @@ function boundSessionManifest(
 			for (const diff of manifest.git.diffs)
 				if (diff.blobId !== null) retainedBlobIds.add(diff.blobId);
 		const retainedBlobs = blobs.filter((blob) => retainedBlobIds.has(blob.id));
-		const omittedEntries = manifest.entries.length - entries.length;
+		const omittedEntries = droppedEntries.length;
 		const omittedBlobs =
 			omittedContent + omittedDiffs + blobs.length - retainedBlobs.length;
+		const omittedSkillDefinitions = droppedEntries.filter((entry) =>
+			entry.categories.includes("skill-definition"),
+		).length;
 		const limits = new Set(manifest.coverage.limitsReached);
 		if (manifest.entries.length > SESSION_CONTEXT_MAX_ENTRIES)
 			limits.add("maxManifestEntries");
 		if (byteLimited) limits.add("maxManifestBytes");
 		if (omittedDiffs > 0) limits.add("git:capture-limit");
+		const manifestLimit = byteLimited
+			? "maxManifestBytes"
+			: "maxManifestEntries";
 		const roots = manifest.roots.map((root) => {
 			const rootEntries = entries.filter((entry) => entry.rootId === root.id);
 			const contentEntries = rootEntries.filter(
@@ -263,13 +266,13 @@ function boundSessionManifest(
 					(entry.content.status === "available" ||
 						entry.content.status === "reused"),
 			);
-			const truncated = rootEntries.length < root.coverage.discoveredEntries;
+			// Dropping inventory metadata is recorded on the root but does not
+			// change its status: facets decide truncation from what was dropped.
+			const lostEntries = droppedEntries.some(
+				(entry) => entry.rootId === root.id,
+			);
 			return {
 				...root,
-				status:
-					truncated && root.status === "collected"
-						? ("limit-reached" as const)
-						: root.status,
 				coverage: {
 					...root.coverage,
 					contentFiles: contentEntries.length,
@@ -287,9 +290,7 @@ function boundSessionManifest(
 					limitsReached: [
 						...new Set([
 							...root.coverage.limitsReached,
-							...(truncated
-								? [byteLimited ? "maxManifestBytes" : "maxManifestEntries"]
-								: []),
+							...(lostEntries ? [manifestLimit] : []),
 						]),
 					].sort(compareStrings),
 				},
@@ -303,6 +304,18 @@ function boundSessionManifest(
 			(total, blob) => total + blob.byteLength,
 			0,
 		);
+		const truncated =
+			omittedEntries > 0 ||
+			omittedBlobs > 0 ||
+			manifest.coverage.truncated !== undefined
+				? {
+						...manifest.coverage.truncated,
+						omittedEntries,
+						omittedBlobs,
+						...(omittedSkillDefinitions > 0 ? { omittedSkillDefinitions } : {}),
+						reason: "capture-limit" as const,
+					}
+				: undefined;
 		return {
 			blobs: retainedBlobs,
 			manifest: {
@@ -313,8 +326,9 @@ function boundSessionManifest(
 				contextIndex: buildContextIndex(
 					roots,
 					entries,
-					manifest.coverage.excludedPaths,
-					manifest.coverage.errors,
+					sourceManifest.coverage.excludedPaths,
+					sourceManifest.coverage.errors,
+					droppedEntries,
 				),
 				coverage: {
 					...manifest.coverage,
@@ -336,16 +350,7 @@ function boundSessionManifest(
 					partialReasons: [
 						...new Set([...manifest.coverage.partialReasons, ...limits]),
 					].sort(compareStrings),
-					...(omittedEntries > 0 || omittedBlobs > 0
-						? {
-								truncated: {
-									...manifest.coverage.truncated,
-									omittedEntries,
-									omittedBlobs,
-									reason: "capture-limit" as const,
-								},
-							}
-						: {}),
+					...(truncated === undefined ? {} : { truncated }),
 				},
 			},
 		};
@@ -378,69 +383,105 @@ function boundSessionManifest(
 	return result;
 }
 
+/**
+ * Trims each Git and exclusion metadata list to its own byte budget. The
+ * omitted items are counted and the trimmed lists named in limitsReached; the
+ * roots, facets and Git output sections stay as they were.
+ */
 function boundManifestMetadata(
 	manifest: LocalContextManifest,
 ): LocalContextManifest {
-	let omittedMetadata = 0;
-	const bound = <Item>(items: readonly Item[]): readonly Item[] => {
+	const omitted = new Map<string, number>();
+	const bound = <Item>(
+		name: string,
+		items: readonly Item[],
+	): readonly Item[] => {
 		let bytes = 2;
-		return items.filter((item) => {
+		let dropped = 0;
+		const kept = items.filter((item) => {
 			const itemBytes = Buffer.byteLength(JSON.stringify(item)) + 1;
-			if (bytes + itemBytes > 8 * 1024) {
-				omittedMetadata += 1;
+			if (bytes + itemBytes > SESSION_CONTEXT_MAX_METADATA_LIST_BYTES) {
+				dropped += 1;
 				return false;
 			}
 			bytes += itemBytes;
 			return true;
 		});
+		if (dropped > 0) omitted.set(name, dropped);
+		return kept;
 	};
-	const excludedPaths = bound(manifest.coverage.excludedPaths);
-	const errors = bound(manifest.coverage.errors);
+	const excludedPaths = bound("excludedPaths", manifest.coverage.excludedPaths);
+	const errors = bound("errors", manifest.coverage.errors);
 	const git =
 		manifest.git.status === "available"
 			? {
 					...manifest.git,
-					statusEntries: bound(manifest.git.statusEntries),
-					commits: bound(manifest.git.commits),
-					worktrees: bound(manifest.git.worktrees),
-					remotes: bound(manifest.git.remotes),
-					errors: bound(manifest.git.errors),
+					statusEntries: bound("git.statusEntries", manifest.git.statusEntries),
+					commits: bound("git.commits", manifest.git.commits),
+					worktrees: bound("git.worktrees", manifest.git.worktrees),
+					remotes: bound("git.remotes", manifest.git.remotes),
+					errors: bound("git.errors", manifest.git.errors),
 				}
 			: manifest.git;
-	if (omittedMetadata === 0) return manifest;
+	if (omitted.size === 0) return manifest;
+	const omittedMetadata = [...omitted.values()].reduce(
+		(total, count) => total + count,
+		0,
+	);
+	const limits = [...omitted.keys()].map((name) => `metadata:${name}`);
 	return {
 		...manifest,
-		git:
-			git.status === "available"
-				? {
-						...git,
-						truncatedSections: [
-							...new Set([...git.truncatedSections, "capture-limit"]),
-						],
-					}
-				: git,
-		roots: manifest.roots.map((root) =>
-			root.status === "collected" ? { ...root, status: "limit-reached" } : root,
-		),
+		git,
 		coverage: {
 			...manifest.coverage,
 			excludedPaths,
 			errors,
 			limitsReached: [
-				...new Set([...manifest.coverage.limitsReached, "maxManifestBytes"]),
+				...new Set([...manifest.coverage.limitsReached, ...limits]),
 			].sort(compareStrings),
 			partialReasons: [
-				...new Set([...manifest.coverage.partialReasons, "maxManifestBytes"]),
+				...new Set([...manifest.coverage.partialReasons, ...limits]),
 			].sort(compareStrings),
 			partial: true,
 			truncated: {
-				omittedBlobs: 0,
-				omittedEntries: 0,
+				omittedBlobs: manifest.coverage.truncated?.omittedBlobs ?? 0,
+				omittedEntries: manifest.coverage.truncated?.omittedEntries ?? 0,
 				omittedMetadata,
 				reason: "capture-limit",
 			},
 		},
 	};
+}
+
+function getRetentionRank(
+	entry: ContextEntry,
+	observedSkills: ReadonlySet<string>,
+): number {
+	const inFacet = getContextFacetKinds(entry.path, entry).length > 0;
+	if (
+		entry.kind === "file" &&
+		(entry.content.status === "available" || entry.content.status === "reused")
+	)
+		// Supporting files (skill resources, plugin commands and agents) give
+		// way to instructions, skill definitions and every facet resource.
+		return !inFacet &&
+			((entry.categories.includes("skill-resource") &&
+				!entry.categories.includes("skill-definition")) ||
+				isPluginCommandOrAgent(entry.rootId, entry.path))
+			? 2
+			: 0;
+	if (entry.categories.includes("skill-definition") || inFacet) return 1;
+	if (entry.kind !== "file") return 9;
+	// Remaining files keep their content priority order (-1..4 maps to 3..8).
+	return (
+		4 +
+		getSessionContentPriority(
+			entry.rootId,
+			entry.path,
+			entry.categories,
+			observedSkills,
+		)
+	);
 }
 
 export function serializeLocalContextBundle(
@@ -562,10 +603,12 @@ function buildAggregateCoverage(
 	const partialReasons = new Set<string>(limitsReached);
 	if (fileSystem.errors.length > 0) partialReasons.add("filesystem-errors");
 	for (const root of fileSystem.roots) {
-		if (root.status === "missing")
-			partialReasons.add(`missing-root:${root.id}`);
+		// A missing root is an absent source; it leaves nothing uncaptured.
 		if (root.status === "inaccessible") {
 			partialReasons.add(`inaccessible-root:${root.id}`);
+		}
+		if (root.status === "excluded") {
+			partialReasons.add(`excluded-root:${root.id}`);
 		}
 	}
 	return {

@@ -1,10 +1,11 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ORPCError } from "@orpc/client";
 import {
 	INGEST_AGGREGATE_CONTENT_MAX_BYTES,
+	INGEST_DIRECT_CONTENT_MAX_BYTES,
 	INGEST_LIMIT_REASONS,
 	type IngestSessionInput,
 	REDACTION_DID_NOT_CONVERGE_CODE,
@@ -17,18 +18,35 @@ import {
 	SecretFilterConvergenceError,
 	SecretFilterJsonIntegrityError,
 } from "../internal/secret-filter/index.js";
+import { MAX_RAW_TRANSCRIPT_BYTES } from "../lib/filtered-upload-staging.js";
+import { slimTranscriptText } from "../lib/transcript-slim.js";
 import {
 	formatRedactionSummary,
 	formatUploadError,
+	getRawTranscriptSizeFailure,
 	getSecretFilterUploadFailure,
-	getUploadSizeFailure,
 	isRetryableUploadError,
 	uploadSession,
 } from "../lib/uploader.js";
 import {
 	INGEST_STUB_TEST_TOKEN,
+	respondAsSlimmingServer,
 	startIngestStub,
 } from "./helpers/ingest-stub.js";
+
+// Capability answers are cached in the config directory: keep them out of the
+// real one.
+const originalConfigDir = process.env.OPALINE_CONFIG_DIR;
+let isolatedConfigDir = "";
+beforeAll(async () => {
+	isolatedConfigDir = await mkdtemp(join(tmpdir(), "opaline-uploader-config-"));
+	process.env.OPALINE_CONFIG_DIR = isolatedConfigDir;
+});
+afterAll(async () => {
+	if (originalConfigDir === undefined) delete process.env.OPALINE_CONFIG_DIR;
+	else process.env.OPALINE_CONFIG_DIR = originalConfigDir;
+	await rm(isolatedConfigDir, { force: true, recursive: true });
+});
 
 describe("formatUploadError", () => {
 	test("explains API key rate limits from ingest auth", () => {
@@ -214,13 +232,9 @@ describe("isRetryableUploadError", () => {
 });
 
 describe("uploadSession aggregate size guard", () => {
-	test("preflights an impossible large in-memory payload without invoking filtering", async () => {
-		const totalBytes =
-			Math.floor(
-				INGEST_AGGREGATE_CONTENT_MAX_BYTES /
-					(1 - secretFilter.MAX_REDACTION_RATIO),
-			) + 1;
-		const content = "a".repeat(totalBytes);
+	test("preflights a raw payload above the raw limit without invoking filtering", async () => {
+		const maxRawSourceBytes = 1024;
+		const content = "a".repeat(maxRawSourceBytes + 1);
 		const filterSpy = spyOn(secretFilter, "filterSessionTextFields");
 		try {
 			const result = await uploadSession(
@@ -233,11 +247,14 @@ describe("uploadSession aggregate size guard", () => {
 				{
 					endpoint: "http://127.0.0.1:1/rpc",
 					allowInsecureEndpoint: false,
+					maxRawSourceBytes,
 					token: "unused",
 				},
 			);
 			expect(filterSpy).not.toHaveBeenCalled();
-			expect(result).toEqual(getUploadSizeFailure(totalBytes));
+			expect(result).toEqual(
+				getRawTranscriptSizeFailure(maxRawSourceBytes + 1, maxRawSourceBytes),
+			);
 		} finally {
 			filterSpy.mockRestore();
 		}
@@ -317,10 +334,248 @@ describe("uploadSession aggregate size guard", () => {
 		});
 	});
 
-	test("permits the exact size limit and skips one byte above it", () => {
-		const limit = INGEST_AGGREGATE_CONTENT_MAX_BYTES;
-		expect(getUploadSizeFailure(limit)).toBeUndefined();
-		expect(getUploadSizeFailure(limit + 1)).toMatchObject({
+	test("applies the per-session limit to the slimmed transcript", async () => {
+		const screenshot = Buffer.alloc(96 * 1024, 7).toString("base64");
+		const content = `${JSON.stringify({
+			type: "response_item",
+			timestamp: "2026-10-04T10:00:00.000Z",
+			payload: {
+				type: "function_call_output",
+				call_id: "call_1",
+				output: [
+					{
+						type: "input_image",
+						image_url: `data:image/png;base64,${screenshot}`,
+					},
+				],
+			},
+		})}\n`;
+		const stub = startIngestStub({
+			respond: (info) =>
+				respondAsSlimmingServer(info) ??
+				Response.json({ json: { success: true, sessionId: "slim-to-fit" } }),
+		});
+		try {
+			const result = await uploadSession(
+				{
+					source: "codex",
+					sessionId: "slim-to-fit",
+					projectPath: "/test",
+					content,
+				},
+				{
+					endpoint: `${stub.loopbackBase}/rpc`,
+					allowInsecureEndpoint: true,
+					maxAggregateBytes: 64 * 1024,
+					token: INGEST_STUB_TEST_TOKEN,
+				},
+			);
+			expect(Buffer.byteLength(content)).toBeGreaterThan(64 * 1024);
+			expect(result.success).toBe(true);
+			const body =
+				stub.bodies[
+					stub.requests.findIndex(
+						(request) => request.pathname === "/rpc/ingestSession",
+					)
+				] ?? "";
+			expect(body).toContain("opaline-image-omitted:v1;sha256=");
+			expect(body).not.toContain(screenshot);
+		} finally {
+			await stub.server.stop(true);
+		}
+	});
+
+	test("filters before slimming on the direct path, so a false positive in image base64 stays inline", async () => {
+		const pixels = Buffer.alloc(6_000, 5).toString("base64");
+		const falsePositive = `${pixels}SK${"0123456789abcdef".repeat(2)}AA`;
+		const content = `${JSON.stringify({
+			type: "user",
+			timestamp: "2026-10-04T10:00:00.000Z",
+			message: {
+				role: "user",
+				content: [
+					{
+						type: "image",
+						source: {
+							type: "base64",
+							media_type: "image/png",
+							data: falsePositive,
+						},
+					},
+				],
+			},
+		})}\n${JSON.stringify({
+			type: "user",
+			timestamp: "2026-10-04T10:00:01.000Z",
+			message: {
+				role: "user",
+				content: [
+					{
+						type: "image",
+						source: {
+							type: "base64",
+							media_type: "image/png",
+							data: Buffer.alloc(6_000, 9).toString("base64"),
+						},
+					},
+				],
+			},
+		})}\n`;
+		const stub = startIngestStub({
+			respond: (info) =>
+				respondAsSlimmingServer(info) ??
+				Response.json({ json: { success: true, sessionId: "order" } }),
+		});
+		try {
+			const result = await uploadSession(
+				{
+					source: "claude_code",
+					sessionId: "order",
+					projectPath: "/t",
+					content,
+				},
+				{
+					endpoint: `${stub.loopbackBase}/rpc`,
+					allowInsecureEndpoint: true,
+					token: INGEST_STUB_TEST_TOKEN,
+				},
+			);
+			expect(result.success).toBe(true);
+			const sent = JSON.parse(
+				stub.bodies[
+					stub.requests.findIndex(
+						(request) => request.pathname === "/rpc/ingestSession",
+					)
+				] ?? "",
+			).json.content;
+			// What 0.11 sent (filtered) slimmed the way the API slims it.
+			expect(sent).toBe(
+				slimTranscriptText(
+					secretFilter.filterSessionTextFields({
+						content,
+						subagents: undefined,
+					}).content,
+				),
+			);
+			expect(sent).toContain(`${pixels}[REDACTED:twilio-api-key]AA`);
+			expect(sent).toContain("opaline-image-omitted:v1;");
+		} finally {
+			stub.server.stop(true);
+		}
+	});
+
+	test("reports the slimmed size when the slimmed transcript is still too large", async () => {
+		const screenshot = Buffer.alloc(96 * 1024, 7).toString("base64");
+		const imageLine = JSON.stringify({
+			type: "response_item",
+			payload: {
+				type: "message",
+				content: [
+					{
+						type: "input_image",
+						image_url: `data:image/png;base64,${screenshot}`,
+					},
+				],
+			},
+		});
+		const textLine = JSON.stringify({ type: "user", text: "t".repeat(2048) });
+		const content = `${imageLine}\n${textLine}\n`;
+		const slimmedBytes =
+			Buffer.byteLength(content) -
+			Buffer.byteLength(`data:image/png;base64,${screenshot}`) +
+			Buffer.byteLength(
+				`opaline-image-omitted:v1;sha256=${"0".repeat(64)};bytes=${96 * 1024};type=image/png`,
+			);
+		const stub = startIngestStub({
+			hostname: "127.0.0.1",
+			respond: (info) =>
+				respondAsSlimmingServer(info) ??
+				new Response("unexpected", { status: 500 }),
+		});
+		try {
+			const result = await uploadSession(
+				{
+					source: "codex",
+					sessionId: "still-too-large",
+					projectPath: "/t",
+					content,
+				},
+				{
+					endpoint: `${stub.loopbackBase}/rpc`,
+					allowInsecureEndpoint: false,
+					maxAggregateBytes: 1024,
+					token: "unused",
+				},
+			);
+			expect(result).toMatchObject({
+				success: false,
+				totalBytes: slimmedBytes,
+				maxBytes: 1024,
+				attempts: 0,
+			});
+		} finally {
+			stub.server.stop(true);
+		}
+	});
+
+	test("allows sessions up to 256 MiB after slimming", () => {
+		expect(INGEST_AGGREGATE_CONTENT_MAX_BYTES).toBe(256 * 1024 * 1024);
+		expect(INGEST_DIRECT_CONTENT_MAX_BYTES).toBe(128 * 1024 * 1024);
+	});
+
+	for (const authType of ["api-key", "bearer"] as const) {
+		test(`keeps a session above the direct-request limit retryable without R2 (${authType})`, async () => {
+			const content = `${JSON.stringify({ type: "user", text: "u".repeat(4096) })}\n`;
+			const stub = startIngestStub({
+				respond: () =>
+					Response.json(
+						{
+							json: {
+								code: "NOT_FOUND",
+								defined: false,
+								message: "Not Found",
+								status: 404,
+							},
+						},
+						{ status: 404 },
+					),
+			});
+			try {
+				const result = await uploadSession(
+					{
+						source: "claude_code",
+						sessionId: "needs-r2",
+						projectPath: "/test",
+						content: content.repeat(40_000),
+					},
+					{
+						endpoint: `${stub.loopbackBase}/rpc`,
+						allowInsecureEndpoint: true,
+						authType,
+						token: INGEST_STUB_TEST_TOKEN,
+					},
+				);
+
+				expect(result).toMatchObject({
+					success: false,
+					attempts: 0,
+					retryable: true,
+					maxBytes: INGEST_DIRECT_CONTENT_MAX_BYTES,
+				});
+				expect(result.error).toContain("opaline upload --retry");
+				expect(stub.requests.map((request) => request.pathname)).toEqual(
+					authType === "api-key" ? ["/rpc/ingest/init"] : [],
+				);
+			} finally {
+				await stub.server.stop(true);
+			}
+		}, 60_000);
+	}
+
+	test("permits the exact raw limit and skips one byte above it", () => {
+		const limit = MAX_RAW_TRANSCRIPT_BYTES;
+		expect(getRawTranscriptSizeFailure(limit)).toBeUndefined();
+		expect(getRawTranscriptSizeFailure(limit + 1)).toMatchObject({
 			success: false,
 			totalBytes: limit + 1,
 			maxBytes: limit,
@@ -336,7 +591,7 @@ describe("uploadSession aggregate size guard", () => {
 				try {
 					const transcriptPath = join(directory, "main.jsonl");
 					const subagentPath = join(directory, "subagent.jsonl");
-					const limit = INGEST_AGGREGATE_CONTENT_MAX_BYTES;
+					const limit = MAX_RAW_TRANSCRIPT_BYTES;
 					// Sparse, invalid transcripts: reading/filtering them must not run.
 					await writeFile(transcriptPath, "invalid transcript\n");
 					await truncate(
@@ -371,7 +626,7 @@ describe("uploadSession aggregate size guard", () => {
 							onRetry: (attempt) => retries.push(attempt),
 						},
 					);
-					expect(result).toEqual(getUploadSizeFailure(limit + 1));
+					expect(result).toEqual(getRawTranscriptSizeFailure(limit + 1));
 					expect(transfers).toEqual([]);
 					expect(retries).toEqual([]);
 				} finally {

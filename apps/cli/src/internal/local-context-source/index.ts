@@ -24,6 +24,7 @@ export type {
 	BoundedHashResult,
 	BoundedReadResult,
 	CaptureConsistency,
+	CaptureRuntime,
 	ContextBlob,
 	ContextDocumentIndex,
 	ContextEntry,
@@ -36,6 +37,8 @@ export type {
 	ContextIndexResourceAccess,
 	ContextPathReference,
 	ContextRegularFileEntry,
+	ContextRootAlias,
+	ContextRootInclude,
 	ContextRootManifest,
 	ContextRootOrigin,
 	ContextRootScope,
@@ -71,6 +74,9 @@ export type {
 	ParentCaptureReference,
 	RootCoverage,
 	SecretFilterMetadata,
+	ToolResultReference,
+	ToolResultReferences,
+	UserAgentConfiguration,
 } from "./types.js";
 export {
 	LOCAL_CONTEXT_BUNDLE_SCHEMA_VERSION,

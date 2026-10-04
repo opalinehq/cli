@@ -130,6 +130,7 @@ for (const command of ["opaline", "rudel"]) {
 									type: "command",
 									command: `${command} hooks claude session-end`,
 									async: true,
+									timeout: 60,
 								},
 							],
 						},

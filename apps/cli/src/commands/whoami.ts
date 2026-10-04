@@ -7,12 +7,11 @@ import { loadFailedUploads } from "../lib/failed-uploads.js";
 async function runWhoami(): Promise<undefined | Error> {
 	const failedUploads = await loadFailedUploads();
 	if (failedUploads.length > 0) {
-		const retryable = failedUploads.filter(
-			(failure) => failure.status === "retryable",
-		).length;
-		const permanent = failedUploads.length - retryable;
+		const count = (status: (typeof failedUploads)[number]["status"]) =>
+			failedUploads.filter((failure) => failure.status === status).length;
+		const pending = count("pending");
 		p.log.warn(
-			`Local upload status: ${retryable} retryable failure(s), ${permanent} permanent failure(s). Run \`opaline upload --retry\` for details.`,
+			`Local upload status: ${count("retryable")} retryable failure(s), ${count("permanent")} permanent failure(s)${pending > 0 ? `, ${pending} still processing on the server` : ""}. Run \`opaline upload --retry\` for details.`,
 		);
 	}
 

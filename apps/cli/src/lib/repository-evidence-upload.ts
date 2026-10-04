@@ -192,7 +192,11 @@ export function buildRepositoryEvidenceUpload(
 	const built = {
 		input: {
 			capture,
-			coverage: buildCoverage(input.bundle, input.transcriptRevision.delivery),
+			coverage: buildCoverage(
+				input.bundle,
+				input.transcriptRevision.delivery,
+				input.session.source,
+			),
 			manifestObjectId: manifest.descriptor.objectId,
 			objects: [...objects.values()].map((object) => object.descriptor),
 			operationId: randomUUID(),
@@ -501,25 +505,25 @@ const DIFF_LABELS: Readonly<Record<GitDiff["kind"], string>> = {
 function buildCoverage(
 	bundle: LocalContextBundle,
 	transcriptDelivery: TranscriptDeliveryState,
+	source: IngestSessionInput["source"],
 ): RepositoryEvidenceInitInput["coverage"] {
 	const facets = bundle.manifest.contextIndex.facets;
+	const instructions = coverageFromFacets(
+		"effective-instructions",
+		facets.filter((facet) =>
+			["agents-instructions", "claude-instructions"].includes(facet.kind),
+		),
+	);
+	const hookGap = getHookOutputGap(bundle, source);
 	return [
 		buildGitStateCoverage(bundle),
-		coverageFromFacets(
-			"effective-instructions",
-			facets.filter((facet) =>
-				["agents-instructions", "claude-instructions"].includes(facet.kind),
-			),
-		),
-		coverageFromFacets(
-			"available-skills",
-			[],
-			bundle.manifest.roots.some(
-				(root) => root.scope === "skills" && root.status !== "collected",
-			)
-				? "One or more skill roots were unavailable or truncated"
-				: null,
-		),
+		hookGap === null
+			? instructions
+			: incompleteCoverage("effective-instructions", "partial", [
+					...(instructions.reason === null ? [] : [instructions.reason]),
+					hookGap,
+				]),
+		coverage("available-skills", getSkillInventoryGap(bundle)),
 		coverageFromFacets(
 			"package-configuration",
 			facets.filter((facet) => facet.kind === "package-context"),
@@ -534,6 +538,75 @@ function buildCoverage(
 		buildTranscriptCoverage(transcriptDelivery),
 	];
 }
+
+/**
+ * Context a hook adds is captured only where the agent persists it. Claude
+ * Code writes hook results into the transcript (hook_additional_context and
+ * other hook attachments, stop_hook_summary records), which is uploaded.
+ * Codex writes no hook output to its rollout or logs, so a Codex session
+ * with hooks configured (other than Opaline's own) may have had context that
+ * no capture can recover.
+ */
+/** Opaline's own hook commands: `opaline|rudel|<runtime>/cli.js hooks codex|claude`. */
+const OPALINE_HOOK_COMMAND =
+	/(?:^|[\s"'/])(?:opaline|rudel|cli\.js)["']?\s+hooks\s+(?:codex|claude)\b/u;
+
+function getHookOutputGap(
+	bundle: LocalContextBundle,
+	source: IngestSessionInput["source"],
+): string | null {
+	if (source !== "codex") return null;
+	const hooks = (bundle.manifest.userConfiguration?.codex.hooks ?? []).filter(
+		(hook) => !OPALINE_HOOK_COMMAND.test(hook.command ?? ""),
+	);
+	if (hooks.length === 0) return null;
+	const events = [...new Set(hooks.map((hook) => hook.event))].sort();
+	return `Codex does not persist hook output: ${hooks.length} configured hook(s) (${events.join(", ")}) may have added context that is not captured`;
+}
+
+/**
+ * Skills are discovered in the skill roots and in the repository. A missing
+ * skill root holds no skills, so only an unreadable root, a discovery walk that
+ * stopped early or skill definitions dropped by the manifest bound leave the
+ * inventory incomplete.
+ */
+function getSkillInventoryGap(bundle: LocalContextBundle): string | null {
+	const roots = bundle.manifest.roots.filter(
+		(root) => root.scope === "skills" || root.scope === "repository",
+	);
+	const outside = roots.filter((root) => root.status === "excluded");
+	if (outside.length > 0)
+		return `Skill roots outside the allowed boundary were not read: ${outside.map((root) => root.id).join(", ")}`;
+	const unreadable = roots.filter((root) => root.status === "inaccessible");
+	if (unreadable.length > 0)
+		return `Skill roots could not be read: ${unreadable.map((root) => root.id).join(", ")}`;
+	const truncated = roots.filter((root) => root.status === "limit-reached");
+	if (truncated.length > 0)
+		return `Skill discovery stopped at a capture limit in: ${truncated.map((root) => root.id).join(", ")}`;
+	const omitted =
+		bundle.manifest.coverage.truncated?.omittedSkillDefinitions ?? 0;
+	if (omitted > 0)
+		return `${omitted} skill definition(s) were omitted by the manifest bound`;
+	// Every skill definition is captured in full; one cut by a capacity limit
+	// leaves the skill inventory without its content.
+	const cut = bundle.manifest.entries.filter(
+		(entry) =>
+			entry.kind === "file" &&
+			entry.categories.includes("skill-definition") &&
+			entry.content.status === "omitted" &&
+			SKILL_CAPACITY_OMISSIONS.has(entry.content.reason),
+	).length;
+	if (cut > 0)
+		return `${cut} skill definition(s) exceeded the capture's content budget`;
+	return null;
+}
+
+const SKILL_CAPACITY_OMISSIONS: ReadonlySet<string> = new Set([
+	"blob-count-cap",
+	"file-content-cap",
+	"root-content-cap",
+	"total-content-cap",
+]);
 
 function buildGitStateCoverage(bundle: LocalContextBundle): CoverageItem {
 	const snapshot = bundle.manifest.git;
@@ -666,15 +739,13 @@ function getGitErrorCommand(error: string): string {
 function coverageFromFacets(
 	area: RepositoryEvidenceCoverageArea,
 	facets: readonly LocalContextBundle["manifest"]["contextIndex"]["facets"][number][],
-	overrideReason: string | null = null,
 ) {
 	const incomplete = facets.find((facet) => facet.coverage !== "complete");
 	return coverage(
 		area,
-		overrideReason ??
-			(incomplete
-				? `${incomplete.kind} coverage is ${incomplete.coverage}`
-				: null),
+		incomplete
+			? `${incomplete.kind} coverage is ${incomplete.coverage} in ${incomplete.rootId}`
+			: null,
 	);
 }
 

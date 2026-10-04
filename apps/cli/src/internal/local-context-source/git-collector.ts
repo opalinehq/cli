@@ -773,13 +773,23 @@ function summarizeGitFailure(result: GitCommandResult): string {
 	return sanitizeGitMetadata(sanitizeRemoteUrl(message)).slice(0, 500);
 }
 
+/**
+ * Whether an ancestor directory of `path` is listed. Looks up each ancestor
+ * instead of scanning the list, which holds every ignored file of the
+ * repository (tens of thousands in agent workspaces) and was scanned once per
+ * inventory entry.
+ */
 function isUnderListedDirectory(
 	path: string,
 	listed: ReadonlySet<string>,
 ): boolean {
-	for (const candidate of listed) {
-		const normalized = candidate.endsWith("/") ? candidate : `${candidate}/`;
-		if (path.startsWith(normalized)) return true;
+	for (
+		let separator = path.indexOf("/");
+		separator > 0;
+		separator = path.indexOf("/", separator + 1)
+	) {
+		const ancestor = path.slice(0, separator);
+		if (listed.has(ancestor) || listed.has(`${ancestor}/`)) return true;
 	}
 	return false;
 }

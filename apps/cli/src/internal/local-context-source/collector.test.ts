@@ -394,8 +394,18 @@ describe("local context collection from a real Git worktree", () => {
 				facet.rootId === "missing" && facet.kind === "agents-instructions",
 		);
 		assert(unavailableFacet);
-		expect(unavailableFacet.presence).toBe("unknown");
-		expect(unavailableFacet.coverage).toBe("unavailable");
+		// A missing root holds nothing: its facets are complete and absent, and
+		// the missing root is neither a coverage error nor a partial reason.
+		expect(unavailableFacet.presence).toBe("absent");
+		expect(unavailableFacet.coverage).toBe("complete");
+		expect(
+			bundle.manifest.coverage.errors.some(
+				(error) => error.rootId === "missing",
+			),
+		).toBe(false);
+		expect(bundle.manifest.coverage.partialReasons).not.toContain(
+			"missing-root:missing",
+		);
 
 		assert(bundle.manifest.git.status === "available");
 		const workingDiff = bundle.manifest.git.diffs.find(
@@ -430,7 +440,7 @@ describe("local context collection from a real Git worktree", () => {
 		{ observedSkillNames: ["demo"] },
 		{ observedSkillNames: ["DEMO"] },
 	])(
-		"session evidence only materializes skills observed by exact name (%j)",
+		"session evidence materializes every skill definition and nothing else outside instructions (%j)",
 		async ({ observedSkillNames }) => {
 			const fixture = await createRepositoryFixture();
 			const options = {
@@ -454,27 +464,19 @@ describe("local context collection from a real Git worktree", () => {
 			const unrelated = getFile(bundle, "repository", "README.md");
 
 			expect(agents.content.status).toBe("available");
+			// Every available skill's definition is captured, observed or not.
 			for (const definition of [
 				skill,
 				getFile(bundle, "user-skills", "demo/SKILL.md"),
+				getFile(bundle, "user-skills", "cached-plugin/skill/SKILL.md"),
 			]) {
-				if (observedSkillNames?.includes("demo")) {
-					expect(definition.content.status).toBe("available");
-				} else {
-					expect(definition.content).toMatchObject({
-						status: "omitted",
-						reason: "metadata-only",
-					});
-				}
+				expect(definition.content.status).toBe("available");
 				expect(definition.hash).toMatchObject({
 					status: "available",
 					algorithm: "sha256",
-					scope: observedSkillNames?.includes("demo") ? "stored" : "source",
+					scope: "stored",
 				});
 			}
-			expect(
-				getFile(bundle, "user-skills", "cached-plugin/skill/SKILL.md").content,
-			).toMatchObject({ status: "omitted", reason: "metadata-only" });
 			expect(packageContext.content).toMatchObject({
 				status: "omitted",
 				reason: "metadata-only",

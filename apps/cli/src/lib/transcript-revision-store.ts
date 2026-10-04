@@ -20,7 +20,10 @@ import { hasValidTranscriptRevisionIntegrity } from "./transcript-revision.js";
 const STORE_VERSION = 2;
 const LOCK_POLL_MS = 25;
 const LOCK_STALE_MS = 30_000;
-const LOCK_TIMEOUT_MS = 1_000;
+// Concurrent hooks of one session (start, end, checkpoints) contend for this
+// lock while capturing. A capture that cannot read the revision is lost, so
+// waiting longer than a loaded machine's file I/O is worth it.
+const LOCK_TIMEOUT_MS = 10_000;
 
 export interface TranscriptRevisionDeliveryScope {
 	readonly endpoint: string;
@@ -173,13 +176,37 @@ async function quarantineTranscriptRevision(path: string): Promise<void> {
 	}
 }
 
+/**
+ * Run `operation` while holding a cross-process directory lock at `lockPath`.
+ * Stale locks of crashed owners are recovered; waiting is bounded.
+ */
+export async function withDirectoryLock<TResult>(
+	lockPath: string,
+	timeoutMs: number,
+	operation: () => Promise<TResult>,
+): Promise<TResult> {
+	const releaseLock = await acquireRevisionLock(
+		lockPath,
+		timeoutMs,
+		"Timed out waiting for another Opaline process to finish.",
+	);
+	try {
+		return await operation();
+	} finally {
+		await releaseLock();
+	}
+}
+
 async function acquireRevisionLock(
 	lockPath: string,
+	timeoutMs = LOCK_TIMEOUT_MS,
+	timeoutMessage = "Timed out waiting to advance the transcript revision.",
 ): Promise<() => Promise<void>> {
 	await mkdir(dirname(lockPath), { mode: 0o700, recursive: true });
 	const ownerPath = join(lockPath, "owner");
 	const ownerToken = `${process.pid}:${randomUUID()}`;
-	const startedAt = Date.now();
+	// Monotonic elapsed time: hooks under test may freeze Date.now().
+	const startedAt = performance.now();
 	while (true) {
 		let createdLock = false;
 		try {
@@ -212,11 +239,11 @@ async function acquireRevisionLock(
 			}
 			if (!isErrorCode(error, "EEXIST")) throw error;
 			if (await recoverStaleRevisionLock(lockPath)) continue;
-			if (Date.now() - startedAt >= LOCK_TIMEOUT_MS) break;
+			if (performance.now() - startedAt >= timeoutMs) break;
 			await new Promise((resolve) => setTimeout(resolve, LOCK_POLL_MS));
 		}
 	}
-	throw new Error("Timed out waiting to advance the transcript revision.");
+	throw new Error(timeoutMessage);
 }
 
 async function recoverStaleRevisionLock(lockPath: string): Promise<boolean> {

@@ -5,6 +5,7 @@ import type { ContractRouterClient } from "@orpc/contract";
 import {
 	type contract,
 	INGEST_AGGREGATE_CONTENT_MAX_BYTES,
+	INGEST_DIRECT_CONTENT_MAX_BYTES,
 	INGEST_LIMIT_REASONS,
 	type IngestSessionInput,
 	parseSafeApiEndpoint,
@@ -23,7 +24,6 @@ import {
 	filterSessionTextFields,
 	getRedactionBudgetAnomaly,
 	getRedactionCount,
-	MAX_REDACTION_RATIO,
 	mergeRedactionCounts,
 	type RedactionBudgetAnomaly,
 	type RedactionCounts,
@@ -31,6 +31,7 @@ import {
 	SecretFilterJsonIntegrityError,
 	type SessionTextFilterResult,
 } from "../internal/secret-filter/index.js";
+import { MAX_RAW_TRANSCRIPT_BYTES } from "./filtered-upload-staging.js";
 import { hasR2IngestUpgradeHint } from "./r2-ingest-contract.js";
 import type { R2MultipartProgress } from "./r2-multipart-upload.js";
 import {
@@ -41,8 +42,13 @@ import {
 import {
 	formatR2UploadFlowError,
 	isR2InitUnsupported,
+	R2IngestInitError,
+	R2IngestPendingError,
+	type TranscriptSlimming,
 	uploadSessionViaR2,
 } from "./r2-upload-flow.js";
+import { slimTranscriptText } from "./transcript-slim.js";
+import { supportsTranscriptSlimming } from "./transcript-slimming-capability.js";
 import type { UploadResult, UploadTransferProgress } from "./types.js";
 import { describeUploadEndpointRejection } from "./upload-endpoint.js";
 
@@ -52,12 +58,16 @@ export interface UploadConfig {
 	allowInsecureEndpoint: boolean;
 	authType?: "bearer" | "api-key";
 	maxAggregateBytes?: number;
+	/** Raw source size above which a session is skipped unread. */
+	maxRawSourceBytes?: number;
 	onRetry?: (attempt: number, maxAttempts: number, error: string) => void;
 	onProgress?: (progress: R2MultipartProgress) => void;
 	onTransferProgress?: (progress: UploadTransferProgress) => void;
 	signal?: AbortSignal;
 	r2MultipartBaseDelayMs?: number;
 	r2StatusPollIntervalMs?: number;
+	/** Status polls after an R2 commit before the job is recorded as pending. */
+	r2StatusMaxPolls?: number;
 }
 
 const RETRYABLE_STATUS_CODES = new Set([408, 502, 503, 504]);
@@ -95,9 +105,16 @@ type LegacyUploadPreparation =
 	| {
 			readonly actualBytes: number;
 			readonly maxBytes: number;
+			readonly status: "direct-too-large";
+	  }
+	| {
+			readonly actualBytes: number;
+			readonly maxBytes: number;
+			readonly slimming: TranscriptSlimming;
 			readonly status: "too-large";
 	  }
 	| {
+			readonly aggregateBytes: number;
 			readonly filteredRequest: IngestSessionInput;
 			readonly filteredText: SessionTextFilterResult<UploadSubagent>;
 			readonly status: "ready";
@@ -345,9 +362,26 @@ export async function uploadSession(
 	request: UploadSessionRequest,
 	config: UploadConfig,
 ): Promise<UploadResult> {
+	const measured: { uploadBytes: number | undefined } = {
+		uploadBytes: undefined,
+	};
+	const result = await uploadSessionMeasured(request, config, measured);
+	// Only uploads that will be tried again need the size for ordering.
+	if (
+		result.success ||
+		result.retryable === false ||
+		measured.uploadBytes === undefined
+	)
+		return result;
+	return { ...result, uploadBytes: result.uploadBytes ?? measured.uploadBytes };
+}
+
+async function uploadSessionMeasured(
+	request: UploadSessionRequest,
+	config: UploadConfig,
+	measured: { uploadBytes: number | undefined },
+): Promise<UploadResult> {
 	config.signal?.throwIfAborted();
-	const maxAggregateBytes =
-		config.maxAggregateBytes ?? INGEST_AGGREGATE_CONTENT_MAX_BYTES;
 	const endpoint = parseSafeApiEndpoint(config.endpoint, {
 		allowPlaintext: config.allowInsecureEndpoint,
 	});
@@ -360,17 +394,32 @@ export async function uploadSession(
 			retryable: false,
 		};
 	}
+	// Slimmed transcripts go only to servers that say they accept them:
+	// older servers reject a re-upload that shrinks a stored session, and keep
+	// the 128 MiB limit. The server is asked only when slimming changes the
+	// transcript.
+	const canSlim = () =>
+		supportsTranscriptSlimming(
+			new URL(endpoint.url),
+			config.authType ?? "bearer",
+			config.token,
+		);
+	const maxAggregateBytesFor = (slimming: TranscriptSlimming) =>
+		config.maxAggregateBytes ??
+		(slimming === "unsupported"
+			? INGEST_DIRECT_CONTENT_MAX_BYTES
+			: INGEST_AGGREGATE_CONTENT_MAX_BYTES);
 
 	// Stat file-backed transcripts before reading, filtering or staging them.
+	// The per-session limit applies to the slimmed, filtered upload; only a
+	// raw source beyond any plausible slimmed fit is skipped unread.
 	const sourceBytes = isFileBackedUploadRequest(request)
 		? await getFileBackedAggregateBytes(request)
 		: getUploadAggregateBytes(request);
-	const sizeFailure =
-		sourceBytes > LEGACY_MATERIALIZATION_MAX_BYTES &&
-		(isFileBackedUploadRequest(request) ||
-			sourceBytes * (1 - MAX_REDACTION_RATIO) > maxAggregateBytes)
-			? getUploadSizeFailure(sourceBytes, maxAggregateBytes)
-			: undefined;
+	const sizeFailure = getRawTranscriptSizeFailure(
+		sourceBytes,
+		config.maxRawSourceBytes,
+	);
 	if (sizeFailure) return sizeFailure;
 	config.signal?.throwIfAborted();
 
@@ -385,23 +434,29 @@ export async function uploadSession(
 	const client: ContractRouterClient<typeof contract> = createORPCClient(link);
 	const authType = config.authType ?? "bearer";
 	const endpointUrl = new URL(endpoint.url);
+	// Sources the direct request cannot carry probe R2 even without a cached
+	// capability; an unsupported server falls back to the bounded direct path.
 	const shouldProbeR2 =
 		authType === "api-key" &&
 		(hasAdvertisedR2UploadCapability(endpointUrl, authType, config.token) ||
-			(isFileBackedUploadRequest(request) &&
-				sourceBytes > LEGACY_MATERIALIZATION_MAX_BYTES));
+			sourceBytes > LEGACY_MATERIALIZATION_MAX_BYTES);
 	if (authType === "api-key" && shouldProbeR2) {
 		try {
 			const r2Result = await uploadSessionViaR2(request, {
 				authType,
 				endpoint: endpointUrl,
-				maxAggregateBytes,
+				maxAggregateBytes: maxAggregateBytesFor,
+				canSlim,
 				multipartBaseDelayMs: config.r2MultipartBaseDelayMs,
 				onProgress: config.onProgress,
 				onTransferProgress: config.onTransferProgress,
 				onRetry: config.onRetry,
 				statusPollIntervalMs: config.r2StatusPollIntervalMs,
+				statusMaxPolls: config.r2StatusMaxPolls,
 				token: config.token,
+				onStaged: (aggregateBytes) => {
+					measured.uploadBytes = aggregateBytes;
+				},
 			});
 			if (r2Result.status === "redaction-budget") {
 				return {
@@ -420,14 +475,23 @@ export async function uploadSession(
 					totalBytes: r2Result.actualBytes,
 					maxBytes: r2Result.maxBytes,
 					success: false,
-					error: formatTranscriptTooLargeError(
+					error: formatSessionTooLargeError(
 						r2Result.actualBytes,
 						r2Result.maxBytes,
+						r2Result.slimming,
 					),
 					attempts: 0,
-					retryable: false,
+					// Unslimmed for a server without slimming: it may fit once
+					// the server accepts slimmed transcripts, so a retry can work.
+					retryable: r2Result.slimming === "unsupported",
 				};
 			}
+			const analysisFailure = getAnalysisLinkFailure(
+				request,
+				r2Result.result.analysisId,
+				r2Result.attempts,
+			);
+			if (analysisFailure) return analysisFailure;
 			return {
 				success: true,
 				status: 200,
@@ -439,6 +503,23 @@ export async function uploadSession(
 		} catch (error) {
 			const filterFailure = getSecretFilterUploadFailure(error);
 			if (filterFailure) return filterFailure;
+			if (error instanceof R2IngestPendingError) {
+				return {
+					success: false,
+					error: error.message,
+					attempts: MAX_ATTEMPTS,
+					pendingJobId: error.jobId,
+					retryable: true,
+				};
+			}
+			const analysisRejection = getAnalysisInitRejection(request, error);
+			if (analysisRejection) return analysisRejection;
+			const organizationFailure = getOrganizationChoiceFailure(
+				error instanceof R2IngestInitError ? error.causeValue : error,
+				request,
+				1,
+			);
+			if (organizationFailure) return organizationFailure;
 			if (isR2InitUnsupported(error)) {
 				await forgetR2UploadCapability(endpointUrl, authType, config.token);
 			} else {
@@ -455,7 +536,7 @@ export async function uploadSession(
 
 	let legacy: LegacyUploadPreparation;
 	try {
-		legacy = await prepareLegacyUpload(request, maxAggregateBytes);
+		legacy = await prepareLegacyUpload(request, maxAggregateBytesFor, canSlim);
 	} catch (error) {
 		const filterFailure = getSecretFilterUploadFailure(error);
 		if (filterFailure) return filterFailure;
@@ -473,7 +554,16 @@ export async function uploadSession(
 	if (legacy.status === "empty-main") {
 		return getEmptyMainUploadFailure();
 	}
-	if (legacy.status === "legacy-too-large") {
+	// Only slimmed, filtered sizes count; legacy-too-large is the raw size.
+	if (legacy.status === "ready") measured.uploadBytes = legacy.aggregateBytes;
+	else if (legacy.status !== "legacy-too-large")
+		measured.uploadBytes = legacy.actualBytes;
+	if (
+		legacy.status === "legacy-too-large" ||
+		legacy.status === "direct-too-large"
+	) {
+		// Direct R2 upload (API-key login on a server that supports it) can
+		// carry this session, so a later retry can still succeed.
 		return {
 			totalBytes: legacy.actualBytes,
 			maxBytes: legacy.maxBytes,
@@ -481,9 +571,10 @@ export async function uploadSession(
 			error: formatLegacyServerTooLargeError(
 				legacy.actualBytes,
 				legacy.maxBytes,
+				authType,
 			),
 			attempts: 0,
-			retryable: false,
+			retryable: true,
 		};
 	}
 	if (legacy.status === "too-large") {
@@ -491,9 +582,13 @@ export async function uploadSession(
 			totalBytes: legacy.actualBytes,
 			maxBytes: legacy.maxBytes,
 			success: false,
-			error: formatTranscriptTooLargeError(legacy.actualBytes, legacy.maxBytes),
+			error: formatSessionTooLargeError(
+				legacy.actualBytes,
+				legacy.maxBytes,
+				legacy.slimming,
+			),
 			attempts: 0,
-			retryable: false,
+			retryable: legacy.slimming === "unsupported",
 		};
 	}
 	const { filteredRequest, filteredText } = legacy;
@@ -528,6 +623,12 @@ export async function uploadSession(
 			if (authType === "api-key" && hasR2IngestUpgradeHint(response)) {
 				await rememberR2UploadCapability(endpointUrl, authType, config.token);
 			}
+			const analysisFailure = getAnalysisLinkFailure(
+				request,
+				response.analysisId,
+				attempt,
+			);
+			if (analysisFailure) return analysisFailure;
 			return {
 				success: true,
 				status: 200,
@@ -541,6 +642,12 @@ export async function uploadSession(
 				usageChecksum: response.usageChecksum,
 			};
 		} catch (error) {
+			const organizationFailure = getOrganizationChoiceFailure(
+				error,
+				request,
+				attempt,
+			);
+			if (organizationFailure) return organizationFailure;
 			if (
 				error instanceof ORPCError &&
 				error.status === 400 &&
@@ -577,6 +684,20 @@ export async function uploadSession(
 					error: formatUploadError(error),
 					attempts: attempt,
 					failureKind: "json-integrity",
+					retryable: false,
+				};
+			}
+
+			if (
+				filteredRequest.analysisId !== undefined &&
+				error instanceof ORPCError &&
+				(error.status === 404 || error.status === 412)
+			) {
+				return {
+					success: false,
+					error: `${error.status} ${error.message}`,
+					attempts: attempt,
+					analysisRejected: true,
 					retryable: false,
 				};
 			}
@@ -619,7 +740,8 @@ export async function uploadSession(
 
 async function prepareLegacyUpload(
 	request: UploadSessionRequest,
-	maxAggregateBytes: number,
+	maxAggregateBytesFor: (slimming: TranscriptSlimming) => number,
+	canSlim: () => Promise<boolean>,
 ): Promise<LegacyUploadPreparation> {
 	if (isFileBackedUploadRequest(request)) {
 		const sourceBytes = await getFileBackedAggregateBytes(request);
@@ -632,6 +754,8 @@ async function prepareLegacyUpload(
 		}
 	}
 	const materialized = await materializeLegacyUploadRequest(request);
+	// Secret filter first, then slimming (as 0.11 and the API order them), so
+	// every CLI version derives the same bytes from one transcript.
 	const inputBytes = getUploadAggregateBytes(materialized);
 	const filteredText = filterSessionTextFields({
 		content: materialized.content,
@@ -649,7 +773,7 @@ async function prepareLegacyUpload(
 	const nonEmptySubagents = filteredText.subagents?.filter(
 		(subagent) => Buffer.byteLength(subagent.content, "utf8") > 0,
 	);
-	const filteredRequest: IngestSessionInput = {
+	const filtered: IngestSessionInput = {
 		...materialized,
 		content: filteredText.content,
 		subagents:
@@ -658,15 +782,33 @@ async function prepareLegacyUpload(
 				: undefined,
 		filter_version: FILTER_VERSION,
 	};
+	const candidate = slimUploadRequest(filtered);
+	// Slimming that changed nothing needs no negotiation.
+	const slimming: TranscriptSlimming =
+		getUploadAggregateBytes(candidate) >= getUploadAggregateBytes(filtered)
+			? "unchanged"
+			: (await canSlim())
+				? "applied"
+				: "unsupported";
+	const filteredRequest = slimming === "applied" ? candidate : filtered;
+	const maxAggregateBytes = maxAggregateBytesFor(slimming);
 	const aggregateBytes = getUploadAggregateBytes(filteredRequest);
 	if (aggregateBytes > maxAggregateBytes) {
 		return {
 			actualBytes: aggregateBytes,
 			maxBytes: maxAggregateBytes,
+			slimming,
 			status: "too-large",
 		};
 	}
-	return { filteredRequest, filteredText, status: "ready" };
+	if (aggregateBytes > INGEST_DIRECT_CONTENT_MAX_BYTES) {
+		return {
+			actualBytes: aggregateBytes,
+			maxBytes: INGEST_DIRECT_CONTENT_MAX_BYTES,
+			status: "direct-too-large",
+		};
+	}
+	return { aggregateBytes, filteredRequest, filteredText, status: "ready" };
 }
 
 async function getFileBackedAggregateBytes(
@@ -679,16 +821,16 @@ async function getFileBackedAggregateBytes(
 	return files.reduce((total, file) => total + file.size, 0);
 }
 
-export function getUploadSizeFailure(
+export function getRawTranscriptSizeFailure(
 	totalBytes: number,
-	maxBytes = INGEST_AGGREGATE_CONTENT_MAX_BYTES,
+	maxBytes = MAX_RAW_TRANSCRIPT_BYTES,
 ): UploadResult | undefined {
 	if (totalBytes <= maxBytes) return undefined;
 	return {
 		success: false,
 		totalBytes,
 		maxBytes,
-		error: `Skipped: session files total ${formatMebibytes(totalBytes)} MiB, above the ${formatMebibytes(maxBytes)} MiB per-session limit. No upload attempted.`,
+		error: `Skipped: session files total ${formatMebibytes(totalBytes)} MiB, above the ${formatMebibytes(maxBytes)} MiB raw transcript limit. No upload attempted.`,
 		attempts: 0,
 		retryable: false,
 	};
@@ -713,10 +855,101 @@ async function materializeLegacyUploadRequest(
 	};
 }
 
+function slimUploadRequest(request: IngestSessionInput): IngestSessionInput {
+	return {
+		...request,
+		content: slimTranscriptText(request.content),
+		subagents: request.subagents?.map((subagent) => ({
+			...subagent,
+			content: slimTranscriptText(subagent.content),
+		})),
+	};
+}
+
 function isFileBackedUploadRequest(
 	request: UploadSessionRequest,
 ): request is FileBackedUploadRequest {
 	return "kind" in request && request.kind === "file";
+}
+
+export const ANALYSIS_UPLOAD_UNSUPPORTED_MESSAGE =
+	"This Opaline server does not support analysis uploads yet. Update the Opaline server or CLI (`opaline update`), or try again later.";
+
+/**
+ * An analysis upload only counts when the server confirms the link. A server
+ * that ignores `analysisId` stores the session in the default workspace, so a
+ * missing echo is reported instead of treated as success.
+ */
+function getAnalysisLinkFailure(
+	request: UploadSessionRequest,
+	echoedAnalysisId: string | undefined,
+	attempts: number,
+): UploadResult | null {
+	const analysisId = getRequestMetadata(request).analysisId;
+	if (analysisId === undefined || echoedAnalysisId === analysisId) return null;
+	return {
+		success: false,
+		error: `The upload was stored without its analysis link. ${ANALYSIS_UPLOAD_UNSUPPORTED_MESSAGE}`,
+		attempts,
+		analysisLinkMissing: true,
+		retryable: false,
+	};
+}
+
+// A rejected analysis id (404 not found or not visible, 412 analysis log off)
+// must reach the caller. Servers that link analyses always support R2 init, so
+// such an init 404 is never treated as "R2 unsupported" for these uploads.
+/**
+ * The server could not pick a workspace for an upload without one (the
+ * account belongs to several and none was chosen). That is fixable by the
+ * user, so the upload stays retryable with the remedy.
+ */
+function getOrganizationChoiceFailure(
+	error: unknown,
+	request: UploadSessionRequest,
+	attempts: number,
+): UploadResult | null {
+	if (
+		!(error instanceof ORPCError) ||
+		error.status !== 400 ||
+		!/Choose an organization/iu.test(error.message)
+	)
+		return null;
+	const projectPath = getRequestMetadata(request).projectPath;
+	return {
+		success: false,
+		error: `Opaline could not choose a workspace for this session: your account belongs to more than one. Run \`opaline set-org\` in ${projectPath} (or pass --org), then \`opaline upload --retry\`.`,
+		attempts,
+		needsOrganization: true,
+		retryable: true,
+	};
+}
+
+function getAnalysisInitRejection(
+	request: UploadSessionRequest,
+	error: unknown,
+): UploadResult | null {
+	if (getRequestMetadata(request).analysisId === undefined) return null;
+	if (!(error instanceof R2IngestInitError)) return null;
+	const cause = error.causeValue;
+	if (
+		!(cause instanceof ORPCError) ||
+		(cause.status !== 404 && cause.status !== 412)
+	)
+		return null;
+	return {
+		success: false,
+		error: `${cause.status} ${cause.message}`,
+		attempts: 1,
+		analysisRejected: true,
+		retryable: false,
+	};
+}
+
+function getRequestMetadata(
+	request: UploadSessionRequest,
+): Omit<IngestSessionInput, "content" | "subagents"> {
+	return isFileBackedUploadRequest(request) ? request.metadata : request;
 }
 
 function getEmptyMainUploadFailure(): UploadResult {
@@ -764,6 +997,7 @@ export function formatRedactionBudgetError(
 interface IngestSessionResponse {
 	readonly success: true;
 	readonly sessionId: string;
+	readonly analysisId?: string;
 	readonly upgradeHint?: { readonly protocol: "r2_multipart_v1" };
 	readonly redacted?: RedactionCounts;
 	readonly redactedBytes?: number;
@@ -783,6 +1017,9 @@ function isIngestSessionResponse(
 		return false;
 	}
 	if (value.redacted !== undefined && !isRecord(value.redacted)) {
+		return false;
+	}
+	if (value.analysisId !== undefined && typeof value.analysisId !== "string") {
 		return false;
 	}
 	if (
@@ -811,6 +1048,16 @@ function getUploadAggregateBytes(request: IngestSessionInput): number {
 	);
 }
 
+function formatSessionTooLargeError(
+	actualBytes: number,
+	maxBytes: number,
+	slimming: TranscriptSlimming,
+): string {
+	return slimming !== "unsupported"
+		? formatTranscriptTooLargeError(actualBytes, maxBytes)
+		: `Session transcript payload is ${formatMebibytes(actualBytes)} MiB, above the ${formatMebibytes(maxBytes)} MiB limit of this Opaline server, which does not accept slimmed transcripts yet. It stays queued; retry with \`opaline upload --retry\` after the server is updated.`;
+}
+
 function formatTranscriptTooLargeError(
 	actualBytes: number | null,
 	maxBytes: number | null,
@@ -827,8 +1074,13 @@ function formatTranscriptTooLargeError(
 function formatLegacyServerTooLargeError(
 	actualBytes: number,
 	maxBytes: number,
+	authType: "api-key" | "bearer",
 ): string {
-	return `Transcript too large for this server: the ${formatMebibytes(actualBytes)} MiB transcript/subagent payload exceeds the CLI's ${formatMebibytes(maxBytes)} MiB safe limit for legacy uploads. Upgrade the Opaline server to one that supports direct R2 uploads, or upload a smaller transcript.`;
+	const remedy =
+		authType === "api-key"
+			? "Upgrade the Opaline server to one that supports direct R2 uploads"
+			: "Run `opaline login` to upload with an API key over direct R2 uploads";
+	return `Transcript too large for this server: the ${formatMebibytes(actualBytes)} MiB transcript/subagent payload exceeds the CLI's ${formatMebibytes(maxBytes)} MiB safe limit for legacy uploads. ${remedy}, then retry with: opaline upload --retry`;
 }
 
 function formatMebibytes(bytes: number): string {

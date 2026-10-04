@@ -9,10 +9,8 @@ import {
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import pMap from "p-map";
-import {
-	INGEST_AGGREGATE_CONTENT_MAX_BYTES,
-	INGEST_MAX_SUBAGENT_COUNT,
-} from "../../../../contracts/ingest.js";
+import { INGEST_MAX_SUBAGENT_COUNT } from "../../../../contracts/ingest.js";
+import { MAX_RAW_TRANSCRIPT_BYTES } from "../../../../lib/filtered-upload-staging.js";
 import { scanBoundedJsonlFile } from "../../bounded-jsonl-scan.js";
 import { MissingTranscriptTimestampError } from "../../errors.js";
 import type {
@@ -520,9 +518,10 @@ export async function discoverClaudeSubagentFiles(
 			reasons.add("A subagent file could not be safely resolved");
 			continue;
 		}
+		// Raw bytes bound the read; the ingest limit applies after slimming.
 		if (
-			fileBytes > INGEST_AGGREGATE_CONTENT_MAX_BYTES ||
-			inspectedBytes + fileBytes > INGEST_AGGREGATE_CONTENT_MAX_BYTES
+			fileBytes > MAX_RAW_TRANSCRIPT_BYTES ||
+			inspectedBytes + fileBytes > MAX_RAW_TRANSCRIPT_BYTES
 		) {
 			omittedCount += 1;
 			reasons.add("Subagent byte limit reached");

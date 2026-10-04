@@ -10,7 +10,10 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { IngestSessionInput } from "../contracts/index.js";
+import {
+	INGEST_DIRECT_CONTENT_MAX_BYTES,
+	type IngestSessionInput,
+} from "../contracts/index.js";
 import type { FileBackedUploadRequest } from "../internal/agent-adapters/index.js";
 import {
 	R2_INGEST_PART_SIZE_BYTES,
@@ -794,6 +797,388 @@ describe("capability-gated R2 upload flow", () => {
 		).toBe(false);
 	}, 120_000);
 
+	test.each([{ capability: true }, { capability: false }])(
+		"slims a raw-oversized transcript under the limit only for a server that accepts it (%j)",
+		async ({ capability }) => {
+			await isolateCapabilityCache();
+			let authStatusCalls = 0;
+			const directory = await mkdtemp(join(tmpdir(), "opaline-r2-slim-"));
+			temporaryDirectories.push(directory);
+			const transcriptPath = join(directory, "rollout.jsonl");
+			const screenshot = Buffer.alloc(256 * 1024, 9).toString("base64");
+			const output = "o".repeat(64 * 1024);
+			const lines = [
+				JSON.stringify({
+					timestamp: "2026-08-25T12:00:00.000Z",
+					type: "event_msg",
+					payload: { type: "user_message", message: "take a screenshot" },
+				}),
+			];
+			for (let index = 0; index < 4; index += 1) {
+				lines.push(
+					JSON.stringify({
+						timestamp: "2026-08-25T12:00:01.000Z",
+						type: "response_item",
+						payload: {
+							type: "function_call_output",
+							call_id: `call_${index}`,
+							output: [
+								{
+									type: "input_image",
+									image_url: `data:image/png;base64,${screenshot}`,
+								},
+							],
+						},
+					}),
+					JSON.stringify({
+						timestamp: "2026-08-25T12:00:02.000Z",
+						type: "event_msg",
+						payload: {
+							type: "item_completed",
+							item: {
+								type: "CommandExecution",
+								stdout: output,
+								stderr: "",
+								aggregated_output: output,
+								formatted_output: output,
+							},
+						},
+					}),
+				);
+			}
+			await writeFile(transcriptPath, `${lines.join("\n")}\n`);
+			const rawBytes = (await stat(transcriptPath)).size;
+			const maxAggregateBytes = 512 * 1024;
+			let uploadedBody = "";
+			let initByteLength = 0;
+			let server: FetchStub;
+			server = serveFetchStub({
+				hostname: "127.0.0.1",
+				port: 0,
+				async fetch(request) {
+					const pathname = new URL(request.url).pathname;
+					if (pathname === "/r2/part/1") {
+						uploadedBody = await request.text();
+						return new Response(null, { headers: { etag: '"etag-1"' } });
+					}
+					if (pathname === "/rpc/cli/authStatus") {
+						authStatusCalls += 1;
+						return rpcResponse({
+							id: "user-1",
+							email: "user@example.invalid",
+							name: "User",
+							...(capability
+								? { capabilities: { transcriptSlimming: true } }
+								: {}),
+						});
+					}
+					const input = await readRpcInput(request);
+					if (pathname === "/rpc/ingest/init") {
+						const main = getMainObject(input);
+						initByteLength = getRequiredNumber(main, "byteLength");
+						return rpcResponse({
+							expiresAt: "2026-08-25T12:15:00.000Z",
+							jobId: JOB_ID,
+							objects: [
+								{
+									byteLength: initByteLength,
+									kind: "main",
+									objectKey: `ingest/${JOB_ID}/main.jsonl`,
+									parts: [
+										{
+											byteLength: initByteLength,
+											headers: {
+												"Content-Length": initByteLength.toString(),
+											},
+											partNumber: 1,
+											uploadUrl: `http://127.0.0.1:${server.port}/r2/part/1`,
+										},
+									],
+									sha256: getRequiredString(main, "sha256"),
+									uploadId: "upload-1",
+								},
+							],
+							partSizeBytes: 8 * 1024 * 1024,
+							protocol: "r2_multipart_v1",
+						});
+					}
+					if (pathname === "/rpc/ingest/commit") {
+						return rpcResponse({
+							jobId: JOB_ID,
+							protocol: "r2_multipart_v1",
+							result: createSuccessResult("slimmed-rollout"),
+							status: "completed",
+						});
+					}
+					if (pathname === "/rpc/ingest/status") {
+						return rpcResponse({
+							attempts: 1,
+							availableAt: "2026-08-25T12:00:00.000Z",
+							error: null,
+							jobId: JOB_ID,
+							leaseExpiresAt: null,
+							protocol: "r2_multipart_v1",
+							result: createSuccessResult("slimmed-rollout"),
+							status: "completed",
+							updatedAt: "2026-08-25T12:00:01.000Z",
+						});
+					}
+					return new Response("not found", { status: 404 });
+				},
+			});
+			activeServers.push(server);
+			const config = { ...createUploadConfig(server), maxAggregateBytes };
+			await rememberR2UploadCapability(
+				new URL(config.endpoint),
+				"api-key",
+				TOKEN,
+			);
+
+			const result = await uploadSession(
+				createFileRequest("slimmed-rollout", transcriptPath),
+				config,
+			);
+
+			expect(rawBytes).toBeGreaterThan(maxAggregateBytes);
+			expect(authStatusCalls).toBe(1);
+			if (!capability) {
+				// An older server compares re-uploads with the stored session, so it
+				// gets the unslimmed transcript, as 0.11 sent it: here too large,
+				// and retryable for when the server accepts slimming.
+				expect(result).toMatchObject({ success: false, retryable: true });
+				expect(result.error).toContain("does not accept slimmed transcripts");
+				expect(uploadedBody).toBe("");
+				return;
+			}
+			expect(result.success).toBe(true);
+			expect(initByteLength).toBe(Buffer.byteLength(uploadedBody));
+			expect(initByteLength).toBeLessThan(maxAggregateBytes);
+			expect(uploadedBody).not.toContain(screenshot);
+			expect(uploadedBody.split("opaline-image-omitted:v1;")).toHaveLength(5);
+			expect(uploadedBody.split(output)).toHaveLength(5);
+			// Positive answers are cached: the next upload does not ask again.
+			await uploadSession(
+				createFileRequest("slimmed-rollout", transcriptPath),
+				config,
+			);
+			expect(authStatusCalls).toBe(1);
+		},
+	);
+
+	test("sends an unslimmed transcript byte for byte like 0.11 when the server lacks the capability", async () => {
+		await isolateCapabilityCache();
+		const screenshot = Buffer.alloc(4 * 1024, 3).toString("base64");
+		const content = `${JSON.stringify({
+			timestamp: "2026-08-25T12:00:01.000Z",
+			type: "response_item",
+			payload: {
+				type: "function_call_output",
+				call_id: "call_0",
+				output: [
+					{
+						type: "input_image",
+						image_url: `data:image/png;base64,${screenshot}`,
+					},
+				],
+			},
+		})}\n`;
+		const bodies: string[] = [];
+		const server = serveFetchStub({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				const pathname = new URL(request.url).pathname;
+				if (pathname === "/rpc/cli/authStatus")
+					return rpcResponse({
+						id: "user-1",
+						email: "user@example.invalid",
+						name: "User",
+					});
+				bodies.push(await request.text());
+				return rpcResponse({ success: true, sessionId: "old-server" });
+			},
+		});
+		activeServers.push(server);
+
+		const result = await uploadSession(
+			{ source: "codex", sessionId: "old-server", projectPath: "/t", content },
+			{ ...createUploadConfig(server), authType: "bearer" },
+		);
+
+		expect(result.success).toBe(true);
+		expect(bodies).toHaveLength(1);
+		expect(JSON.parse(bodies[0] ?? "").json.content).toBe(content);
+	});
+
+	test.each([
+		{
+			status: 413,
+			code: "PAYLOAD_TOO_LARGE",
+			message: "too large",
+			data: undefined,
+		},
+		// The shape oRPC gives a failed input validation of R2IngestInitInput.
+		{
+			status: 400,
+			code: "BAD_REQUEST",
+			message: "Input validation failed",
+			data: {
+				issues: [
+					{
+						message: "Number must be less than or equal to 134217728",
+						path: ["objects", 0, "byteLength"],
+					},
+				],
+			},
+		},
+		{
+			status: 400,
+			code: "BAD_REQUEST",
+			message: "Input validation failed",
+			data: {
+				issues: [
+					{
+						message: "Aggregate transcript content exceeds 134217728 bytes",
+						path: [{ key: "objects" }],
+					},
+				],
+			},
+		},
+	])(
+		"keeps a 128-256 MiB session retryable when an older server rejects its size at init ($status $message)",
+		async ({ status, code, message, data }) => {
+			await isolateCapabilityCache();
+			const directory = await mkdtemp(join(tmpdir(), "opaline-r2-old-limit-"));
+			temporaryDirectories.push(directory);
+			const transcriptPath = join(directory, "large.jsonl");
+			const rawBytes = await writeCodexTranscriptAtLeast(
+				transcriptPath,
+				"clean",
+				INGEST_DIRECT_CONTENT_MAX_BYTES,
+			);
+			const requestPaths: string[] = [];
+			const server = serveFetchStub({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch(request) {
+					requestPaths.push(new URL(request.url).pathname);
+					return Response.json(
+						{ json: { code, defined: false, message, status, data } },
+						{ status },
+					);
+				},
+			});
+			activeServers.push(server);
+			const config = createUploadConfig(server);
+			await rememberR2UploadCapability(
+				new URL(config.endpoint),
+				"api-key",
+				TOKEN,
+			);
+
+			const result = await uploadSession(
+				createFileRequest("old-server-limit", transcriptPath),
+				config,
+			);
+
+			expect(rawBytes).toBeGreaterThan(INGEST_DIRECT_CONTENT_MAX_BYTES);
+			expect(result).toMatchObject({ success: false, retryable: true });
+			expect(result.error).toContain("does not accept sessions this large yet");
+			expect(requestPaths).toEqual(["/rpc/ingest/init"]);
+			// The slimmed size is kept so retries can order by what is sent.
+			expect(result.uploadBytes).toBeGreaterThan(
+				INGEST_DIRECT_CONTENT_MAX_BYTES,
+			);
+			expect(result.uploadBytes).toBeLessThanOrEqual(rawBytes);
+		},
+		60_000,
+	);
+
+	test("surfaces the server's message for a 400 at init that is not about size", async () => {
+		await isolateCapabilityCache();
+		const directory = await mkdtemp(join(tmpdir(), "opaline-r2-org-"));
+		temporaryDirectories.push(directory);
+		const transcriptPath = join(directory, "large.jsonl");
+		await writeCodexTranscriptAtLeast(
+			transcriptPath,
+			"clean",
+			INGEST_DIRECT_CONTENT_MAX_BYTES,
+		);
+		const server = serveFetchStub({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch() {
+				return Response.json(
+					{
+						json: {
+							code: "BAD_REQUEST",
+							defined: false,
+							message: "Choose an organization with --org or opaline set-org",
+							status: 400,
+						},
+					},
+					{ status: 400 },
+				);
+			},
+		});
+		activeServers.push(server);
+		const config = createUploadConfig(server);
+		await rememberR2UploadCapability(
+			new URL(config.endpoint),
+			"api-key",
+			TOKEN,
+		);
+
+		const result = await uploadSession(
+			createFileRequest("needs-org", transcriptPath),
+			config,
+		);
+
+		// Not a size rejection: the workspace choice is reported, retryable.
+		expect(result).toMatchObject({
+			success: false,
+			needsOrganization: true,
+			retryable: true,
+		});
+		expect(result.error).toContain("opaline set-org");
+		expect(result.error).not.toContain("does not accept sessions this large");
+	}, 60_000);
+
+	test("keeps an init rejection permanent for a session the old limit allows", async () => {
+		await isolateCapabilityCache();
+		const server = serveFetchStub({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch() {
+				return Response.json(
+					{
+						json: {
+							code: "BAD_REQUEST",
+							defined: false,
+							message: "bad",
+							status: 400,
+						},
+					},
+					{ status: 400 },
+				);
+			},
+		});
+		activeServers.push(server);
+		const config = createUploadConfig(server);
+		await rememberR2UploadCapability(
+			new URL(config.endpoint),
+			"api-key",
+			TOKEN,
+		);
+
+		const result = await uploadSession(
+			createRequest("small-bad-request", '{"type":"user"}\n'),
+			config,
+		);
+
+		expect(result).toMatchObject({ success: false, retryable: false });
+	});
+
 	test("rejects an empty main transcript locally before any R2 request", async () => {
 		await isolateCapabilityCache();
 		let requestCount = 0;
@@ -864,10 +1249,11 @@ describe("capability-gated R2 upload flow", () => {
 		expect(result).toMatchObject({
 			success: false,
 			attempts: 0,
-			retryable: false,
+			retryable: true,
 		});
 		expect(result.error).toContain("Transcript too large for this server");
 		expect(result.error).toContain("32.00 MiB safe limit for legacy uploads");
+		expect(result.error).toContain("opaline upload --retry");
 		expect(requestPaths).toEqual(["/rpc/ingest/init"]);
 		expect(
 			hasAdvertisedR2UploadCapability(

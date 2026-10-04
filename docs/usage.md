@@ -102,7 +102,19 @@ npx opaline@latest import ./path/to/session.jsonl
 npx opaline@latest upload --retry
 ```
 
-Use `npx opaline@latest import --help` for historical import options. The legacy `upload <session>` form remains supported. File/retry flags require a session argument or `--retry`; normal repository selection uses the picker.
+Use `npx opaline@latest import --help` for historical import options. The legacy `upload <session>` form remains supported. File/retry flags require a session argument or `--retry`; normal repository selection uses the picker. Batch uploads and retries send smaller sessions first.
+
+Uploads that Opaline accepted but had not finished processing when the CLI stopped waiting are kept as pending, not failed. The next hook run and `upload --retry` check them with the server: finished jobs are cleared, failed jobs are reported with the server's error, and expired jobs are uploaded again.
+
+### Linking a chat to an Opaline analysis
+
+The Opaline skill runs this after it saves an analysis, from inside the chat:
+
+```bash
+opaline import "$CODEX_THREAD_ID" --analysis <analysis id>
+```
+
+Pass a Codex thread id, a Claude Code session id or a transcript path. The CLI uploads the chat into the analysis's workspace (no `--org`), with a Codex thread's parent chat and the subagent threads it spawned (`--no-related` uploads only the given thread). It also records a marker for seven days, so the Codex turn-complete hook (or the Claude Code SessionEnd hook) uploads the chat again after the agent's answer and after follow-up turns, even where automatic uploads are off. These uploads never capture repository evidence. The command prints one line, or one JSON object with `--json`, and exits non-zero if the server does not support analysis uploads or refuses the analysis.
 
 `enable` and `disable` are aliases for the repository picker. Open it and confirm your selections to change automatic uploads. `set-org` remains available to change the workspace associated with a project.
 

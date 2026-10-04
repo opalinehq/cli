@@ -6,7 +6,14 @@ import {
 } from "./product-analytics.js";
 import { SourceSchema } from "./source.js";
 
-export const INGEST_AGGREGATE_CONTENT_MAX_BYTES = 128 * 1024 * 1024;
+/** Per-session limit on the slimmed, filtered upload (main plus subagents). */
+export const INGEST_AGGREGATE_CONTENT_MAX_BYTES = 256 * 1024 * 1024;
+/**
+ * The largest session the direct `ingestSession` request carries (the API caps
+ * request bodies at 160 MiB), and the per-session limit servers enforced
+ * before 256 MiB. Larger sessions upload only through R2.
+ */
+export const INGEST_DIRECT_CONTENT_MAX_BYTES = 128 * 1024 * 1024;
 export const INGEST_MAX_SUBAGENT_COUNT = 512;
 export const INGEST_LIMIT_REASONS = {
 	requestLimit: "request_limit",
@@ -63,11 +70,18 @@ export const IngestSessionInputSchema = z.object({
 	platform_os: ProductAnalyticsPlatformOsSchema.optional(),
 	filter_version: z.number().int().min(0).max(65_535).optional(),
 	force_replace: z.boolean().optional(),
+	/**
+	 * Link this upload to an Opaline analysis; the server stores the session in
+	 * the analysis's workspace. Only sent by `opaline import --analysis`.
+	 */
+	analysisId: z.string().max(200).optional(),
 });
 
 export const IngestSessionOutputSchema = z.object({
 	success: z.literal(true),
 	sessionId: z.string(),
+	/** Echoed only when the server recorded the analysis link. */
+	analysisId: z.string().optional(),
 	redacted: z.record(z.string(), z.number().int().nonnegative()).default({}),
 	redactedBytes: z.number().int().nonnegative().optional(),
 	usageChecksum: z

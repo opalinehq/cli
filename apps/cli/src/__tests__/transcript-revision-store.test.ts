@@ -218,7 +218,7 @@ describe("transcript revision persistence", () => {
 			`${process.pid}:live-owner`,
 		);
 		await rm(liveLock, { force: true, recursive: true });
-	});
+	}, 20_000);
 
 	test("serializes competing stale-lock reclaimers across processes", async () => {
 		const competingScope = withTranscriptScope({

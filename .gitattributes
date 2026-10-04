@@ -1,1 +1,4 @@
 * text=auto eol=lf
+
+# Byte-exact transcript-slim parity fixtures (shared with the Opaline API; one line is CRLF).
+apps/cli/src/__tests__/fixtures/transcript-slim/*.jsonl -text

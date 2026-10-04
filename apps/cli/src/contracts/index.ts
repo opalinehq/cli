@@ -12,6 +12,7 @@ export {
 } from "./device-flow.js";
 export {
 	INGEST_AGGREGATE_CONTENT_MAX_BYTES,
+	INGEST_DIRECT_CONTENT_MAX_BYTES,
 	INGEST_LIMIT_REASONS,
 	type IngestSessionInput,
 	REDACTION_BUDGET_EXCEEDED_CODE,

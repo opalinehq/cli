@@ -17,8 +17,35 @@ import {
 	createOwnedR2StagingDirectory,
 	R2_UPLOAD_STAGING_DIRECTORY_PREFIX,
 } from "./r2-staging-cleanup.js";
+import {
+	createTranscriptSlimmer,
+	slimTranscriptText,
+	type TranscriptSlimmer,
+} from "./transcript-slim.js";
 
 export const MAX_STREAM_RECORD_BYTES = 16 * 1024 * 1024;
+/**
+ * A raw record read for slimming may be larger: the 16 MiB record limit
+ * applies to the slimmed record (an inline screenshot shrinks to a marker).
+ * This bound only keeps the read buffer finite.
+ */
+export const MAX_SLIMMABLE_RECORD_BYTES = 128 * 1024 * 1024;
+
+/*
+ * Order: secret filter first, then slimming, per record. This is the order
+ * 0.11 and the API produce (the API slims the already filtered upload), so
+ * every CLI version and the API derive the same bytes from one transcript.
+ * Slimming first would differ where a secret rule matches inside image base64
+ * (for example SK + 32 hex): filtering first breaks that base64 and the image
+ * stays inline everywhere.
+ */
+/**
+ * Raw transcript files above this size are skipped without reading them. The
+ * per-session ingest limit applies to the slimmed, filtered upload instead,
+ * so a raw transcript well above it can still fit once images and duplicate
+ * output are gone.
+ */
+export const MAX_RAW_TRANSCRIPT_BYTES = 1024 * 1024 * 1024;
 
 export type TranscriptSource =
 	| { readonly content: string; readonly kind: "text" }
@@ -32,6 +59,8 @@ export interface FilteredUploadSubagentSource {
 export interface FilteredUploadSources {
 	readonly main: TranscriptSource;
 	readonly metadata: R2IngestMetadata;
+	/** Session uploads are slimmed; repository evidence keeps its exact bytes. */
+	readonly slim: boolean;
 	readonly subagents: readonly FilteredUploadSubagentSource[];
 }
 
@@ -51,6 +80,12 @@ export type StagedUploadObject =
 export interface StagedFilteredUpload {
 	readonly aggregateBytes: number;
 	readonly directory: string;
+	/**
+	 * Filtered bytes before slimming. Slimming changed the session when
+	 * `aggregateBytes` is smaller. The secret filter runs over the raw
+	 * `inputBytes` (its redaction-budget base), as in 0.11 and on the server.
+	 */
+	readonly unslimmedBytes: number;
 	readonly inputBytes: number;
 	readonly metadata: R2IngestMetadata;
 	readonly objects: readonly StagedUploadObject[];
@@ -60,6 +95,7 @@ export interface StagedFilteredUpload {
 
 interface FilteredFileResult {
 	readonly byteLength: number;
+	readonly unslimmedBytes: number;
 	readonly inputBytes: number;
 	readonly redactedBytes: number;
 	readonly redactions: RedactionCounts;
@@ -88,11 +124,13 @@ function checkBudget(budget: SourceBudget | undefined): void {
 
 export function createFilteredUploadSources(
 	request: IngestSessionInput | FileBackedUploadRequest,
+	options: { readonly slim: boolean },
 ): FilteredUploadSources {
 	if (isFileBackedUploadRequest(request)) {
 		return {
 			main: { kind: "file", path: request.transcriptPath },
 			metadata: { ...request.metadata, filter_version: FILTER_VERSION },
+			slim: options.slim,
 			subagents: request.subagents.map((subagent) => ({
 				agentId: subagent.agentId,
 				source: { kind: "file", path: subagent.path },
@@ -103,6 +141,7 @@ export function createFilteredUploadSources(
 	return {
 		main: { content, kind: "text" },
 		metadata: { ...metadata, filter_version: FILTER_VERSION },
+		slim: options.slim,
 		subagents: (subagents ?? []).map((subagent) => ({
 			agentId: subagent.agentId,
 			source: { content: subagent.content, kind: "text" },
@@ -157,6 +196,7 @@ async function stageSourcesIntoDirectory(
 	const main = await stageSource(
 		sources.main,
 		join(directory, "main.jsonl"),
+		sources.slim,
 		budget,
 	);
 	const objects: StagedUploadObject[] = [
@@ -168,6 +208,7 @@ async function stageSourcesIntoDirectory(
 		},
 	];
 	let aggregateBytes = main.byteLength;
+	let unslimmedBytes = main.unslimmedBytes;
 	let inputBytes = main.inputBytes;
 	let redactedBytes = main.redactedBytes;
 	let redactions = main.redactions;
@@ -177,8 +218,14 @@ async function stageSourcesIntoDirectory(
 
 	for (const [index, subagent] of sortedSubagents.entries()) {
 		const path = join(directory, `subagent-${index + 1}.jsonl`);
-		const result = await stageSource(subagent.source, path, budget);
+		const result = await stageSource(
+			subagent.source,
+			path,
+			sources.slim,
+			budget,
+		);
 		aggregateBytes += result.byteLength;
+		unslimmedBytes += result.unslimmedBytes;
 		inputBytes += result.inputBytes;
 		redactedBytes += result.redactedBytes;
 		redactions = mergeRedactionCounts(redactions, result.redactions);
@@ -197,6 +244,7 @@ async function stageSourcesIntoDirectory(
 	return {
 		aggregateBytes,
 		directory,
+		unslimmedBytes,
 		inputBytes,
 		metadata: sources.metadata,
 		objects,
@@ -208,41 +256,54 @@ async function stageSourcesIntoDirectory(
 async function stageSource(
 	source: TranscriptSource,
 	destinationPath: string,
+	slim: boolean,
 	budget: SourceBudget | undefined,
 ): Promise<FilteredFileResult> {
 	checkBudget(budget);
 	return source.kind === "text"
-		? stageText(source.content, destinationPath, budget)
-		: stageFile(source.path, destinationPath, budget);
+		? stageText(source.content, destinationPath, slim, budget)
+		: stageFile(
+				source.path,
+				destinationPath,
+				slim ? createTranscriptSlimmer() : undefined,
+				budget,
+			);
 }
 
 async function stageText(
 	content: string,
 	destinationPath: string,
+	slim: boolean,
 	budget: SourceBudget | undefined,
 ): Promise<FilteredFileResult> {
 	if (budget) budget.inputBytes += Buffer.byteLength(content, "utf8");
 	checkBudget(budget);
-	const filtered = filterSessionTextFields({ content, subagents: undefined });
+	const filtered = filterSessionTextFields({
+		content,
+		subagents: undefined,
+	});
+	const output = slim ? slimTranscriptText(filtered.content) : filtered.content;
 	checkBudget(budget);
-	const byteLength = Buffer.byteLength(filtered.content, "utf8");
-	await writeFile(destinationPath, filtered.content, {
+	const byteLength = Buffer.byteLength(output, "utf8");
+	await writeFile(destinationPath, output, {
 		encoding: "utf8",
 		flag: "wx",
 		mode: 0o600,
 	});
 	return {
 		byteLength,
+		unslimmedBytes: Buffer.byteLength(filtered.content, "utf8"),
 		inputBytes: Buffer.byteLength(content, "utf8"),
 		redactedBytes: filtered.redactedBytes,
 		redactions: filtered.counts,
-		sha256: createHash("sha256").update(filtered.content, "utf8").digest("hex"),
+		sha256: createHash("sha256").update(output, "utf8").digest("hex"),
 	};
 }
 
 async function stageFile(
 	sourcePath: string,
 	destinationPath: string,
+	slimmer: TranscriptSlimmer | undefined,
 	budget: SourceBudget | undefined,
 ): Promise<FilteredFileResult> {
 	const input = createReadStream(sourcePath, {
@@ -256,10 +317,14 @@ async function stageFile(
 	const hash = createHash("sha256");
 	let pending = "";
 	let byteLength = 0;
+	let unslimmedBytes = 0;
 	let inputBytes = 0;
 	let redactedBytes = 0;
 	let redactions: RedactionCounts = {};
 
+	const rawRecordLimit = slimmer
+		? MAX_SLIMMABLE_RECORD_BYTES
+		: MAX_STREAM_RECORD_BYTES;
 	try {
 		for await (const chunk of input) {
 			if (!(chunk instanceof Uint8Array)) {
@@ -274,22 +339,34 @@ async function stageFile(
 				checkBudget(budget);
 				const record = pending.slice(0, newlineIndex + 1);
 				pending = pending.slice(newlineIndex + 1);
-				assertRecordWithinLimit(record);
-				const result = await filterAndWriteRecord(record, output, hash);
+				assertRecordWithinLimit(record, rawRecordLimit);
+				const result = await filterSlimAndWriteRecord(
+					record,
+					slimmer,
+					output,
+					hash,
+				);
 				byteLength += result.byteLength;
+				unslimmedBytes += result.unslimmedBytes;
 				redactedBytes += result.redactedBytes;
 				redactions = mergeRedactionCounts(redactions, result.redactions);
 				newlineIndex = pending.indexOf("\n");
 			}
-			assertRecordWithinLimit(pending);
+			assertRecordWithinLimit(pending, rawRecordLimit);
 		}
 
 		pending += decoder.end();
 		checkBudget(budget);
 		if (pending.length > 0) {
-			assertRecordWithinLimit(pending);
-			const result = await filterAndWriteRecord(pending, output, hash);
+			assertRecordWithinLimit(pending, rawRecordLimit);
+			const result = await filterSlimAndWriteRecord(
+				pending,
+				slimmer,
+				output,
+				hash,
+			);
 			byteLength += result.byteLength;
+			unslimmedBytes += result.unslimmedBytes;
 			redactedBytes += result.redactedBytes;
 			redactions = mergeRedactionCounts(redactions, result.redactions);
 		}
@@ -300,6 +377,7 @@ async function stageFile(
 
 	return {
 		byteLength,
+		unslimmedBytes,
 		inputBytes,
 		redactedBytes,
 		redactions,
@@ -307,12 +385,18 @@ async function stageFile(
 	};
 }
 
-async function filterAndWriteRecord(
+/**
+ * Filters one raw record, slims the filtered record, and writes it. The
+ * 16 MiB record limit applies to what is written (the slimmed record).
+ */
+async function filterSlimAndWriteRecord(
 	record: string,
+	slimmer: TranscriptSlimmer | undefined,
 	output: Awaited<ReturnType<typeof open>>,
 	hash: ReturnType<typeof createHash>,
 ): Promise<{
 	readonly byteLength: number;
+	readonly unslimmedBytes: number;
 	readonly redactedBytes: number;
 	readonly redactions: RedactionCounts;
 }> {
@@ -320,20 +404,28 @@ async function filterAndWriteRecord(
 		content: record,
 		subagents: undefined,
 	});
-	await output.writeFile(filtered.content, { encoding: "utf8" });
-	hash.update(filtered.content, "utf8");
+	const written = slimmer
+		? slimmer.slimRecord(filtered.content)
+		: filtered.content;
+	assertRecordWithinLimit(written, MAX_STREAM_RECORD_BYTES);
+	await output.writeFile(written, { encoding: "utf8" });
+	hash.update(written, "utf8");
 	return {
-		byteLength: Buffer.byteLength(filtered.content, "utf8"),
+		byteLength: Buffer.byteLength(written, "utf8"),
+		unslimmedBytes: Buffer.byteLength(filtered.content, "utf8"),
 		redactedBytes: filtered.redactedBytes,
 		redactions: filtered.counts,
 	};
 }
 
-function assertRecordWithinLimit(record: string): void {
+function assertRecordWithinLimit(record: string, limit: number): void {
+	// UTF-8 needs at least one byte per UTF-16 code unit: most records are
+	// decided without encoding them.
+	if (record.length <= limit / 3) return;
 	const bytes = Buffer.byteLength(record, "utf8");
-	if (bytes > MAX_STREAM_RECORD_BYTES) {
+	if (bytes > limit) {
 		throw new Error(
-			`Transcript contains a record larger than ${MAX_STREAM_RECORD_BYTES} bytes; refusing an unbounded secret-filter buffer`,
+			`Transcript contains a record larger than ${limit} bytes; refusing an unbounded secret-filter buffer`,
 		);
 	}
 }

@@ -9,17 +9,27 @@ import {
 	MissingTranscriptTimestampError,
 	type SessionFile,
 } from "../internal/agent-adapters/index.js";
+import {
+	type AnalysisSupport,
+	type AnalysisUploadEnvironment,
+	checkAnalysisUploadSupport,
+	getAnalysisDestination,
+	isSameAnalysisDestination,
+} from "../lib/analysis-upload.js";
 import type { BatchUploadItem } from "../lib/batch-upload.js";
 import { renderBatchSummary, runBatchUpload } from "../lib/batch-upload-ui.js";
 import { classifySessionFile } from "../lib/classifier.js";
 import { type Credentials, loadCredentials } from "../lib/credentials.js";
 import {
+	type FailedUpload,
 	isRetryCandidate,
 	loadFailedUploads,
+	recordFailedUpload,
+	recordPendingUpload,
 	removeFailedUpload,
 } from "../lib/failed-uploads.js";
 import { getGitInfo } from "../lib/git-info.js";
-import { getProjectOrgId } from "../lib/project-config.js";
+import { reconcilePendingUploads } from "../lib/pending-upload-reconcile.js";
 import { retryPendingSessionEvidence } from "../lib/session-evidence.js";
 import { resolveSession } from "../lib/session-resolver.js";
 import {
@@ -28,7 +38,12 @@ import {
 	type SessionTag,
 } from "../lib/types.js";
 import { allowsInsecureEndpoint } from "../lib/upload-endpoint.js";
+import { resolveUploadOrganizationId } from "../lib/upload-organization.js";
 import { formatRedactionSummary, uploadSession } from "../lib/uploader.js";
+import { runAnalysisImport } from "./import-analysis.js";
+
+// `--retry` checks every pending server job it can; hooks check only a few.
+const RETRY_RECONCILE_MAX_ENTRIES = 200;
 
 interface UploadFlags {
 	tag?: SessionTag;
@@ -41,6 +56,9 @@ interface UploadFlags {
 	yes: boolean;
 	concurrency: number;
 	forceReplace: boolean;
+	analysis?: string;
+	related: boolean;
+	json: boolean;
 }
 
 interface ResolvedUploadFlags extends UploadFlags {
@@ -74,8 +92,12 @@ async function runSingleUpload(
 	if (displayName) write(`Repository: ${displayName}`);
 	if (gitInfo.branch) write(`Branch: ${gitInfo.branch}`);
 
-	const organizationId =
-		flags.org ?? (await getProjectOrgId(sessionInfo.projectPath));
+	const organizationId = await resolveUploadOrganizationId({
+		credentials,
+		explicit: flags.org,
+		projectPath: sessionInfo.projectPath,
+		recorded: undefined,
+	});
 	if (organizationId) write(`Organization: ${organizationId}`);
 
 	write("Building upload request...");
@@ -153,6 +175,22 @@ async function runSingleUpload(
 		authType: credentials.authType,
 	});
 
+	if (result.pendingJobId !== undefined) {
+		await recordPendingUpload({
+			sessionId: request.metadata.sessionId,
+			transcriptPath: request.transcriptPath,
+			projectPath: sessionInfo.projectPath,
+			source: sessionInfo.source,
+			organizationId,
+			error: result.error ?? "Still processing on the server",
+			jobId: result.pendingJobId,
+			uploadBytes: result.uploadBytes,
+		});
+		write(
+			"Upload accepted; Opaline is still processing it. Run `opaline upload --retry` later to confirm.",
+		);
+		return;
+	}
 	if (result.success) {
 		write("Upload successful!");
 		await removeFailedUpload(request.metadata.sessionId);
@@ -164,6 +202,17 @@ async function runSingleUpload(
 			write(redactionSummary);
 		}
 	} else {
+		// A missing workspace choice is fixable: keep it for --retry.
+		if (result.needsOrganization)
+			await recordFailedUpload({
+				sessionId: request.metadata.sessionId,
+				transcriptPath: request.transcriptPath,
+				projectPath: sessionInfo.projectPath,
+				source: sessionInfo.source,
+				organizationId,
+				error: result.error ?? "Choose a workspace with `opaline set-org`.",
+				status: "retryable",
+			});
 		return new Error(`Upload failed: ${result.error}`);
 	}
 }
@@ -200,9 +249,34 @@ async function runRetryUpload(
 		}
 	}
 
+	if (!flags.dryRun && credentials) {
+		const reconciled = await reconcilePendingUploads(
+			{ maxEntries: RETRY_RECONCILE_MAX_ENTRIES },
+			{
+				allowInsecureEndpoint: allowPlaintextEndpoint,
+				authType: credentials.authType,
+				endpoint: flags.endpoint,
+				token: credentials.token,
+			},
+		);
+		for (const failure of reconciled.linkFailures)
+			p.log.warn(`Analysis upload failed for ${failure}`);
+		if (reconciled.checked > 0)
+			p.log.info(
+				`Checked ${reconciled.checked} upload(s) still processing on the server: ${reconciled.completed} completed, ${reconciled.stillPending} still processing, ${reconciled.requeued} to upload again, ${reconciled.failed} failed.`,
+			);
+	}
+
 	const failures = await loadFailedUploads();
-	if (failures.length === 0) {
-		p.outro("No failed uploads to retry.");
+	const pendingUploads = failures.filter(
+		(failure) => failure.status === "pending",
+	);
+	if (failures.length === pendingUploads.length) {
+		p.outro(
+			pendingUploads.length > 0
+				? `No failed uploads to retry. ${pendingUploads.length} upload(s) are still processing on the server.`
+				: "No failed uploads to retry.",
+		);
 		return evidenceRetryError;
 	}
 
@@ -212,14 +286,17 @@ async function runRetryUpload(
 	const permanentFailures = failures.filter(
 		(failure) => failure.status === "permanent",
 	);
-	p.log.info(
-		`Found ${failures.length} failed upload(s): ${retryableFailures.length} retryable, ${permanentFailures.length} permanent`,
+	const failedUploads = failures.filter(
+		(failure) => failure.status !== "pending",
 	);
-	for (const f of failures.slice(0, 10)) {
+	p.log.info(
+		`Found ${failedUploads.length} failed upload(s): ${retryableFailures.length} retryable, ${permanentFailures.length} permanent${pendingUploads.length > 0 ? ` (${pendingUploads.length} still processing on the server)` : ""}`,
+	);
+	for (const f of failedUploads.slice(0, 10)) {
 		p.log.warn(`  [${f.status}] ${f.sessionId}: ${f.error} (${f.failedAt})`);
 	}
-	if (failures.length > 10) {
-		p.log.warn(`  ...and ${failures.length - 10} more`);
+	if (failedUploads.length > 10) {
+		p.log.warn(`  ...and ${failedUploads.length - 10} more`);
 	}
 	if (permanentFailures.length > 0) {
 		p.log.warn(
@@ -260,13 +337,21 @@ async function runRetryUpload(
 		failure: (typeof failures)[number];
 	};
 
-	const items: RetryItem[] = retryableFailures.map((f) => ({
+	const sendable = await filterAnalysisRetries(retryableFailures, {
+		allowInsecureEndpoint: allowPlaintextEndpoint,
+		credentials,
+		endpoint: flags.endpoint,
+	});
+	const items: RetryItem[] = sendable.map((f) => ({
 		sessionId: f.sessionId,
 		label: f.sessionId,
 		transcriptPath: f.transcriptPath,
 		projectPath: f.projectPath,
 		source: f.source,
-		organizationId: f.organizationId,
+		organizationId: f.analysisId === undefined ? f.organizationId : undefined,
+		analysisId: f.analysisId,
+		analysisDestination: f.analysisDestination,
+		uploadBytes: f.uploadBytes,
 		failure: f,
 	}));
 
@@ -285,10 +370,16 @@ async function runRetryUpload(
 				projectPath: item.failure.projectPath,
 			};
 			const gitInfo = await getGitInfo(item.failure.projectPath);
+			// Analysis uploads go to the analysis's workspace, never an org.
 			const organizationId =
-				flags.org ??
-				item.failure.organizationId ??
-				(await getProjectOrgId(item.failure.projectPath));
+				item.analysisId === undefined
+					? await resolveUploadOrganizationId({
+							credentials,
+							explicit: flags.org,
+							projectPath: item.failure.projectPath,
+							recorded: item.failure.organizationId,
+						})
+					: undefined;
 
 			const request = await adapter.buildUploadRequest(sessionFile, {
 				tag: flags.tag,
@@ -297,6 +388,8 @@ async function runRetryUpload(
 				uploadMode: "retry",
 			});
 			if (flags.forceReplace) request.metadata.force_replace = true;
+			if (item.analysisId !== undefined)
+				request.metadata.analysisId = item.analysisId;
 
 			return uploadSession(request, {
 				endpoint: flags.endpoint,
@@ -323,6 +416,50 @@ async function runRetryUpload(
 	return evidenceRetryError;
 }
 
+/**
+ * Analysis uploads are retried only to the endpoint and account their import
+ * approved, and only once the server confirms it links analyses. Others are
+ * recorded as permanent (destination changed, server unsupported) or kept for
+ * later (server unreachable).
+ */
+async function filterAnalysisRetries(
+	failures: readonly FailedUpload[],
+	environment: AnalysisUploadEnvironment,
+): Promise<FailedUpload[]> {
+	const destination = getAnalysisDestination(environment);
+	let support: AnalysisSupport | undefined;
+	const sendable: FailedUpload[] = [];
+	for (const failure of failures) {
+		if (failure.analysisId === undefined) {
+			sendable.push(failure);
+			continue;
+		}
+		if (
+			!failure.analysisDestination ||
+			!isSameAnalysisDestination(failure.analysisDestination, destination)
+		) {
+			const error =
+				"Not retried: the Opaline server or account changed since `opaline import --analysis`. Run that command again to link this chat.";
+			p.log.warn(`  ${failure.sessionId}: ${error}`);
+			await recordFailedUpload({ ...failure, error, status: "permanent" });
+			continue;
+		}
+		support ??= await checkAnalysisUploadSupport(environment);
+		if (support.supported) {
+			sendable.push(failure);
+			continue;
+		}
+		p.log.warn(`  ${failure.sessionId}: not retried: ${support.reason}`);
+		if (support.kind === "unsupported")
+			await recordFailedUpload({
+				...failure,
+				error: support.reason,
+				status: "permanent",
+			});
+	}
+	return sendable;
+}
+
 async function runUpload(
 	flags: UploadFlags,
 	...sessions: string[]
@@ -341,19 +478,66 @@ async function runUpload(
 	const allowPlaintextEndpoint = allowsInsecureEndpoint(
 		resolvedFlags.allowInsecureEndpoint,
 	);
+	if (resolvedFlags.analysis !== undefined) {
+		const analysisId = resolvedFlags.analysis.trim();
+		const session = sessions[0];
+		if (!analysisId) return new Error("--analysis needs an analysis id.");
+		if (!session || sessions.length > 1)
+			return new Error(
+				"Pass exactly one session or Codex thread id with --analysis.",
+			);
+		if (resolvedFlags.retry || resolvedFlags.org !== undefined)
+			return new Error(
+				"--analysis cannot be combined with --retry or --org; the analysis decides the workspace.",
+			);
+		return runAnalysisImport(
+			{
+				analysisId,
+				dryRun: resolvedFlags.dryRun,
+				json: resolvedFlags.json,
+				related: resolvedFlags.related,
+				session,
+			},
+			{
+				allowInsecureEndpoint: allowPlaintextEndpoint,
+				credentials,
+				endpoint: resolvedFlags.endpoint,
+			},
+		);
+	}
 	if (resolvedFlags.retry) {
 		return runRetryUpload(resolvedFlags, allowPlaintextEndpoint, credentials);
 	}
-	const session = sessions[0];
-	if (!session)
+	const [first] = sessions;
+	if (first === undefined)
 		return new Error(
 			"Use `opaline upload` to select repositories, or pass a session file or --retry.",
 		);
-	return runSingleUpload(
-		resolvedFlags,
-		session,
-		allowPlaintextEndpoint,
-		credentials,
+	if (sessions.length === 1)
+		return runSingleUpload(
+			resolvedFlags,
+			first,
+			allowPlaintextEndpoint,
+			credentials,
+		);
+	// Every given session is uploaded, in order; one failure does not stop
+	// the others.
+	const failures: Error[] = [];
+	for (const session of sessions) {
+		const error = await runSingleUpload(
+			resolvedFlags,
+			session,
+			allowPlaintextEndpoint,
+			credentials,
+		);
+		if (error === undefined) continue;
+		failures.push(error);
+		process.stderr.write(`Upload of ${session} failed: ${error.message}\n`);
+	}
+	if (failures.length === 0) return undefined;
+	return new AggregateError(
+		failures,
+		`${failures.length} of ${sessions.length} session uploads failed.`,
 	);
 }
 
@@ -421,6 +605,24 @@ export const importCommand = buildCommand({
 			forceReplace: {
 				kind: "boolean",
 				brief: "Intentionally replace a stored session with smaller content",
+				default: false,
+			},
+			analysis: {
+				kind: "parsed",
+				parse: String,
+				brief:
+					"Link the chat to an Opaline analysis (uploads into the analysis's workspace; later turns re-upload via hooks)",
+				optional: true,
+			},
+			related: {
+				kind: "boolean",
+				brief:
+					"With --analysis, include the Codex thread's parent chain and spawned subagent threads",
+				default: true,
+			},
+			json: {
+				kind: "boolean",
+				brief: "With --analysis, print one JSON object instead of a line",
 				default: false,
 			},
 		},

@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { strict as assert } from "node:assert";
 import { execFileSync } from "node:child_process";
 import {
 	mkdir,
@@ -6,15 +7,20 @@ import {
 	open,
 	readdir,
 	readFile,
+	realpath,
 	rm,
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readPendingRepositoryEvidence } from "../lib/repository-evidence-pending.js";
 import {
 	captureAndUploadSessionEvidence,
 	EVIDENCE_TRANSCRIPT_INPUT_MAX_BYTES,
+	EvidenceBudgetError,
+	retryPendingSessionEvidence,
 } from "../lib/session-evidence.js";
+import { startEvidenceProtocolStub } from "./helpers/evidence-protocol-stub.js";
 import { createCliFixture, runCli } from "./helpers/ingest-stub.js";
 
 test.each([false, true])(
@@ -195,5 +201,61 @@ test("abandons a collected capture and removes its source when pending persisten
 		expect(await readdir(pendingDirectory)).toHaveLength(200);
 	} finally {
 		await rm(fixture.home, { force: true, recursive: true });
+	}
+});
+
+test("a hook that spent its budget spools the capture for background delivery instead of losing it", async () => {
+	const home = await realpath(
+		await mkdtemp(join(tmpdir(), "opaline-evidence-budget-")),
+	);
+	const previousConfigDir = process.env.OPALINE_CONFIG_DIR;
+	const previousInsecure = process.env.OPALINE_ALLOW_INSECURE_ENDPOINT;
+	const stub = startEvidenceProtocolStub();
+	try {
+		const repository = join(home, "repository");
+		await mkdir(repository, { recursive: true });
+		await writeFile(join(repository, "AGENTS.md"), "Instructions\n");
+		execFileSync("git", ["init", "--quiet", repository]);
+		const configDir = join(home, "config");
+		process.env.OPALINE_CONFIG_DIR = configDir;
+		process.env.OPALINE_ALLOW_INSECURE_ENDPOINT = "1";
+		const credentials = {
+			authType: "api-key" as const,
+			token: "test",
+			apiBaseUrl: stub.base,
+			user: { id: "user", email: "test@example.invalid", name: "Test" },
+		};
+		const capture = captureAndUploadSessionEvidence({
+			backgroundDelivery: "none",
+			credentials,
+			// The hook received its input two minutes ago: no inline delivery.
+			hookReceivedAt: new Date(Date.now() - 120_000).toISOString(),
+			lifecycle: "checkpoint",
+			organizationId: "org",
+			request: {
+				content: '{"type":"session_meta","payload":{"id":"budget"}}\n',
+				projectPath: repository,
+				sessionId: "budget-session",
+				source: "codex",
+				upload_mode: "hook",
+			},
+			terminalTranscript: false,
+		});
+		await expect(capture).rejects.toBeInstanceOf(EvidenceBudgetError);
+		expect(stub.counts.init).toBe(0);
+		const [pending] = await readPendingRepositoryEvidence(configDir);
+		assert(pending);
+		expect(pending.next_attempt_at).toBeUndefined();
+		expect(await retryPendingSessionEvidence(credentials)).toBe(1);
+		expect(stub.committed.size).toBe(1);
+		expect(await readPendingRepositoryEvidence(configDir)).toEqual([]);
+	} finally {
+		stub.stop();
+		if (previousConfigDir === undefined) delete process.env.OPALINE_CONFIG_DIR;
+		else process.env.OPALINE_CONFIG_DIR = previousConfigDir;
+		if (previousInsecure === undefined)
+			delete process.env.OPALINE_ALLOW_INSECURE_ENDPOINT;
+		else process.env.OPALINE_ALLOW_INSECURE_ENDPOINT = previousInsecure;
+		await rm(home, { force: true, recursive: true });
 	}
 });
