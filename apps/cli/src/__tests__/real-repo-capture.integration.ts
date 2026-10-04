@@ -208,12 +208,13 @@ describe("real repository sidecar capture", () => {
 				).toBe(true);
 				// Every captured file outside the repository (user and parent
 				// instructions and their imports, every skill definition), and
-				// every repository skill definition, is stored byte for byte as on
-				// disk after the secret filter.
+				// every repository skill definition and personal instruction file,
+				// is stored byte for byte as on disk after the secret filter.
 				const userFiles: string[] = [];
 				const fullContent = (entry: (typeof localContext.entries)[number]) =>
 					entry.rootId !== "repository" ||
-					entry.categories?.includes("skill-definition");
+					entry.categories?.includes("skill-definition") ||
+					basename(entry.path).toLowerCase().endsWith(".local.md");
 				for (const entry of localContext.entries) {
 					if (!fullContent(entry) || entry.kind !== "file") continue;
 					if (entry.content?.status !== "available" || !entry.content.blobId)
@@ -264,6 +265,12 @@ describe("real repository sidecar capture", () => {
 					skillDefinitions: countContext(
 						(entry) => entry.categories?.includes("skill-definition") ?? false,
 					),
+					personalInstructions: localContext.entries.filter(
+						(entry) =>
+							entry.kind === "file" &&
+							basename(entry.path).toLowerCase().endsWith(".local.md") &&
+							entry.content?.status === "available",
+					).length,
 				};
 				// The protocol's object and aggregate limits hold with every skill.
 				const aggregateBytes = capture.input.objects.reduce(

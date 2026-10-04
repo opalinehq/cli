@@ -20,6 +20,7 @@ import {
 import { buildRepositoryEvidenceUpload } from "../../lib/repository-evidence-upload.js";
 import { planTranscriptRevision } from "../../lib/transcript-revision.js";
 import { extractObservedSkills } from "../../lib/transcript-skills.js";
+import { filterKnownSecrets } from "../secret-filter/index.js";
 import { buildRepositoryEvidenceIndexRow } from "./__fixtures__/athena-evidence-index.js";
 import { addSanitizedTextBlob, createBlobStore } from "./blob-store.js";
 import {
@@ -528,12 +529,8 @@ test("keeps Claude and Codex agent-definition Markdown but not skill-resource Ma
 	}
 });
 
-test("personal instructions, MCP files and agent settings are hash-only even when they contain unknown tokens", async () => {
+test("MCP files and agent settings are hash-only even when they contain unknown tokens", async () => {
 	const metadataPaths = [
-		"CLAUDE.local.md",
-		"AGENTS.local.md",
-		"nested/CLAUDE.local.md",
-		".claude/AGENTS.local.md",
 		"docs/private.LOCAL.MD",
 		".mcp.json",
 		"nested/mcp.json",
@@ -599,6 +596,43 @@ test("personal instructions, MCP files and agent settings are hash-only even whe
 	}
 	expect(bundle.blobs).toHaveLength(4);
 	expect(bundle.manifest.coverage.truncated).toBeUndefined();
+});
+
+test("personal instruction files are captured in full from the instruction pool, secret-filtered", async () => {
+	const secret = `ghp_${"A".repeat(36)}`;
+	const personal = {
+		"CLAUDE.local.md": `Personal notes for this checkout\n${"Prefer small commits.\n".repeat(40)}Token ${secret}\n`,
+		"AGENTS.local.md": "Personal agent notes\n",
+		"nested/CLAUDE.local.md": "Nested personal notes\n",
+		".claude/CLAUDE.local.md": "Agent-directory personal notes\n",
+	};
+	const directory = await createSmallFixture({
+		...personal,
+		"AGENTS.md": "Shared instructions\n",
+	});
+	const bundle = await collectLocalContextBundle(
+		directory,
+		{
+			...getDefaultLocalContextCollectionOptions(),
+			capturePolicy: "session-evidence",
+		},
+		createLocalContextSourceEnv(),
+	);
+	for (const [path, content] of Object.entries(personal)) {
+		const entry = fileEntry(bundle, "repository", path);
+		expect(entry.content.status).toBe("available");
+		if (entry.content.status !== "available") continue;
+		const blobId = entry.content.blobId;
+		const blob = bundle.blobs.find((candidate) => candidate.id === blobId);
+		expect(blob?.content).toBe(filterKnownSecrets(content).text);
+		expect(blob?.content).not.toContain(secret);
+	}
+	const filtered = fileEntry(bundle, "repository", "CLAUDE.local.md");
+	expect(filtered.content.status).toBe("available");
+	if (filtered.content.status === "available")
+		expect(filtered.content.secretFilter.redactedBytes).toBeGreaterThan(0);
+	for (const facet of bundle.manifest.contextIndex.facets)
+		expect(facet.coverage).toBe("complete");
 });
 
 test("does not walk dependency, generated or cache directories", async () => {
@@ -899,11 +933,12 @@ test.each([1, 2, 3, 4, 5])(
 			options,
 			env,
 		);
-		// Instructions come from their own pool, the agent definition from the
-		// general pool. Neither competes with skills.
+		// Instructions, including personal ones, come from their own pool; the
+		// agent definition from the general pool. Neither competes with skills.
 		for (const path of [
 			"AGENTS.md",
 			"nested/CLAUDE.md",
+			"nested/CLAUDE.local.md",
 			".claude/agents/reviewer.md",
 		]) {
 			const entry = fileEntry(bundle, "repository", path);
@@ -926,13 +961,11 @@ test.each([1, 2, 3, 4, 5])(
 			);
 			expect(entry.hash.status).toBe("available");
 		}
-		for (const path of ["nested/CLAUDE.local.md", ".claude/settings.json"])
-			expect(fileEntry(bundle, "repository", path).content).toMatchObject({
-				status: "omitted",
-				reason: "metadata-only",
-			});
+		expect(
+			fileEntry(bundle, "repository", ".claude/settings.json").content,
+		).toMatchObject({ status: "omitted", reason: "metadata-only" });
 		expect(bundle.blobs).toHaveLength(
-			3 + Math.min(maxUserContextFiles, skillOrder.length),
+			4 + Math.min(maxUserContextFiles, skillOrder.length),
 		);
 		if (maxUserContextFiles < skillOrder.length) {
 			expect(bundle.manifest.coverage.truncated).toEqual({

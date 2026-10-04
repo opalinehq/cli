@@ -349,7 +349,7 @@ describe("instruction capture", () => {
 				"```",
 				"",
 			].join("\n"),
-			"CLAUDE.local.md": "PRIVATE_LOCAL_CANARY\n",
+			"CLAUDE.local.md": "Personal local instructions\n",
 			"docs/guide.md": "Guide imports @deeper/chain.md\n",
 			"docs/deeper/chain.md": "Chain end\n",
 			"docs/inline.md": "inline\n",
@@ -365,19 +365,18 @@ describe("instruction capture", () => {
 			expect(readCaptured(bundle, path)).toBe(content);
 			expect(getFile(bundle, path).evidenceReason).toBe("instruction-import");
 		}
-		for (const path of [
-			"CLAUDE.local.md",
-			"docs/inline.md",
-			"docs/fenced.md",
-		]) {
+		// Personal instructions are an instruction file of their own.
+		expect(readCaptured(bundle, "CLAUDE.local.md")).toBe(
+			"Personal local instructions\n",
+		);
+		expect(getFile(bundle, "CLAUDE.local.md").evidenceReason).toBeNull();
+		for (const path of ["docs/inline.md", "docs/fenced.md"]) {
 			expect(getFile(bundle, path).content).toMatchObject({
 				status: "omitted",
 				reason: "metadata-only",
 			});
 			expect(getFile(bundle, path).evidenceReason).toBeNull();
 		}
-		for (const blob of bundle.blobs)
-			expect(blob.content).not.toContain("PRIVATE_LOCAL_CANARY");
 	});
 
 	test("finds Claude Code imports outside code and resolves them inside the repository", () => {

@@ -120,15 +120,16 @@ export function getSessionUserContextRank(
 }
 
 /**
- * Personal instructions, MCP files, agent settings and skill resources are
- * deliberately hash-only. Omitting them is policy, not a capacity cut.
+ * MCP files, agent settings and skill resources are deliberately hash-only.
+ * Omitting them is policy, not a capacity cut. Personal instruction files
+ * (`CLAUDE.local.md`, `*.local.md`) are loaded into the agent's context and
+ * captured in full, secret-filtered, like other instructions.
  */
 function isSessionContentPolicyExcluded(
 	path: string,
 	categories: readonly ContextFileCategory[],
 ): boolean {
 	return (
-		basename(path).toLowerCase().endsWith(".local.md") ||
 		(categories.includes("mcp-config") &&
 			!categories.includes("instruction") &&
 			!categories.includes("skill-definition")) ||

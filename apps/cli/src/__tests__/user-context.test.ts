@@ -175,7 +175,7 @@ describe("user-level context roots", () => {
 			"notes/style.md": "Style notes\n",
 			"work/CLAUDE.md": "Work instructions, see @shared.md\n",
 			"work/shared.md": "Shared guidance\n",
-			"work/team/CLAUDE.local.md": "PERSONAL_PARENT_CANARY\n",
+			"work/team/CLAUDE.local.md": "Personal parent instructions\n",
 			"outside-import.md": "Imported from home\n",
 			"codex/AGENTS.md": "Codex user instructions\n",
 			"codex/AGENTS.override.md": "Codex override\n",
@@ -265,8 +265,11 @@ describe("user-level context roots", () => {
 		expect(
 			read("codex-plugins", "mkt/plug/v2/skills/codex-skill/SKILL.md"),
 		).toBe("Codex plugin skill\n");
+		// Personal instructions above the repository are loaded by Claude Code.
+		expect(read("home-instructions", "work/team/CLAUDE.local.md")).toBe(
+			"Personal parent instructions\n",
+		);
 		for (const [rootId, path] of [
-			["home-instructions", "work/team/CLAUDE.local.md"],
 			["claude-user-home", "settings.json"],
 			["codex-user-home", "config.toml"],
 			["claude-plugins", "mkt/plug/1.0.0/commands/review.md"],
@@ -296,7 +299,6 @@ describe("user-level context roots", () => {
 			bundle.manifest.contextIndex.skills.map((skill) => skill.name),
 		).toEqual(["codex-skill", "observed", "unused"]);
 		for (const blob of bundle.blobs) {
-			expect(blob.content).not.toContain("PERSONAL_PARENT_CANARY");
 			for (const secret of Object.values(SECRETS))
 				expect(blob.content).not.toContain(secret);
 		}
