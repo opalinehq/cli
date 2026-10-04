@@ -1727,7 +1727,8 @@ async function acquireSpoolWriteLock(
 	const lockPath = join(spoolRoot, WRITE_LOCK_NAME);
 	const ownerPath = join(lockPath, "owner");
 	const ownerToken = `${process.pid}:${env.createNonce()}`;
-	const startedAt = Date.now();
+	// Monotonic elapsed time: hooks under test may freeze Date.now().
+	const startedAt = performance.now();
 	while (true) {
 		let createdLock = false;
 		try {
@@ -1768,7 +1769,7 @@ async function acquireSpoolWriteLock(
 				throw error;
 			}
 			if (await recoverStaleWriteLock(lockPath, env)) continue;
-			if (Date.now() - startedAt >= env.writeLockTimeoutMs) {
+			if (performance.now() - startedAt >= env.writeLockTimeoutMs) {
 				throw new Error(
 					"Timed out waiting for another repository spool writer. No capture was changed.",
 				);
