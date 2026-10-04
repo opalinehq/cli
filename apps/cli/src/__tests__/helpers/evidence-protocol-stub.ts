@@ -241,10 +241,26 @@ export function startEvidenceProtocolStub(
 			}
 			if (pathname === "/rpc/ingest/init")
 				return orpcError("NOT_FOUND", 404, "older ingest");
+			if (pathname === "/rpc/cli/authStatus")
+				return Response.json({
+					json: {
+						capabilities: { analysisLinkedUploads: true },
+						email: "test@example.invalid",
+						id: "user-1",
+						name: "Test",
+					},
+				});
 			if (pathname === "/rpc/ingestSession") {
 				transcriptUploads.push(info.body);
+				// Analysis-linked uploads (`opaline import --analysis`) need the
+				// link echoed back, as the real API does.
+				const analysisId: unknown = JSON.parse(info.body).json?.analysisId;
 				return Response.json({
-					json: { success: true, sessionId: "stub-session" },
+					json: {
+						success: true,
+						sessionId: "stub-session",
+						...(typeof analysisId === "string" ? { analysisId } : {}),
+					},
 				});
 			}
 			return Response.json({

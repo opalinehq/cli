@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { readRepositoryEvidencePauseUntil } from "../lib/repository-evidence-pause.js";
 import { readPendingRepositoryEvidence } from "../lib/repository-evidence-pending.js";
+import { codexThreadId, writeCodexRollout } from "./helpers/codex-rollouts.js";
 import {
 	type CommittedEvidence,
 	type EvidenceProtocolStub,
@@ -460,7 +461,141 @@ describe("sidecar delivery under faults", () => {
 			stub.stop();
 		}
 	}, 150_000);
+
+	test("chats linked to an analysis capture no repository evidence while marked, in or outside Git", async () => {
+		const stub = startEvidenceProtocolStub();
+		try {
+			const workspace = await createWorkspace(stub, ["alpha"]);
+			const alpha = workspace.repositories.get("alpha");
+			assert(alpha);
+			// A Codex desktop chat folder: not a Git repository, but bound to the
+			// same workspace so only the analysis marker can keep it out.
+			const desktopChat = join(workspace.home, "Documents", "Codex", "chat");
+			await mkdir(desktopChat, { recursive: true });
+			await writeFile(
+				join(workspace.configDir, "projects.json"),
+				JSON.stringify({
+					projects: {
+						[alpha]: { organizationId: "org" },
+						[desktopChat]: { organizationId: "org" },
+					},
+				}),
+			);
+			const codexHome = join(workspace.home, ".codex");
+			const started = Date.now() - 60 * 60 * 1_000;
+			const desktopThread = codexThreadId(started);
+			const repositoryThread = codexThreadId(started + 10_000);
+			await writeCodexRollout(codexHome, {
+				cwd: desktopChat,
+				threadId: desktopThread,
+				userText: "Which repositories had the most failed sessions?",
+			});
+			await writeCodexRollout(codexHome, {
+				cwd: alpha,
+				threadId: repositoryThread,
+				userText: "Summarize the failing sessions in this repository.",
+			});
+			const claudeSession = "5b0c9a52-2d0e-4b8f-9a51-6f2f3c1d7e10";
+			const claudeTranscript = join(
+				workspace.home,
+				".claude",
+				"projects",
+				"-repositories-alpha",
+				`${claudeSession}.jsonl`,
+			);
+			await mkdir(dirname(claudeTranscript), { recursive: true });
+			await writeFile(
+				claudeTranscript,
+				`${JSON.stringify({
+					cwd: alpha,
+					message: { content: "How many sessions failed?", role: "user" },
+					sessionId: claudeSession,
+					timestamp: "2026-10-04T10:00:00.000Z",
+					type: "user",
+				})}\n`,
+			);
+			for (const session of [desktopThread, repositoryThread, claudeSession]) {
+				const imported = await runCli(
+					["import", session, "--analysis", "analysis-1", "--no-related"],
+					fixtureFor(workspace),
+					{ env: cliEnvironmentOverrides(undefined) },
+				);
+				expect(imported.exitCode).toBe(0);
+			}
+			const hooks: Array<{ args: string[]; stdin: string }> = [
+				...[
+					[desktopThread, desktopChat],
+					[repositoryThread, alpha],
+				].map(([threadId, cwd]) => ({
+					args: [
+						"hooks",
+						"codex",
+						"turn-complete",
+						JSON.stringify({
+							type: "agent-turn-complete",
+							"thread-id": threadId,
+							"turn-id": "turn",
+							cwd,
+							"input-messages": ["test"],
+							"last-assistant-message": "done",
+						}),
+					],
+					stdin: "",
+				})),
+				...(["session-start", "session-end"] as const).map((hook) => ({
+					args: ["hooks", "claude", hook],
+					stdin: JSON.stringify({
+						cwd: alpha,
+						session_id: claudeSession,
+						transcript_path: claudeTranscript,
+						hook_event_name:
+							hook === "session-start" ? "SessionStart" : "SessionEnd",
+						reason: "other",
+					}),
+				})),
+			];
+			for (const hook of hooks) {
+				const result = await runCli(hook.args, fixtureFor(workspace), {
+					stdin: hook.stdin,
+					env: cliEnvironmentOverrides(undefined),
+				});
+				expect(result.exitCode).toBe(0);
+			}
+
+			expect(stub.counts.init).toBe(0);
+			expect(await countPending(workspace)).toBe(0);
+			expect(await countSpooledCaptures(workspace)).toBe(0);
+			// Imports plus the hooks' linked re-uploads of the changed transcript
+			// all carried the analysis link; nothing went up unlinked.
+			const uploads = stub.transcriptUploads.map(
+				(body) => JSON.parse(body).json,
+			);
+			expect(uploads.length).toBeGreaterThanOrEqual(3);
+			expect(
+				uploads.filter((upload) => upload.analysisId !== "analysis-1"),
+			).toEqual([]);
+
+			// Control: the same repository and binding capture an unmarked chat.
+			await runHook(workspace, "claude-end", "alpha", "unmarked");
+			await waitFor(async () => (await countPending(workspace)) === 0, 60_000);
+			expect(stub.committed.size).toBe(1);
+		} finally {
+			stub.stop();
+		}
+	});
 });
+
+async function countSpooledCaptures(workspace: Workspace): Promise<number> {
+	const spoolRoot = join(workspace.configDir, "repo-context-spool", "v2");
+	let count = 0;
+	for (const binding of await readdir(spoolRoot).catch(() => [] as string[])) {
+		const captures = await readdir(join(spoolRoot, binding, "captures")).catch(
+			() => [] as string[],
+		);
+		count += captures.filter((name) => name.endsWith(".capture.json")).length;
+	}
+	return count;
+}
 
 function failFirst(
 	index: number,

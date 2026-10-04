@@ -6,6 +6,7 @@ import {
 	claudeCodeAdapter,
 	type FileBackedUploadRequest,
 } from "../../../internal/agent-adapters/index.js";
+import { findHookAnalysisMarker } from "../../../lib/analysis-hook.js";
 import { isRepositoryAutoUploadAllowed } from "../../../lib/auto-upload-config.js";
 import { loadCredentials } from "../../../lib/credentials.js";
 import { getGitInfo } from "../../../lib/git-info.js";
@@ -41,6 +42,22 @@ async function runSessionStart(): Promise<undefined> {
 		const input: unknown = JSON.parse(raw);
 		if (!isSessionStartInput(input)) return;
 		if (readRepositoryEvidencePauseUntil() !== undefined) return;
+		// A chat linked by `opaline import --analysis` (for example a resumed
+		// session) captures no repository evidence while the link is live, as
+		// in the SessionEnd and Codex turn-complete hooks.
+		if (
+			await findHookAnalysisMarker(
+				logger,
+				claudeCodeAdapter.source,
+				input.session_id,
+			)
+		) {
+			logger.info(
+				"Skipping start context for session {sessionId}: linked to an analysis",
+				{ sessionId: input.session_id },
+			);
+			return;
+		}
 		const hookReceivedAt = new Date().toISOString();
 		const gitInfo = await getGitInfo(input.cwd);
 		const repository = resolveUploadRepositoryIdentity(input.cwd, gitInfo);
