@@ -167,6 +167,44 @@ describe("inline image stripping (parity with the API)", () => {
 		).toBe(PNG_MARKER.replace("type=image/png", "type=image/gif"));
 	});
 
+	test("replaces any string value that is entirely an image data URL", () => {
+		const jpegMarker = PNG_MARKER.replace("type=image/png", "type=image/jpeg");
+		const line = JSON.stringify({
+			type: "event_msg",
+			payload: {
+				type: "item_completed",
+				item: {
+					type: "McpToolCall",
+					result: {
+						_meta: {
+							"codex/toolSurface": {
+								screenshot: {
+									pageUrl: "https://example.com",
+									url: `data:image/jpeg;base64,${PIXELS_BASE64}`,
+								},
+							},
+						},
+					},
+				},
+				images: [`data:image/png;base64,${PIXELS_BASE64}`],
+			},
+		});
+
+		const stripped = slimTranscriptText(line);
+
+		const payload = JSON.parse(stripped).payload;
+		expect(payload.item.result._meta["codex/toolSurface"].screenshot).toEqual({
+			pageUrl: "https://example.com",
+			url: jpegMarker,
+		});
+		expect(payload.images).toEqual([PNG_MARKER]);
+		expect(stripped).toBe(
+			line
+				.replace(`data:image/jpeg;base64,${PIXELS_BASE64}`, jpegMarker)
+				.replace(`data:image/png;base64,${PIXELS_BASE64}`, PNG_MARKER),
+		);
+	});
+
 	test("replaces base64 inside JSON-encoded tool-output strings", () => {
 		const output = JSON.stringify([
 			{ type: "input_text", text: "captured" },

@@ -7,13 +7,15 @@ import { createHash } from "node:crypto";
  *
  * 1. Inline images become one marker string that keeps the fact of the image:
  *    `opaline-image-omitted:v1;sha256=<hex of decoded bytes>;bytes=<decoded
- *    length>;type=<media type>`. Covered: Codex `image_url` data URLs (string
- *    or `image_url.url`), the Claude `{ type: "base64", media_type, data }`
- *    source, MCP `{ type: "image", mimeType, data }` content and Claude Read
- *    results `{ type: "image/...", base64 }`, also inside JSON-encoded tool
- *    output. Only strict, padded image base64 is replaced; data URLs in
- *    ordinary text or code stay. The output is byte-identical to the API's
- *    own stripping pass.
+ *    length>;type=<media type>`. Covered: any JSON string value that is
+ *    entirely a `data:image/<type>;base64,<payload>` URL (Codex `image_url`,
+ *    `image_url.url`, `_meta["codex/toolSurface"].screenshot.url`, ...), the
+ *    Claude `{ type: "base64", media_type, data }` source, MCP
+ *    `{ type: "image", mimeType, data }` content and Claude Read results
+ *    `{ type: "image/...", base64 }`, also inside JSON-encoded tool output.
+ *    Only strict, padded image base64 is replaced; data URLs embedded in
+ *    longer text or code stay. The output is byte-identical to the API's own
+ *    stripping pass.
  * 2. Codex command completions keep one copy of the output:
  *    `aggregated_output` stays, `stdout` is dropped only when it equals it, and
  *    `formatted_output` is dropped only when it equals it or is Codex's
@@ -162,6 +164,7 @@ function collectImageReplacements(
 ): void {
 	if (depth > MAX_WALK_DEPTH) return;
 	if (typeof value === "string") {
+		if (value.startsWith("data:image/")) addDataUrl(value, replacements);
 		collectFromEncodedJson(value, replacements, depth);
 		return;
 	}
