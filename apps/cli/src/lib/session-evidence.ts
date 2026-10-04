@@ -66,6 +66,7 @@ import {
 	requireRepositoryEvidenceApiKey,
 	uploadRepositoryEvidence,
 } from "./repository-evidence-upload.js";
+import { collectCaptureRuntime } from "./runtime-versions.js";
 import {
 	buildSessionAttribution,
 	type SessionAttributionHookKind,
@@ -181,6 +182,7 @@ export async function captureAndUploadSessionEvidence(input: {
 			repositoryPath: request.projectPath,
 			deadlineAt: captureDeadlineAt,
 			observedSkillNames: extractObservedSkills(request),
+			runtime: await collectCaptureRuntime(request.content, request.source),
 			...(toolResultsDirectory === null
 				? {}
 				: {

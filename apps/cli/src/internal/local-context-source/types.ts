@@ -617,6 +617,8 @@ export interface LocalContextManifest {
 	 * record (stream and 1-based JSONL line) and tool call that produced it.
 	 */
 	readonly toolResultReferences?: ToolResultReferences;
+	/** Tool and agent versions on the capturing machine. */
+	readonly runtime?: CaptureRuntime;
 	readonly transport: {
 		readonly secretFilterApplied: true;
 		readonly secretFilterVersion: number;
@@ -690,6 +692,29 @@ export interface ToolResultReferences {
 	readonly references: readonly ToolResultReference[];
 	/** References beyond the manifest's bound that were not listed. */
 	readonly omitted: number;
+}
+
+export interface CaptureRuntime {
+	readonly os: {
+		readonly platform: string;
+		readonly release: string;
+		readonly arch: string;
+	};
+	/** The JavaScript runtime executing the CLI. */
+	readonly cli: { readonly runtime: "node" | "bun"; readonly version: string };
+	/** Versions of tools on PATH; null when absent or slower than the timeout. */
+	readonly tools: {
+		readonly node: string | null;
+		readonly bun: string | null;
+		readonly git: string | null;
+		readonly python: string | null;
+	};
+	/** The agent that wrote the transcript, from the transcript itself. */
+	readonly agentHost: {
+		readonly name: "claude-code" | "codex";
+		readonly version: string | null;
+		readonly originator: string | null;
+	} | null;
 }
 
 export interface LocalContextBundle {

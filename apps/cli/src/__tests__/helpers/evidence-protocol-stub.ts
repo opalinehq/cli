@@ -7,6 +7,7 @@ import {
 	RepositoryEvidenceInitInputSchema,
 } from "../../contracts/index.js";
 import type {
+	CaptureRuntime,
 	ToolResultReferences,
 	UserAgentConfiguration,
 } from "../../internal/local-context-source/index.js";
@@ -79,6 +80,7 @@ export interface CommittedManifest {
 		};
 		readonly userConfiguration?: UserAgentConfiguration;
 		readonly toolResultReferences?: ToolResultReferences;
+		readonly runtime?: CaptureRuntime;
 	};
 	readonly contextIndex: {
 		readonly facets: readonly {

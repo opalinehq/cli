@@ -434,7 +434,7 @@ describe("sidecar delivery under faults", () => {
 		}
 	});
 
-	test("carries the session's saved tool outputs, linked to their records", async () => {
+	test("carries the session's saved tool outputs, linked to their records, and runtime versions", async () => {
 		const stub = startEvidenceProtocolStub();
 		try {
 			const workspace = await createWorkspace(stub, ["alpha"]);
@@ -543,6 +543,16 @@ describe("sidecar delivery under faults", () => {
 			expect(image).toContain("opaline-image-omitted:v1;sha256=");
 			expect(image).not.toContain(pixels);
 			expect(stored("unreferenced.txt")).toBe("Never referenced\n");
+			const runtime = localContext.runtime;
+			assert(runtime);
+			expect(runtime.agentHost).toEqual({
+				name: "claude-code",
+				version: "2.1.286",
+				originator: "cli",
+			});
+			expect(runtime.os.platform).toBe(process.platform);
+			expect(runtime.tools.git).toMatch(/^\d+\.\d+/u);
+			expect(runtime.cli.version.length).toBeGreaterThan(0);
 			await expectNothingDropped(workspace, stub);
 		} finally {
 			stub.stop();

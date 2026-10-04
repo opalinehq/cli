@@ -14,6 +14,7 @@ import {
 } from "../internal/local-context-source/capture-policy.js";
 import {
 	type AdditionalContextRoot,
+	type CaptureRuntime,
 	collectLocalContextBundle,
 	createLocalContextSourceEnv,
 	getDefaultLocalContextCollectionOptions,
@@ -158,6 +159,7 @@ export async function collectSessionRepositoryContext(input: {
 		readonly references: ToolResultReferences;
 		readonly transformText: (text: string) => string;
 	};
+	readonly runtime?: CaptureRuntime;
 }): Promise<SessionRepositoryContextCapture> {
 	const resolvedContext = await resolveRepositoryContext(input.repositoryPath);
 	const context: RepositoryContext = {
@@ -252,6 +254,7 @@ export async function collectSessionRepositoryContext(input: {
 			...(input.toolResults === undefined
 				? {}
 				: { toolResultReferences: input.toolResults.references }),
+			...(input.runtime === undefined ? {} : { runtime: input.runtime }),
 		},
 	};
 	const candidate = createRepositoryBundleCandidate(bundle);

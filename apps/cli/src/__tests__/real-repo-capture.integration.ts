@@ -367,6 +367,7 @@ describe("real repository sidecar capture", () => {
 					memoryRoot: memoryRoot
 						? `${memoryRoot.status}: ${memoryRoot.absolutePath}`
 						: null,
+					runtime: localContext.runtime ?? null,
 					entries: localContext.entries.length,
 					instructions: instructionResults,
 					userFiles,
