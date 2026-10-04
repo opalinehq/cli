@@ -113,6 +113,47 @@ export async function forgetAnalysisUploadCapability(
 	}
 }
 
+const SLIMMING_CAPABILITY = "transcriptSlimming";
+
+/** Positive answers only, like the analysis capability. */
+export function hasCachedTranscriptSlimmingCapability(
+	endpoint: URL,
+	authType: "api-key" | "bearer",
+	token: string,
+): boolean {
+	try {
+		const path = getSlimmingCapabilityPath(
+			getCapabilityKey(endpoint, authType, token),
+		);
+		return (
+			existsSync(path) &&
+			readFileSync(path, "utf8").trim() === SLIMMING_CAPABILITY
+		);
+	} catch {
+		return false;
+	}
+}
+
+export async function rememberTranscriptSlimmingCapability(
+	endpoint: URL,
+	authType: "api-key" | "bearer",
+	token: string,
+): Promise<void> {
+	try {
+		await writePrivateFile(
+			getSlimmingCapabilityPath(getCapabilityKey(endpoint, authType, token)),
+			`${SLIMMING_CAPABILITY}\n`,
+			getConfigDir(),
+		);
+	} catch {
+		// The preflight simply runs again next time.
+	}
+}
+
+function getSlimmingCapabilityPath(key: string): string {
+	return join(getConfigDir(), "upload-capabilities", `${key}.slimming`);
+}
+
 function getAnalysisCapabilityPath(key: string): string {
 	return join(getConfigDir(), "upload-capabilities", `${key}.analysis`);
 }

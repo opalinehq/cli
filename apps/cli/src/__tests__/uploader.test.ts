@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,8 +29,23 @@ import {
 } from "../lib/uploader.js";
 import {
 	INGEST_STUB_TEST_TOKEN,
+	respondAsSlimmingServer,
 	startIngestStub,
 } from "./helpers/ingest-stub.js";
+
+// Capability answers are cached in the config directory: keep them out of the
+// real one.
+const originalConfigDir = process.env.OPALINE_CONFIG_DIR;
+let isolatedConfigDir = "";
+beforeAll(async () => {
+	isolatedConfigDir = await mkdtemp(join(tmpdir(), "opaline-uploader-config-"));
+	process.env.OPALINE_CONFIG_DIR = isolatedConfigDir;
+});
+afterAll(async () => {
+	if (originalConfigDir === undefined) delete process.env.OPALINE_CONFIG_DIR;
+	else process.env.OPALINE_CONFIG_DIR = originalConfigDir;
+	await rm(isolatedConfigDir, { force: true, recursive: true });
+});
 
 describe("formatUploadError", () => {
 	test("explains API key rate limits from ingest auth", () => {
@@ -335,7 +350,8 @@ describe("uploadSession aggregate size guard", () => {
 			},
 		})}\n`;
 		const stub = startIngestStub({
-			respond: () =>
+			respond: (info) =>
+				respondAsSlimmingServer(info) ??
 				Response.json({ json: { success: true, sessionId: "slim-to-fit" } }),
 		});
 		try {
@@ -355,7 +371,12 @@ describe("uploadSession aggregate size guard", () => {
 			);
 			expect(Buffer.byteLength(content)).toBeGreaterThan(64 * 1024);
 			expect(result.success).toBe(true);
-			const body = stub.bodies[0] ?? "";
+			const body =
+				stub.bodies[
+					stub.requests.findIndex(
+						(request) => request.pathname === "/rpc/ingestSession",
+					)
+				] ?? "";
 			expect(body).toContain("opaline-image-omitted:v1;sha256=");
 			expect(body).not.toContain(screenshot);
 		} finally {
@@ -385,26 +406,36 @@ describe("uploadSession aggregate size guard", () => {
 			Buffer.byteLength(
 				`opaline-image-omitted:v1;sha256=${"0".repeat(64)};bytes=${96 * 1024};type=image/png`,
 			);
-		const result = await uploadSession(
-			{
-				source: "codex",
-				sessionId: "still-too-large",
-				projectPath: "/t",
-				content,
-			},
-			{
-				endpoint: "http://127.0.0.1:1/rpc",
-				allowInsecureEndpoint: false,
-				maxAggregateBytes: 1024,
-				token: "unused",
-			},
-		);
-		expect(result).toMatchObject({
-			success: false,
-			totalBytes: slimmedBytes,
-			maxBytes: 1024,
-			attempts: 0,
+		const stub = startIngestStub({
+			hostname: "127.0.0.1",
+			respond: (info) =>
+				respondAsSlimmingServer(info) ??
+				new Response("unexpected", { status: 500 }),
 		});
+		try {
+			const result = await uploadSession(
+				{
+					source: "codex",
+					sessionId: "still-too-large",
+					projectPath: "/t",
+					content,
+				},
+				{
+					endpoint: `${stub.loopbackBase}/rpc`,
+					allowInsecureEndpoint: false,
+					maxAggregateBytes: 1024,
+					token: "unused",
+				},
+			);
+			expect(result).toMatchObject({
+				success: false,
+				totalBytes: slimmedBytes,
+				maxBytes: 1024,
+				attempts: 0,
+			});
+		} finally {
+			stub.server.stop(true);
+		}
 	});
 
 	test("allows sessions up to 256 MiB after slimming", () => {

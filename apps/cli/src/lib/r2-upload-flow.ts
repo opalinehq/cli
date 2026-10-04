@@ -60,7 +60,13 @@ const RETRYABLE_JOB_FAILURE_CODES = new Set([
 export interface R2UploadFlowConfig {
 	readonly authType: "api-key" | "bearer";
 	readonly endpoint: URL;
-	readonly maxAggregateBytes: number;
+	/** Per-session limit for an upload with this slimming outcome. */
+	readonly maxAggregateBytes: (slimming: TranscriptSlimming) => number;
+	/**
+	 * Asked only when slimming changes the transcript: whether the server
+	 * accepts slimmed transcripts. Otherwise the upload is restaged unslimmed.
+	 */
+	readonly canSlim: () => Promise<boolean>;
 	readonly multipartBaseDelayMs: number | undefined;
 	readonly onProgress: ((progress: R2MultipartProgress) => void) | undefined;
 	readonly onTransferProgress?: (progress: UploadTransferProgress) => void;
@@ -75,10 +81,19 @@ export interface R2UploadFlowConfig {
 	readonly onStaged?: (aggregateBytes: number) => void;
 }
 
+/**
+ * `applied`: slimmed for a server that accepts it; `unchanged`: slimming
+ * changes nothing in this transcript; `unsupported`: the server does not
+ * accept slimmed transcripts, so it is sent unslimmed.
+ */
+export type TranscriptSlimming = "applied" | "unchanged" | "unsupported";
+
 export type R2UploadFlowResult =
 	| {
 			readonly actualBytes: number;
 			readonly maxBytes: number;
+			/** Slimming of the measured upload. */
+			readonly slimming: TranscriptSlimming;
 			readonly status: "too-large";
 	  }
 	| {
@@ -144,12 +159,27 @@ export async function uploadSessionViaR2(
 	request: IngestSessionInput | FileBackedUploadRequest,
 	config: R2UploadFlowConfig,
 ): Promise<R2UploadFlowResult> {
-	const staged = await stageFilteredUpload(
+	let staged = await stageFilteredUpload(
 		createFilteredUploadSources(request, { slim: true }),
 	);
+	// Slimming that changed nothing needs no negotiation; slimmed bytes go
+	// only to a server that accepts them.
+	let slimming: TranscriptSlimming =
+		staged.filterInputBytes < staged.inputBytes ? "applied" : "unchanged";
+	if (slimming === "applied" && !(await config.canSlim())) {
+		await cleanupStagedUpload(staged);
+		staged = await stageFilteredUpload(
+			createFilteredUploadSources(request, { slim: false }),
+		);
+		slimming = "unsupported";
+	}
 	config.onStaged?.(staged.aggregateBytes);
 	try {
-		const preflight = getPreflightFailure(staged, config.maxAggregateBytes);
+		const preflight = getPreflightFailure(
+			staged,
+			config.maxAggregateBytes(slimming),
+			slimming,
+		);
 		if (preflight) return preflight;
 		return await uploadStagedSession(staged, config);
 	} finally {
@@ -172,6 +202,7 @@ export function isR2InitUnsupported(error: unknown): boolean {
 function getPreflightFailure(
 	staged: StagedFilteredUpload,
 	maxAggregateBytes: number,
+	slimming: TranscriptSlimming,
 ): Exclude<R2UploadFlowResult, { readonly status: "success" }> | null {
 	const main = staged.objects.find((object) => object.kind === "main");
 	if (!main || main.byteLength === 0) return { status: "empty-main" };
@@ -185,6 +216,7 @@ function getPreflightFailure(
 		return {
 			actualBytes: staged.aggregateBytes,
 			maxBytes: maxAggregateBytes,
+			slimming,
 			status: "too-large",
 		};
 	}

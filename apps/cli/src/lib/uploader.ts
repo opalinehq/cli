@@ -44,9 +44,11 @@ import {
 	isR2InitUnsupported,
 	R2IngestInitError,
 	R2IngestPendingError,
+	type TranscriptSlimming,
 	uploadSessionViaR2,
 } from "./r2-upload-flow.js";
 import { slimTranscriptText } from "./transcript-slim.js";
+import { supportsTranscriptSlimming } from "./transcript-slimming-capability.js";
 import type { UploadResult, UploadTransferProgress } from "./types.js";
 import { describeUploadEndpointRejection } from "./upload-endpoint.js";
 
@@ -108,6 +110,7 @@ type LegacyUploadPreparation =
 	| {
 			readonly actualBytes: number;
 			readonly maxBytes: number;
+			readonly slimming: TranscriptSlimming;
 			readonly status: "too-large";
 	  }
 	| {
@@ -379,8 +382,6 @@ async function uploadSessionMeasured(
 	measured: { uploadBytes: number | undefined },
 ): Promise<UploadResult> {
 	config.signal?.throwIfAborted();
-	const maxAggregateBytes =
-		config.maxAggregateBytes ?? INGEST_AGGREGATE_CONTENT_MAX_BYTES;
 	const endpoint = parseSafeApiEndpoint(config.endpoint, {
 		allowPlaintext: config.allowInsecureEndpoint,
 	});
@@ -393,6 +394,21 @@ async function uploadSessionMeasured(
 			retryable: false,
 		};
 	}
+	// Slimmed transcripts go only to servers that say they accept them:
+	// older servers reject a re-upload that shrinks a stored session, and keep
+	// the 128 MiB limit. The server is asked only when slimming changes the
+	// transcript.
+	const canSlim = () =>
+		supportsTranscriptSlimming(
+			new URL(endpoint.url),
+			config.authType ?? "bearer",
+			config.token,
+		);
+	const maxAggregateBytesFor = (slimming: TranscriptSlimming) =>
+		config.maxAggregateBytes ??
+		(slimming === "unsupported"
+			? INGEST_DIRECT_CONTENT_MAX_BYTES
+			: INGEST_AGGREGATE_CONTENT_MAX_BYTES);
 
 	// Stat file-backed transcripts before reading, filtering or staging them.
 	// The per-session limit applies to the slimmed, filtered upload; only a
@@ -429,7 +445,8 @@ async function uploadSessionMeasured(
 			const r2Result = await uploadSessionViaR2(request, {
 				authType,
 				endpoint: endpointUrl,
-				maxAggregateBytes,
+				maxAggregateBytes: maxAggregateBytesFor,
+				canSlim,
 				multipartBaseDelayMs: config.r2MultipartBaseDelayMs,
 				onProgress: config.onProgress,
 				onTransferProgress: config.onTransferProgress,
@@ -458,12 +475,15 @@ async function uploadSessionMeasured(
 					totalBytes: r2Result.actualBytes,
 					maxBytes: r2Result.maxBytes,
 					success: false,
-					error: formatTranscriptTooLargeError(
+					error: formatSessionTooLargeError(
 						r2Result.actualBytes,
 						r2Result.maxBytes,
+						r2Result.slimming,
 					),
 					attempts: 0,
-					retryable: false,
+					// Unslimmed for a server without slimming: it may fit once
+					// the server accepts slimmed transcripts, so a retry can work.
+					retryable: r2Result.slimming === "unsupported",
 				};
 			}
 			const analysisFailure = getAnalysisLinkFailure(
@@ -510,7 +530,7 @@ async function uploadSessionMeasured(
 
 	let legacy: LegacyUploadPreparation;
 	try {
-		legacy = await prepareLegacyUpload(request, maxAggregateBytes);
+		legacy = await prepareLegacyUpload(request, maxAggregateBytesFor, canSlim);
 	} catch (error) {
 		const filterFailure = getSecretFilterUploadFailure(error);
 		if (filterFailure) return filterFailure;
@@ -556,9 +576,13 @@ async function uploadSessionMeasured(
 			totalBytes: legacy.actualBytes,
 			maxBytes: legacy.maxBytes,
 			success: false,
-			error: formatTranscriptTooLargeError(legacy.actualBytes, legacy.maxBytes),
+			error: formatSessionTooLargeError(
+				legacy.actualBytes,
+				legacy.maxBytes,
+				legacy.slimming,
+			),
 			attempts: 0,
-			retryable: false,
+			retryable: legacy.slimming === "unsupported",
 		};
 	}
 	const { filteredRequest, filteredText } = legacy;
@@ -704,7 +728,8 @@ async function uploadSessionMeasured(
 
 async function prepareLegacyUpload(
 	request: UploadSessionRequest,
-	maxAggregateBytes: number,
+	maxAggregateBytesFor: (slimming: TranscriptSlimming) => number,
+	canSlim: () => Promise<boolean>,
 ): Promise<LegacyUploadPreparation> {
 	if (isFileBackedUploadRequest(request)) {
 		const sourceBytes = await getFileBackedAggregateBytes(request);
@@ -716,9 +741,17 @@ async function prepareLegacyUpload(
 			};
 		}
 	}
-	const materialized = slimUploadRequest(
-		await materializeLegacyUploadRequest(request),
-	);
+	const unslimmed = await materializeLegacyUploadRequest(request);
+	const candidate = slimUploadRequest(unslimmed);
+	// Slimming that changed nothing needs no negotiation.
+	const slimming: TranscriptSlimming =
+		getUploadAggregateBytes(candidate) >= getUploadAggregateBytes(unslimmed)
+			? "unchanged"
+			: (await canSlim())
+				? "applied"
+				: "unsupported";
+	const materialized = slimming === "applied" ? candidate : unslimmed;
+	const maxAggregateBytes = maxAggregateBytesFor(slimming);
 	const inputBytes = getUploadAggregateBytes(materialized);
 	const filteredText = filterSessionTextFields({
 		content: materialized.content,
@@ -750,6 +783,7 @@ async function prepareLegacyUpload(
 		return {
 			actualBytes: aggregateBytes,
 			maxBytes: maxAggregateBytes,
+			slimming,
 			status: "too-large",
 		};
 	}
@@ -972,6 +1006,16 @@ function getUploadAggregateBytes(request: IngestSessionInput): number {
 			0,
 		)
 	);
+}
+
+function formatSessionTooLargeError(
+	actualBytes: number,
+	maxBytes: number,
+	slimming: TranscriptSlimming,
+): string {
+	return slimming !== "unsupported"
+		? formatTranscriptTooLargeError(actualBytes, maxBytes)
+		: `Session transcript payload is ${formatMebibytes(actualBytes)} MiB, above the ${formatMebibytes(maxBytes)} MiB limit of this Opaline server, which does not accept slimmed transcripts yet. It stays queued; retry with \`opaline upload --retry\` after the server is updated.`;
 }
 
 function formatTranscriptTooLargeError(

@@ -35,7 +35,11 @@ const CliUserSchema = z.object({
 	email: z.string(),
 	name: z.string(),
 	capabilities: z
-		.object({ analysisLinkedUploads: z.literal(true).optional() })
+		.object({
+			analysisLinkedUploads: z.literal(true).optional(),
+			/** The server accepts slimmed transcripts (no shrink rejection). */
+			transcriptSlimming: z.literal(true).optional(),
+		})
 		.optional(),
 });
 // Keep UUID-sized batches below common reverse-proxy URI limits.

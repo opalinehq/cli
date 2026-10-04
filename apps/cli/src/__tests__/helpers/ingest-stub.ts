@@ -14,6 +14,25 @@ const SOURCE_CLI_PATH = resolve(import.meta.dir, "..", "..", "bin", "cli.ts");
 
 export const INGEST_STUB_TEST_TOKEN = "endpoint-security-test-token";
 
+/**
+ * Answers `cli.authStatus` for a server that accepts slimmed transcripts, or
+ * undefined for any other path (to compose inside `respond`).
+ */
+export function respondAsSlimmingServer(
+	info: Pick<IngestStubRespondInfo, "pathname">,
+): Response | undefined {
+	return info.pathname === "/rpc/cli/authStatus"
+		? Response.json({
+				json: {
+					id: "user-1",
+					email: "user@example.invalid",
+					name: "User",
+					capabilities: { transcriptSlimming: true },
+				},
+			})
+		: undefined;
+}
+
 export interface IngestStubRequest {
 	readonly apiKey: string | null;
 	readonly pathname: string;

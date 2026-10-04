@@ -63,9 +63,10 @@ function startApiStub(overrides: Partial<ApiStubOptions> = {}): ApiStub {
 						email: "analyst@example.com",
 						id: "user-1",
 						name: "Analyst",
-						...(options.capability
-							? { capabilities: { analysisLinkedUploads: true } }
-							: {}),
+						capabilities: {
+							...(options.capability ? { analysisLinkedUploads: true } : {}),
+							transcriptSlimming: true,
+						},
 					},
 				});
 			}
