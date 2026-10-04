@@ -407,6 +407,70 @@ describe("instruction capture", () => {
 	});
 });
 
+describe("Git-ignored directories", () => {
+	test("are walked after all other content and never truncate the repository or other roots", async () => {
+		const files: Record<string, string> = {
+			".gitignore": "scratch/\n.claude/\n",
+			"AGENTS.md": "Agent instructions\n",
+			"zzz/CLAUDE.md": "Nested instructions\n",
+			".claude/agents/reviewer.md": "Ignored but agent configuration\n",
+		};
+		for (let index = 0; index < 120; index += 1)
+			files[`scratch/run-${String(index).padStart(3, "0")}/output.txt`] =
+				"scratch\n";
+		const repository = await createRepository(files);
+		const skills = await createDirectory({
+			"demo/SKILL.md": "Skill\n",
+			"other/SKILL.md": "Skill\n",
+		});
+		const bundle = await collect(
+			repository,
+			{ maxEntriesPerRoot: 40, maxTotalEntries: 60 },
+			[skillRoot("claude-user-skills", skills)],
+		);
+		expect(bundle.manifest.roots.map((root) => [root.id, root.status])).toEqual(
+			[
+				["repository", "collected"],
+				["claude-user-skills", "collected"],
+			],
+		);
+		expect(getFacetCoverage(bundle, "repository")).toEqual(ALL_COMPLETE);
+		expect(
+			bundle.manifest.contextIndex.skills.map((skill) => skill.name),
+		).toEqual(["demo", "other"]);
+		expect(readCaptured(bundle, "zzz/CLAUDE.md")).toBe("Nested instructions\n");
+		// Ignored agent configuration is not deferred.
+		expect(getFile(bundle, ".claude/agents/reviewer.md").content.status).toBe(
+			"available",
+		);
+		expect(bundle.manifest.coverage.limitsReached).toContain(
+			"maxEntriesPerRoot:ignored",
+		);
+		const ignored = bundle.manifest.coverage.excludedPaths.filter(
+			(excluded) => excluded.reason === "ignored",
+		);
+		expect(ignored.length).toBeGreaterThan(0);
+		for (const excluded of ignored)
+			expect(excluded.path.startsWith("scratch")).toBe(true);
+		const areas = await getCoverageAreas(bundle);
+		expect(Object.values(areas).every((status) => status === "complete")).toBe(
+			true,
+		);
+	});
+
+	test("a cut in non-ignored content still truncates the root", async () => {
+		const files: Record<string, string> = { "AGENTS.md": "Instructions\n" };
+		for (let index = 0; index < 60; index += 1)
+			files[`src/module-${index}.ts`] = "export {};\n";
+		const repository = await createRepository(files);
+		const bundle = await collect(repository, { maxEntriesPerRoot: 20 });
+		expect(bundle.manifest.roots[0]?.status).toBe("limit-reached");
+		expect(getFacetCoverage(bundle, "repository")["agents-instructions"]).toBe(
+			"truncated",
+		);
+	});
+});
+
 async function collect(
 	repository: string,
 	limits: Partial<LocalContextCollectionLimits> = {},

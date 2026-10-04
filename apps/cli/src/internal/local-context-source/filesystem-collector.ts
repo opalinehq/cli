@@ -51,7 +51,11 @@ const MAX_INSTRUCTION_IMPORTS_PER_FILE = 64;
 type ContentPool = "general" | "instruction";
 
 interface PendingFile {
-	readonly result: Awaited<ReturnType<typeof discoverRoot>>;
+	readonly result: {
+		readonly root: RootSpec;
+		readonly skillDirectories: readonly string[];
+		readonly coverage: MutableRootCoverage;
+	};
 	readonly entry: DiscoveredEntry;
 	readonly categories: readonly ContextFileCategory[];
 	readonly rootOrder: number;
@@ -77,6 +81,16 @@ interface PendingDirectory {
 	readonly absolutePath: string;
 	readonly relativePath: string;
 	readonly depth: number;
+	/** Inside a Git-ignored directory: walked after all other content. */
+	readonly ignored: boolean;
+}
+
+interface RootWalk {
+	readonly root: RootSpec;
+	readonly discovered: DiscoveredEntry[];
+	readonly deferred: PendingDirectory[];
+	readonly ignoredDirectories: ReadonlySet<string>;
+	readonly coverage: MutableRootCoverage;
 }
 
 interface MutableRootCoverage {
@@ -160,9 +174,9 @@ export async function collectFileSystemContext(
 		omittedBytes: 0,
 	};
 
-	const collectedRoots = [];
+	const walks = [];
 	for (const rootSpec of rootSpecs) {
-		collectedRoots.push(
+		walks.push(
 			await discoverRoot(
 				rootSpec,
 				options,
@@ -174,6 +188,32 @@ export async function collectFileSystemContext(
 			),
 		);
 	}
+	// Git-ignored directories (agent scratch space, local data, build output
+	// that is not excluded by name) are walked last, with whatever entry budget
+	// remains after every root's own content. What does not fit is recorded as
+	// an ignored exclusion, not as a cut of the repository's inventory.
+	for (const walk of walks) {
+		if (walk.walk === null || walk.walk.deferred.length === 0) continue;
+		await walkDirectories(
+			walk.walk,
+			walk.walk.deferred.splice(0),
+			options,
+			fileSystem,
+			git,
+			aggregate,
+			excludedPaths,
+			errors,
+		);
+	}
+	const collectedRoots = walks.map((walk) => ({
+		root: walk.root,
+		status: walk.status,
+		coverage: walk.coverage,
+		discovered: walk.walk?.discovered ?? [],
+		skillDirectories: findSkillDirectories(
+			(walk.walk?.discovered ?? []).map((entry) => entry.path),
+		),
+	}));
 	const observedSkills = new Set(options.observedSkillNames ?? []);
 	const files: PendingFile[] = [];
 	for (const [rootOrder, result] of collectedRoots.entries()) {
@@ -365,9 +405,8 @@ async function discoverRoot(
 ): Promise<{
 	readonly root: RootSpec;
 	readonly status: "missing" | "inaccessible" | null;
-	readonly discovered: readonly DiscoveredEntry[];
-	readonly skillDirectories: readonly string[];
 	readonly coverage: MutableRootCoverage;
+	readonly walk: RootWalk | null;
 }> {
 	const coverage = createMutableRootCoverage();
 	const canonicalRoot = await resolveRoot(
@@ -380,33 +419,45 @@ async function discoverRoot(
 		return {
 			root: rootSpec,
 			status: canonicalRoot.status,
-			discovered: [],
-			skillDirectories: [],
 			coverage,
+			walk: null,
 		};
 	}
-
-	const discovered = await discoverRootEntries(
-		{ ...rootSpec, absolutePath: canonicalRoot.path },
+	const root = { ...rootSpec, absolutePath: canonicalRoot.path };
+	const walk: RootWalk = {
+		root,
+		discovered: [],
+		deferred: [],
+		ignoredDirectories:
+			root.id === "repository" ? getIgnoredDirectories(git) : new Set(),
+		coverage,
+	};
+	await walkDirectories(
+		walk,
+		[
+			{
+				absolutePath: root.absolutePath,
+				relativePath: "",
+				depth: 0,
+				ignored: false,
+			},
+		],
 		options,
 		fileSystem,
 		git,
 		aggregate,
-		coverage,
 		excludedPaths,
 		errors,
 	);
-
-	const skillDirectories = findSkillDirectories(
-		discovered.map((entry) => entry.path),
-	);
-	return {
-		root: { ...rootSpec, absolutePath: canonicalRoot.path },
-		status: null,
-		discovered,
-		skillDirectories,
+	addUndiscoveredSubmodules(
+		root,
+		walk.discovered,
+		options,
+		git,
+		aggregate,
 		coverage,
-	};
+	);
+	return { root, status: null, coverage, walk };
 }
 
 async function resolveRoot(
@@ -455,23 +506,48 @@ async function resolveRoot(
 	}
 }
 
-async function discoverRootEntries(
-	root: RootSpec,
+/**
+ * Breadth-first walk of one root. Directories inside Git-ignored directories
+ * are queued on the walk's deferred list during the first pass and walked in
+ * a second pass (`queue` then holds only ignored directories). A discovery
+ * limit reached during the first pass truncates the root; reached during the
+ * second pass it only excludes the ignored directories that did not fit.
+ */
+async function walkDirectories(
+	walk: RootWalk,
+	queue: PendingDirectory[],
 	options: LocalContextCollectionOptions,
 	fileSystem: LocalContextFileSystem,
 	git: GitCollectionResult,
 	aggregate: MutableAggregate,
-	coverage: MutableRootCoverage,
 	excludedPaths: ExcludedPath[],
 	errors: CoverageError[],
-): Promise<DiscoveredEntry[]> {
-	const discovered: DiscoveredEntry[] = [];
-	const pending: PendingDirectory[] = [
-		{ absolutePath: root.absolutePath, relativePath: "", depth: 0 },
-	];
+): Promise<void> {
+	const { root, coverage, discovered } = walk;
+	const excludeIgnored = (
+		directories: readonly PendingDirectory[],
+		limit: string,
+	) => {
+		for (const directory of directories) {
+			excludedPaths.push({
+				rootId: root.id,
+				path: directory.relativePath,
+				reason: "ignored",
+			});
+			coverage.excludedPaths += 1;
+		}
+		coverage.limitsReached.add(`${limit}:ignored`);
+	};
+	const stopAtEntryLimit = (directory: PendingDirectory, limit: string) => {
+		if (directory.ignored) {
+			excludeIgnored([directory, ...queue.splice(0)], limit);
+		} else {
+			coverage.limitsReached.add(limit);
+		}
+	};
 
-	while (pending.length > 0) {
-		const directory = pending.shift();
+	while (queue.length > 0) {
+		const directory = queue.shift();
 		if (directory === undefined) break;
 		if (
 			root.id === "repository" &&
@@ -501,8 +577,8 @@ async function discoverRootEntries(
 				? "maxEntriesPerRoot"
 				: "maxTotalEntries";
 		if (remainingEntries <= 0) {
-			coverage.limitsReached.add(entryLimit);
-			return discovered;
+			stopAtEntryLimit(directory, entryLimit);
+			return;
 		}
 		let children: FileSystemEntry[];
 		let complete: boolean;
@@ -513,12 +589,14 @@ async function discoverRootEntries(
 			));
 			coverage.enumeratedEntries += children.length;
 			aggregate.totalEnumeratedEntries += children.length;
-			if (!complete)
-				coverage.limitsReached.add(
+			if (!complete) {
+				const limit =
 					coverage.enumeratedEntries >= options.limits.maxEntriesPerRoot
 						? "maxEntriesPerRoot"
-						: "maxTotalEntries",
-				);
+						: "maxTotalEntries";
+				if (directory.ignored) excludeIgnored([directory], limit);
+				else coverage.limitsReached.add(limit);
+			}
 		} catch (error) {
 			pushFileSystemError(
 				errors,
@@ -537,12 +615,13 @@ async function discoverRootEntries(
 				coverage.discoveredEntries >= options.limits.maxEntriesPerRoot ||
 				aggregate.totalEntries >= options.limits.maxTotalEntries
 			) {
-				coverage.limitsReached.add(
+				stopAtEntryLimit(
+					directory,
 					coverage.discoveredEntries >= options.limits.maxEntriesPerRoot
 						? "maxEntriesPerRoot"
 						: "maxTotalEntries",
 				);
-				return discovered;
+				return;
 			}
 			const relativePath = directory.relativePath
 				? `${directory.relativePath}/${child.name}`
@@ -587,27 +666,45 @@ async function discoverRootEntries(
 			countDiscoveredEntry(stat, coverage, aggregate, isSubmodule);
 
 			if (stat.kind === "directory" && !isSubmodule) {
-				if (directory.depth + 1 >= options.limits.maxDepthPerRoot) {
-					coverage.limitsReached.add("maxDepthPerRoot");
+				const child: PendingDirectory = {
+					absolutePath,
+					relativePath,
+					depth: directory.depth + 1,
+					ignored:
+						directory.ignored ||
+						(walk.ignoredDirectories.has(relativePath) &&
+							!isAgentContextDirectory(relativePath)),
+				};
+				if (child.depth >= options.limits.maxDepthPerRoot) {
+					if (child.ignored) excludeIgnored([child], "maxDepthPerRoot");
+					else coverage.limitsReached.add("maxDepthPerRoot");
+				} else if (child.ignored && !directory.ignored) {
+					walk.deferred.push(child);
 				} else {
-					pending.push({
-						absolutePath,
-						relativePath,
-						depth: directory.depth + 1,
-					});
+					queue.push(child);
 				}
 			}
 		}
 	}
-	addUndiscoveredSubmodules(
-		root,
-		discovered,
-		options,
-		git,
-		aggregate,
-		coverage,
+}
+
+/** Directories Git reports as ignored (`git status --ignored=matching`). */
+function getIgnoredDirectories(git: GitCollectionResult): ReadonlySet<string> {
+	if (git.snapshot.status !== "available") return new Set();
+	return new Set(
+		git.snapshot.statusEntries
+			.filter((entry) => entry.kind === "ignored" && entry.path.endsWith("/"))
+			.map((entry) => entry.path.slice(0, -1)),
 	);
-	return discovered;
+}
+
+/** Agent configuration stays first-class even when a repository ignores it. */
+function isAgentContextDirectory(relativePath: string): boolean {
+	return relativePath
+		.split("/")
+		.some((segment) =>
+			[".agents", ".claude", ".codex", ".cursor", ".github"].includes(segment),
+		);
 }
 
 async function isNestedGitBoundary(

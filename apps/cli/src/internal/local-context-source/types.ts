@@ -297,7 +297,14 @@ export interface CoverageError {
 export interface ExcludedPath {
 	readonly rootId: string;
 	readonly path: string;
-	readonly reason: "vcs" | "dependency" | "generated" | "cache" | "explicit";
+	readonly reason:
+		| "vcs"
+		| "dependency"
+		| "generated"
+		| "cache"
+		| "explicit"
+		// A Git-ignored directory the entry budget did not reach.
+		| "ignored";
 }
 
 export interface RootCoverage {

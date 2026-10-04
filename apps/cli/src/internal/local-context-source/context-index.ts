@@ -48,10 +48,32 @@ export function buildContextIndex(
 	errors: readonly CoverageError[],
 	droppedEntries: readonly ContextEntry[] = [],
 ): ContextIndex {
+	const facetEntries = new Map<string, ContextEntry[]>();
+	for (const entry of entries)
+		for (const kind of getFacetKinds(entry.path, entry)) {
+			const key = getFacetKey(entry.rootId, kind);
+			const list = facetEntries.get(key) ?? [];
+			list.push(entry);
+			facetEntries.set(key, list);
+		}
+	const droppedFacets = new Set(
+		droppedEntries.flatMap((entry) =>
+			getFacetKinds(entry.path, entry).map((kind) =>
+				getFacetKey(entry.rootId, kind),
+			),
+		),
+	);
 	return {
 		facets: roots.flatMap((root) =>
 			FACET_KINDS.map((kind) =>
-				buildFacet(root, kind, entries, excludedPaths, errors, droppedEntries),
+				buildFacet(
+					root,
+					kind,
+					facetEntries.get(getFacetKey(root.id, kind)) ?? [],
+					excludedPaths,
+					errors,
+					droppedFacets.has(getFacetKey(root.id, kind)),
+				),
 			),
 		),
 		skills: buildSkillIndex(entries),
@@ -79,16 +101,11 @@ export function assessContextSkillUse(
 function buildFacet(
 	root: ContextRootManifest,
 	kind: ContextIndexFacetKind,
-	entries: readonly ContextEntry[],
+	facetEntries: readonly ContextEntry[],
 	excludedPaths: readonly ExcludedPath[],
 	errors: readonly CoverageError[],
-	droppedEntries: readonly ContextEntry[],
+	lostEntries: boolean,
 ): ContextIndexFacet {
-	const facetEntries = entries.filter(
-		(entry) =>
-			entry.rootId === root.id &&
-			getFacetKinds(entry.path, entry).includes(kind),
-	);
 	const resources = facetEntries.map(buildResource).sort(compareResources);
 	const coverage = getFacetCoverage(
 		root,
@@ -96,7 +113,7 @@ function buildFacet(
 		facetEntries,
 		excludedPaths,
 		errors,
-		droppedEntries,
+		lostEntries,
 	);
 	return {
 		kind,
@@ -174,7 +191,7 @@ function getFacetCoverage(
 	facetEntries: readonly ContextEntry[],
 	excludedPaths: readonly ExcludedPath[],
 	errors: readonly CoverageError[],
-	droppedEntries: readonly ContextEntry[],
+	lostEntries: boolean,
 ): ContextIndexCoverageStatus {
 	if (root.status === "missing") return "complete";
 	if (root.status === "inaccessible") return "denied";
@@ -189,11 +206,7 @@ function getFacetCoverage(
 		return "denied";
 	}
 	if (
-		droppedEntries.some(
-			(entry) =>
-				entry.rootId === root.id &&
-				getFacetKinds(entry.path, entry).includes(kind),
-		) ||
+		lostEntries ||
 		facetEntries.some(
 			(entry) =>
 				entry.kind === "file" &&
@@ -207,6 +220,7 @@ function getFacetCoverage(
 		excludedPaths.some(
 			(excluded) =>
 				excluded.rootId === root.id &&
+				excluded.reason !== "ignored" &&
 				getFacetKinds(excluded.path).includes(kind),
 		)
 	) {
@@ -215,9 +229,33 @@ function getFacetCoverage(
 	return "complete";
 }
 
+// Entries are immutable and classified many times while the manifest bound
+// searches for its size, so their facet kinds are memoized.
+const ENTRY_FACET_KINDS = new WeakMap<
+	ContextEntry,
+	readonly ContextIndexFacetKind[]
+>();
+
+function getFacetKey(rootId: string, kind: ContextIndexFacetKind): string {
+	return `${rootId}\0${kind}`;
+}
+
 function getFacetKinds(
 	path: string,
 	entry: ContextEntry | undefined = undefined,
+): readonly ContextIndexFacetKind[] {
+	if (entry === undefined || entry.path !== path)
+		return classifyFacetKinds(path, entry);
+	const cached = ENTRY_FACET_KINDS.get(entry);
+	if (cached !== undefined) return cached;
+	const kinds = classifyFacetKinds(path, entry);
+	ENTRY_FACET_KINDS.set(entry, kinds);
+	return kinds;
+}
+
+function classifyFacetKinds(
+	path: string,
+	entry: ContextEntry | undefined,
 ): readonly ContextIndexFacetKind[] {
 	const normalized = path.toLowerCase();
 	const name = basename(normalized);
