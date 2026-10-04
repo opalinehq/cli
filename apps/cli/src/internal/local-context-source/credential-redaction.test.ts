@@ -76,7 +76,7 @@ describe("credential text redaction", () => {
 		"Use the --token flag to pass it.",
 		"tokenCount: 1234567",
 		"Authorization: Bearer",
-		"postgres://${DB_USER}:${DB_PASSWORD}@localhost/app",
+		"postgres://$DB_USER:$DB_PASSWORD@localhost/app",
 		"monkey: banana",
 	])("leaves prose, types and references alone: %s", (text) => {
 		expect(filterContextText(text).text).toBe(text);
