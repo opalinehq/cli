@@ -1,6 +1,6 @@
 import { getLogger } from "@logtape/logtape";
 import { buildCommand } from "@stricli/core";
-import { ensureSessionStartHook } from "../../../internal/agent-adapters/adapters/claude-code/settings.js";
+import { ensureClaudeHooksCurrent } from "../../../internal/agent-adapters/adapters/claude-code/settings.js";
 import {
 	claudeCodeAdapter,
 	type SessionFile,
@@ -63,11 +63,13 @@ async function runSessionEnd(): Promise<undefined | Error> {
 				claudeCodeAdapter.getHookConfigPath({ projectPath: input.cwd }),
 			]);
 			for (const path of paths) {
-				if (ensureSessionStartHook(path))
-					logger.info("Added the missing Claude Code SessionStart hook");
+				if (ensureClaudeHooksCurrent(path))
+					logger.info("Updated Opaline's Claude Code hooks in {path}", {
+						path,
+					});
 			}
 		} catch (error) {
-			logger.warn("Could not add the SessionStart hook: {error}", {
+			logger.warn("Could not update Opaline's Claude Code hooks: {error}", {
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}

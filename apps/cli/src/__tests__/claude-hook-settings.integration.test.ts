@@ -49,7 +49,14 @@ test("installs once in user settings and can disable from another repository", a
 				{ matcher: "", hooks: [otherHook] },
 				{
 					matcher: "",
-					hooks: [{ type: "command", command: hookCommand, async: true }],
+					hooks: [
+						{
+							type: "command",
+							command: hookCommand,
+							async: true,
+							timeout: 60,
+						},
+					],
 				},
 			],
 		},
@@ -104,7 +111,12 @@ test("upgrades a legacy user hook and preserves neighboring hooks on removal", a
 					matcher: "",
 					hooks: [
 						otherHook,
-						{ type: "command", command: hookCommand, async: true },
+						{
+							type: "command",
+							command: hookCommand,
+							async: true,
+							timeout: 60,
+						},
 					],
 				},
 			],
@@ -117,7 +129,7 @@ test("upgrades a legacy user hook and preserves neighboring hooks on removal", a
 });
 
 test.each(["opaline", "rudel"])(
-	"heals a %s SessionEnd-only install once without touching neighboring hooks",
+	"heals a %s SessionEnd-only install once without touching neighboring hooks or its command",
 	async (command) => {
 		const home = await mkdtemp(join(tmpdir(), "opaline-heal-hook-"));
 		fixtureHomes.push(home);
@@ -148,7 +160,19 @@ test.each(["opaline", "rudel"])(
 		const healed = await readFile(settingsPath, "utf8");
 		expect(JSON.parse(healed)).toEqual({
 			hooks: {
-				SessionEnd: endHooks,
+				SessionEnd: [
+					{
+						matcher: "",
+						hooks: [
+							otherHook,
+							{
+								type: "command",
+								command: `${command} hooks claude session-end`,
+								timeout: 60,
+							},
+						],
+					},
+				],
 				SessionStart: [
 					{
 						matcher: "",
@@ -212,6 +236,99 @@ test("repairs a synchronous SessionStart hook without enabling opted-out install
 		{
 			matcher: "",
 			hooks: [{ type: "command", command: startHookCommand, async: true }],
+		},
+	]);
+});
+
+test("adds the SessionEnd timeout to a 0.11 install once, keeping its command and neighbours", async () => {
+	const home = await mkdtemp(join(tmpdir(), "opaline-timeout-hook-"));
+	fixtureHomes.push(home);
+	const settingsPath = join(home, ".claude", "settings.json");
+	await mkdir(join(home, ".claude"));
+	const startHooks = [
+		{
+			matcher: "",
+			hooks: [{ type: "command", command: startHookCommand, async: true }],
+		},
+	];
+	const legacyEnd = {
+		type: "command",
+		command: "rudel hooks claude session-end",
+		async: true,
+	};
+	await writeFile(
+		settingsPath,
+		JSON.stringify({
+			permissions: { allow: ["Read"] },
+			hooks: {
+				SessionStart: startHooks,
+				SessionEnd: [
+					{ matcher: "", hooks: [otherHook] },
+					{ matcher: "", hooks: [legacyEnd] },
+				],
+				Stop: [{ matcher: "", hooks: [otherHook] }],
+			},
+		}),
+	);
+
+	expect(await runProbe("heal", home, home)).toEqual({
+		path: settingsPath,
+		enabled: true,
+		healed: true,
+	});
+	const healed = await readFile(settingsPath, "utf8");
+	expect(JSON.parse(healed)).toEqual({
+		permissions: { allow: ["Read"] },
+		hooks: {
+			SessionStart: startHooks,
+			SessionEnd: [
+				{ matcher: "", hooks: [otherHook] },
+				{ matcher: "", hooks: [{ ...legacyEnd, timeout: 60 }] },
+			],
+			Stop: [{ matcher: "", hooks: [otherHook] }],
+		},
+	});
+	expect(await runProbe("heal", home, home)).toEqual({
+		path: settingsPath,
+		enabled: true,
+		healed: false,
+	});
+	expect(await readFile(settingsPath, "utf8")).toBe(healed);
+});
+
+test("replaces a different timeout on Opaline's SessionEnd hook on install", async () => {
+	const home = await mkdtemp(join(tmpdir(), "opaline-timeout-install-"));
+	fixtureHomes.push(home);
+	const settingsPath = join(home, ".claude", "settings.json");
+	await mkdir(join(home, ".claude"));
+	await writeFile(
+		settingsPath,
+		JSON.stringify({
+			hooks: {
+				SessionEnd: [
+					{
+						matcher: "",
+						hooks: [
+							{ ...otherHook, timeout: 5 },
+							{ type: "command", command: hookCommand, timeout: 2 },
+						],
+					},
+				],
+			},
+		}),
+	);
+
+	await runProbe("install", home, home);
+
+	expect(
+		JSON.parse(await readFile(settingsPath, "utf8")).hooks.SessionEnd,
+	).toEqual([
+		{
+			matcher: "",
+			hooks: [
+				{ ...otherHook, timeout: 5 },
+				{ type: "command", command: hookCommand, async: true, timeout: 60 },
+			],
 		},
 	]);
 });

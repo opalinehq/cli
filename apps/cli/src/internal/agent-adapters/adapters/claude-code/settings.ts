@@ -21,6 +21,12 @@ const HOOKS = {
 	SessionStart: "session-start",
 } as const;
 type ClaudeHookEvent = keyof typeof HOOKS;
+/**
+ * Explicit timeout for Opaline's SessionEnd hook. Without one, Claude Code
+ * gives SessionEnd hooks about 1.5 s; the hook's own budgets (upload, inline
+ * evidence delivery ending 50 s after the hook started) assume 60 s.
+ */
+export const SESSION_END_HOOK_TIMEOUT_SECONDS = 60;
 
 const HookEntriesSchema = z
 	.array(
@@ -34,6 +40,7 @@ const HookEntriesSchema = z
 								type: z.string().optional(),
 								command: z.string().optional(),
 								async: z.boolean().optional(),
+								timeout: z.number().optional(),
 							})
 							.passthrough(),
 					)
@@ -130,25 +137,53 @@ export function addHook(path: string = getClaudeSettingsPath()): void {
 	writeClaudeSettings(settings, path);
 }
 
-export function ensureSessionStartHook(
+/**
+ * Bring an existing install up to date from inside a hook: add a missing or
+ * synchronous SessionStart hook, and give Opaline's SessionEnd hook its
+ * explicit timeout (installs made before the timeout existed). Neighbouring
+ * hooks and the SessionEnd command itself are left as they are. Returns
+ * whether the settings file was rewritten.
+ */
+export function ensureClaudeHooksCurrent(
 	path: string = getClaudeSettingsPath(),
 ): boolean {
 	const settings = readClaudeSettings(path);
 	if (!hasOwnedHook(settings, "SessionEnd")) return false;
-	const entries = settings.hooks?.SessionStart ?? [];
-	if (
-		entries.some((entry) =>
-			entry.hooks?.some(
+	const startEntries = settings.hooks?.SessionStart ?? [];
+	const endEntries = settings.hooks?.SessionEnd ?? [];
+	const startCurrent = startEntries.some((entry) =>
+		entry.hooks?.some(
+			(hook) =>
+				isOwnedHook(hook.command, "SessionStart") &&
+				hook.type === "command" &&
+				hook.async === true,
+		),
+	);
+	const endCurrent = endEntries.every(
+		(entry) =>
+			entry.hooks?.every(
 				(hook) =>
-					isOwnedHook(hook.command, "SessionStart") &&
-					hook.type === "command" &&
-					hook.async === true,
-			),
-		)
-	)
-		return false;
+					!isOwnedHook(hook.command, "SessionEnd") ||
+					hook.timeout === SESSION_END_HOOK_TIMEOUT_SECONDS,
+			) ?? true,
+	);
+	if (startCurrent && endCurrent) return false;
 	settings.hooks ??= {};
-	settings.hooks.SessionStart = reconcileHook(entries, "SessionStart");
+	if (!startCurrent)
+		settings.hooks.SessionStart = reconcileHook(startEntries, "SessionStart");
+	if (!endCurrent)
+		settings.hooks.SessionEnd = endEntries.map((entry) =>
+			Array.isArray(entry.hooks)
+				? {
+						...entry,
+						hooks: entry.hooks.map((hook) =>
+							isOwnedHook(hook.command, "SessionEnd")
+								? { ...hook, timeout: SESSION_END_HOOK_TIMEOUT_SECONDS }
+								: hook,
+						),
+					}
+				: entry,
+		);
 	writeClaudeSettings(settings, path);
 	return true;
 }
@@ -177,7 +212,14 @@ function reconcileHook(
 	entries: HookEntries,
 	event: ClaudeHookEvent,
 ): HookEntries {
-	const command = getHookCommand(event);
+	const owned = {
+		type: "command",
+		command: getHookCommand(event),
+		async: true,
+		...(event === "SessionEnd"
+			? { timeout: SESSION_END_HOOK_TIMEOUT_SECONDS }
+			: {}),
+	};
 	let installed = false;
 	const reconciled = entries.flatMap((entry) => {
 		if (!Array.isArray(entry.hooks)) return [entry];
@@ -185,15 +227,11 @@ function reconcileHook(
 			if (!isOwnedHook(hook.command, event)) return [hook];
 			if (installed) return [];
 			installed = true;
-			return [{ ...hook, type: "command", command, async: true }];
+			return [{ ...hook, ...owned }];
 		});
 		return hooks.length ? [{ ...entry, hooks }] : [];
 	});
-	if (!installed)
-		reconciled.push({
-			matcher: "",
-			hooks: [{ type: "command", command, async: true }],
-		});
+	if (!installed) reconciled.push({ matcher: "", hooks: [owned] });
 	return reconciled;
 }
 
