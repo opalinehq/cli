@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.12.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.11.0...opaline-cli@0.12.0) (2026-10-04)
+
+
+### Features
+
+* **cli:** capture complete session context (instructions, skills, rules, memory, configuration) with credential filtering ([9625c96](https://github.com/opalinehq/cli/commit/9625c96cdeabd2683b19d3cb23f3e81d899207bd))
+* **cli:** link analysis chats with opaline import --analysis and re-upload them after each turn ([9625c96](https://github.com/opalinehq/cli/commit/9625c96cdeabd2683b19d3cb23f3e81d899207bd))
+* **cli:** slim transcripts before upload and allow 256 MiB sessions over direct R2 ([9625c96](https://github.com/opalinehq/cli/commit/9625c96cdeabd2683b19d3cb23f3e81d899207bd))
+
+
+### Bug Fixes
+
+* **cli:** retry 0.11 size skips, report size limits only for size rejections, fall back to a known workspace, and release locks of stopped hooks ([9625c96](https://github.com/opalinehq/cli/commit/9625c96cdeabd2683b19d3cb23f3e81d899207bd))
+
 ## [0.11.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.10.0...opaline-cli@0.11.0) (2026-10-01)
 
 
