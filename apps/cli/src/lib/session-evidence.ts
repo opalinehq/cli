@@ -46,6 +46,7 @@ import {
 	acquirePendingRepositoryEvidenceLease,
 	deferPendingRepositoryEvidence,
 	getRepositoryEvidenceLeaseDirectory,
+	hasDuePendingRepositoryEvidence,
 	hasPendingRepositoryEvidence,
 	normalizeRepositoryEvidenceEndpoint,
 	type PendingRepositoryEvidence,
@@ -625,16 +626,9 @@ async function scheduleBackgroundEvidenceDelivery(
 	onWarning: ((message: string) => void) | undefined,
 ): Promise<boolean> {
 	if (readRepositoryEvidencePauseUntil(configDir) !== undefined) return false;
-	const [due] = await readPendingRepositoryEvidence(configDir, {
-		actorId,
-		endpoint,
-		maxItems: 1,
-		isEligible: (pending) =>
-			(pending.next_attempt_at ?? 0) <= Date.now() &&
-			isPendingRepositoryEvidenceAutoUploadAllowed(pending, configDir),
-		onError: () => undefined,
-	});
-	if (!due) return false;
+	// A cheap header peek: the deliverer applies the full eligibility checks.
+	if (!(await hasDuePendingRepositoryEvidence(configDir, actorId, endpoint)))
+		return false;
 	try {
 		spawnBackgroundEvidenceDelivery();
 		return true;

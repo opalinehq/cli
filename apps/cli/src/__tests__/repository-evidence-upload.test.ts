@@ -39,7 +39,9 @@ import {
 	writeRepositoryBundle,
 } from "../lib/repo-spool.js";
 import {
+	acquirePendingRepositoryEvidenceLease,
 	deferPendingRepositoryEvidence,
+	hasDuePendingRepositoryEvidence,
 	readPendingRepositoryEvidence,
 	removePendingRepositoryEvidence,
 	writePendingRepositoryEvidence,
@@ -615,6 +617,68 @@ describe("repository evidence upload building", () => {
 			await rm(directory, { force: true, recursive: true });
 		}
 	}, 30_000);
+
+	test("detects due pending captures from the file header and leases each capture exclusively", async () => {
+		const configDir = await mkdtemp(join(tmpdir(), "opaline-evidence-due-"));
+		try {
+			const content = '{"ordinal":0}\n';
+			const plan = await planTranscriptRevision({
+				content: new TextEncoder().encode(content),
+				previous: undefined,
+				scope,
+				terminal: true,
+			});
+			const pending = {
+				endpoint: "https://example.com/rpc",
+				transcriptRevision: plan.manifest,
+				upload: buildUploadFor(makeBundle(), plan, content),
+			};
+			const due = () =>
+				hasDuePendingRepositoryEvidence(
+					configDir,
+					scope.actorId,
+					pending.endpoint,
+				);
+			expect(await due()).toBe(false);
+			await writePendingRepositoryEvidence(pending, configDir);
+			expect(await due()).toBe(true);
+			await deferPendingRepositoryEvidence(pending, configDir);
+			expect(await due()).toBe(false);
+			expect(
+				await hasDuePendingRepositoryEvidence(
+					configDir,
+					scope.actorId,
+					pending.endpoint,
+					Date.now() + 5 * 60_000,
+				),
+			).toBe(true);
+			expect(
+				await hasDuePendingRepositoryEvidence(
+					configDir,
+					"another-actor",
+					pending.endpoint,
+					Date.now() + 5 * 60_000,
+				),
+			).toBe(false);
+			const lease = await acquirePendingRepositoryEvidenceLease(
+				pending,
+				configDir,
+			);
+			assert(lease);
+			expect(
+				await acquirePendingRepositoryEvidenceLease(pending, configDir),
+			).toBeNull();
+			await lease.release();
+			const next = await acquirePendingRepositoryEvidenceLease(
+				pending,
+				configDir,
+			);
+			assert(next);
+			await next.release();
+		} finally {
+			await rm(configDir, { force: true, recursive: true });
+		}
+	});
 
 	test("automatic retry policy reloads repository and source settings and fails closed for unscoped evidence", async () => {
 		const configDir = await mkdtemp(join(tmpdir(), "opaline-evidence-off-"));

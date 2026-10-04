@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
 	chmod,
 	mkdir,
+	open,
 	readdir,
 	readFile,
 	rename,
@@ -357,6 +358,51 @@ export async function supersedePendingRepositoryEvidence(
 		}
 	}
 	return removed;
+}
+
+/**
+ * Whether any pending capture of this actor and endpoint is due, judged from
+ * the first bytes of each file (`next_attempt_at` is serialized first), so
+ * hooks can decide to start the background deliverer without parsing
+ * captures that may hold large transcripts.
+ */
+export async function hasDuePendingRepositoryEvidence(
+	configDir: string,
+	actorId: string,
+	endpoint: string,
+	now = Date.now(),
+): Promise<boolean> {
+	const directory = pendingDirectory(configDir);
+	const prefix = pendingFilePrefix(actorId, endpoint);
+	let names: readonly string[];
+	try {
+		names = (await readdir(directory)).filter(
+			(name) => name.endsWith(".json") && name.startsWith(prefix),
+		);
+	} catch (error) {
+		if (isErrorCode(error, "ENOENT")) return false;
+		throw error;
+	}
+	for (const name of names) {
+		let handle: Awaited<ReturnType<typeof open>>;
+		try {
+			handle = await open(join(directory, name), "r");
+		} catch (error) {
+			if (isErrorCode(error, "ENOENT")) continue;
+			throw error;
+		}
+		try {
+			const header = Buffer.alloc(256);
+			const { bytesRead } = await handle.read(header, 0, header.byteLength, 0);
+			const match = /^\{"next_attempt_at":(\d+)/u.exec(
+				header.subarray(0, bytesRead).toString("utf8"),
+			);
+			if (match?.[1] === undefined || Number(match[1]) <= now) return true;
+		} finally {
+			await handle.close();
+		}
+	}
+	return false;
 }
 
 export async function hasPendingRepositoryEvidence(
