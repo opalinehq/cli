@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getAnalysisDestination } from "../lib/analysis-upload.js";
 import {
 	appendCodexAssistantMessage,
 	codexThreadId,
@@ -30,6 +31,8 @@ interface ApiStubOptions {
 
 interface ApiStub {
 	readonly baseUrl: string;
+	/** Session named in the completed result of each R2 job. */
+	readonly jobSessions: Map<string, string>;
 	readonly ingests: Array<Record<string, unknown>>;
 	readonly paths: string[];
 	readonly options: ApiStubOptions;
@@ -39,6 +42,7 @@ interface ApiStub {
 function startApiStub(overrides: Partial<ApiStubOptions> = {}): ApiStub {
 	const ingests: Array<Record<string, unknown>> = [];
 	const paths: string[] = [];
+	const jobSessions = new Map<string, string>();
 	const options: ApiStubOptions = {
 		capability: true,
 		echo: true,
@@ -99,7 +103,10 @@ function startApiStub(overrides: Partial<ApiStubOptions> = {}): ApiStub {
 						jobId: input.jobId,
 						leaseExpiresAt: null,
 						protocol: "r2_multipart_v1",
-						result: { sessionId: "done", success: true },
+						result: {
+							sessionId: jobSessions.get(String(input.jobId)) ?? "unknown",
+							success: true,
+						},
 						status: "completed",
 						updatedAt: new Date().toISOString(),
 					},
@@ -112,6 +119,7 @@ function startApiStub(overrides: Partial<ApiStubOptions> = {}): ApiStub {
 	return {
 		baseUrl: `http://127.0.0.1:${server.port}`,
 		ingests,
+		jobSessions,
 		options,
 		paths,
 	};
@@ -155,27 +163,37 @@ function cli(
 	fixture: Fixture,
 	args: readonly string[],
 	stdin?: string,
+	env: Record<string, string> = {},
 ): Promise<CliResult> {
 	return runCli(
 		args,
 		{ home: fixture.home, projectPath: "", sessionId: "", transcriptPath: "" },
-		{ env: fixture.env, stdin },
+		{ env: { ...fixture.env, ...env }, stdin },
 	);
 }
 
-function turnComplete(fixture: Fixture, threadId: string): Promise<CliResult> {
-	return cli(fixture, [
-		"hooks",
-		"codex",
-		"turn-complete",
-		JSON.stringify({
-			cwd: fixture.chatPath,
-			"input-messages": ["question"],
-			"last-assistant-message": "answer",
-			"thread-id": threadId,
-			type: "agent-turn-complete",
-		}),
-	]);
+function turnComplete(
+	fixture: Fixture,
+	threadId: string,
+	env: Record<string, string> = {},
+): Promise<CliResult> {
+	return cli(
+		fixture,
+		[
+			"hooks",
+			"codex",
+			"turn-complete",
+			JSON.stringify({
+				cwd: fixture.chatPath,
+				"input-messages": ["question"],
+				"last-assistant-message": "answer",
+				"thread-id": threadId,
+				type: "agent-turn-complete",
+			}),
+		],
+		undefined,
+		env,
+	);
 }
 
 async function writeConversation(fixture: Fixture) {
@@ -316,7 +334,7 @@ describe("opaline import --analysis", () => {
 			"This Opaline server does not support analysis uploads yet",
 		);
 		expect(api.ingests).toEqual([]);
-		expect(await readMarkers(fixture)).toEqual({ markers: [], version: 1 });
+		expect(await readMarkers(fixture)).toEqual({ markers: [], version: 2 });
 	});
 
 	test("an upload the server stores without echoing the link fails and drops the marker", async () => {
@@ -334,7 +352,7 @@ describe("opaline import --analysis", () => {
 		expect(result.exitCode).toBe(1);
 		expect(result.stderr).toContain("stored without its analysis link");
 		expect(api.ingests).toHaveLength(1);
-		expect(await readMarkers(fixture)).toEqual({ markers: [], version: 1 });
+		expect(await readMarkers(fixture)).toEqual({ markers: [], version: 2 });
 	});
 
 	test("an unknown analysis surfaces the server's refusal", async () => {
@@ -351,7 +369,7 @@ describe("opaline import --analysis", () => {
 
 		expect(result.exitCode).toBe(1);
 		expect(result.stderr).toContain("404 Analysis not found");
-		expect(await readMarkers(fixture)).toEqual({ markers: [], version: 1 });
+		expect(await readMarkers(fixture)).toEqual({ markers: [], version: 2 });
 	});
 
 	test("--json prints one object and --no-related uploads only the thread", async () => {
@@ -391,10 +409,125 @@ describe("opaline import --analysis", () => {
 		expect(api.paths).not.toContain("/rpc/cli/authStatus");
 	});
 
+	test("--no-related stays in force for later hooks", async () => {
+		const api = startApiStub();
+		const fixture = await createFixture(api.baseUrl);
+		const chat = await writeConversation(fixture);
+
+		const imported = await cli(fixture, [
+			"import",
+			chat.child,
+			"--analysis",
+			"analysis-8",
+			"--no-related",
+		]);
+		expect(imported.exitCode).toBe(0);
+		await appendCodexAssistantMessage(chat.childPath, "Query results.");
+		await appendCodexAssistantMessage(chat.rootPath, "Final answer.");
+		const childTurn = await turnComplete(fixture, chat.child);
+		const parentTurn = await turnComplete(fixture, chat.root);
+
+		expect(childTurn.exitCode).toBe(0);
+		expect(parentTurn.exitCode).toBe(0);
+		expect(api.ingests.map((input) => input.sessionId)).toEqual([
+			chat.child,
+			chat.child,
+		]);
+		expect(await readMarkers(fixture)).toMatchObject({
+			markers: [{ memberIds: [chat.child], related: false }],
+		});
+	});
+
+	test("a hook never sends a marked chat to a server or account the import did not approve", async () => {
+		const approved = startApiStub();
+		const other = startApiStub();
+		const fixture = await createFixture(approved.baseUrl);
+		const chat = await writeConversation(fixture);
+		expect(
+			(await cli(fixture, ["import", chat.root, "--analysis", "analysis-9"]))
+				.exitCode,
+		).toBe(0);
+		const approvedIngests = approved.ingests.length;
+		await appendCodexAssistantMessage(chat.rootPath, "Final answer.");
+
+		const moved = await turnComplete(fixture, chat.root, {
+			OPALINE_API_BASE: other.baseUrl,
+		});
+
+		expect(moved.exitCode).toBe(0);
+		expect(moved.stderr).toContain(
+			"the Opaline server or account changed since `opaline import --analysis`",
+		);
+		expect(other.paths).toEqual([]);
+		expect(approved.ingests).toHaveLength(approvedIngests);
+		expect(await readMarkers(fixture)).toEqual({ markers: [], version: 2 });
+	});
+
+	test("a hook preflights the destination before sending a marked chat", async () => {
+		const api = startApiStub();
+		const fixture = await createFixture(api.baseUrl);
+		const chat = await writeConversation(fixture);
+		expect(
+			(await cli(fixture, ["import", chat.root, "--analysis", "analysis-10"]))
+				.exitCode,
+		).toBe(0);
+		const ingestsAfterImport = api.ingests.length;
+		// The server was rolled back: no capability, and no cached answer.
+		await rm(join(fixture.home, ".rudel", "upload-capabilities"), {
+			force: true,
+			recursive: true,
+		});
+		api.options.capability = false;
+		await appendCodexAssistantMessage(chat.rootPath, "Final answer.");
+
+		const hook = await turnComplete(fixture, chat.root);
+
+		expect(hook.exitCode).toBe(0);
+		expect(hook.stderr).toContain(
+			"This Opaline server does not support analysis uploads yet",
+		);
+		expect(api.paths.at(-1)).toBe("/rpc/cli/authStatus");
+		expect(api.ingests).toHaveLength(ingestsAfterImport);
+		expect(await readMarkers(fixture)).toEqual({ markers: [], version: 2 });
+	});
+
+	test("--retry does not send an analysis upload to another destination", async () => {
+		const api = startApiStub();
+		const fixture = await createFixture(api.baseUrl);
+		const chat = await writeConversation(fixture);
+		await writeFile(
+			join(fixture.home, ".rudel", "failed-uploads.json"),
+			JSON.stringify({
+				failures: [
+					{
+						analysisDestination: destinationOf("https://elsewhere.example"),
+						analysisId: "analysis-11",
+						error: "Temporary Opaline server/proxy error",
+						failedAt: new Date().toISOString(),
+						projectPath: fixture.chatPath,
+						sessionId: chat.root,
+						source: "codex",
+						status: "retryable",
+						transcriptPath: chat.rootPath,
+					},
+				],
+			}),
+		);
+
+		const result = await cli(fixture, ["import", "--retry", "--yes"]);
+
+		expect(result.exitCode).toBe(0);
+		expect(api.ingests).toEqual([]);
+		expect(await readFailedUploads(fixture)).toMatchObject([
+			{ sessionId: chat.root, status: "permanent" },
+		]);
+	});
+
 	test("--retry confirms finished server jobs and keeps the analysis link", async () => {
 		const api = startApiStub();
 		const fixture = await createFixture(api.baseUrl);
 		const chat = await writeConversation(fixture);
+		api.jobSessions.set("00000000-0000-4000-8000-0000000000aa", chat.child);
 		await writeFile(
 			join(fixture.home, ".rudel", "failed-uploads.json"),
 			JSON.stringify({
@@ -410,6 +543,7 @@ describe("opaline import --analysis", () => {
 						transcriptPath: chat.childPath,
 					},
 					{
+						analysisDestination: destinationOf(api.baseUrl),
 						analysisId: "analysis-7",
 						error: "Temporary Opaline server/proxy error",
 						failedAt: new Date().toISOString(),
@@ -561,6 +695,14 @@ describe("hook uploads the server is still processing", () => {
 		expect(await readFailedUploads(fixture)).toEqual([]);
 	}, 60_000);
 });
+
+function destinationOf(apiBaseUrl: string) {
+	return getAnalysisDestination({
+		allowInsecureEndpoint: false,
+		credentials: { authType: "api-key", token: TOKEN },
+		endpoint: `${apiBaseUrl}/rpc`,
+	});
+}
 
 function hookPayload(fixture: Fixture, threadId: string): string {
 	return JSON.stringify({

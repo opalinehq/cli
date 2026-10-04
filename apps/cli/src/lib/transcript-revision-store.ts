@@ -173,8 +173,31 @@ async function quarantineTranscriptRevision(path: string): Promise<void> {
 	}
 }
 
+/**
+ * Run `operation` while holding a cross-process directory lock at `lockPath`.
+ * Stale locks of crashed owners are recovered; waiting is bounded.
+ */
+export async function withDirectoryLock<TResult>(
+	lockPath: string,
+	timeoutMs: number,
+	operation: () => Promise<TResult>,
+): Promise<TResult> {
+	const releaseLock = await acquireRevisionLock(
+		lockPath,
+		timeoutMs,
+		"Timed out waiting for another Opaline process to finish.",
+	);
+	try {
+		return await operation();
+	} finally {
+		await releaseLock();
+	}
+}
+
 async function acquireRevisionLock(
 	lockPath: string,
+	timeoutMs = LOCK_TIMEOUT_MS,
+	timeoutMessage = "Timed out waiting to advance the transcript revision.",
 ): Promise<() => Promise<void>> {
 	await mkdir(dirname(lockPath), { mode: 0o700, recursive: true });
 	const ownerPath = join(lockPath, "owner");
@@ -212,11 +235,11 @@ async function acquireRevisionLock(
 			}
 			if (!isErrorCode(error, "EEXIST")) throw error;
 			if (await recoverStaleRevisionLock(lockPath)) continue;
-			if (Date.now() - startedAt >= LOCK_TIMEOUT_MS) break;
+			if (Date.now() - startedAt >= timeoutMs) break;
 			await new Promise((resolve) => setTimeout(resolve, LOCK_POLL_MS));
 		}
 	}
-	throw new Error("Timed out waiting to advance the transcript revision.");
+	throw new Error(timeoutMessage);
 }
 
 async function recoverStaleRevisionLock(lockPath: string): Promise<boolean> {

@@ -74,10 +74,18 @@ export async function reconcilePendingUploadsInHook(
 			{ maxEntries: HOOK_PENDING_RECONCILE_MAX_ENTRIES },
 			environment,
 		);
+		for (const failure of summary.linkFailures)
+			process.stderr.write(`Opaline analysis upload failed for ${failure}\n`);
 		if (summary.checked > 0)
 			logger.info(
 				"Reconciled {checked} pending upload(s): {completed} completed, {stillPending} still processing, {requeued} requeued, {failed} failed",
-				{ ...summary },
+				{
+					checked: summary.checked,
+					completed: summary.completed,
+					failed: summary.failed,
+					requeued: summary.requeued,
+					stillPending: summary.stillPending,
+				},
 			);
 	} catch (error) {
 		logger.warn("Pending upload reconciliation skipped: {error}", {

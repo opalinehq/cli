@@ -78,8 +78,9 @@ async function runSessionEnd(): Promise<undefined | Error> {
 			claudeCodeAdapter.source,
 			input.session_id,
 		);
-		if (marker) {
-			await runMarkedAnalysisHook(logger, marker, {
+		if (
+			marker &&
+			(await runMarkedAnalysisHook(logger, marker, {
 				sessionId: input.session_id,
 				source: claudeCodeAdapter.source,
 				transcriptPath: input.transcript_path,
@@ -87,9 +88,9 @@ async function runSessionEnd(): Promise<undefined | Error> {
 				relation: "marked",
 				gitBranch: undefined,
 				gitSha: undefined,
-			});
+			})) === "handled"
+		)
 			return;
-		}
 		const gitInfo = await getGitInfo(input.cwd);
 		const repository = resolveUploadRepositoryIdentity(input.cwd, gitInfo);
 		if (

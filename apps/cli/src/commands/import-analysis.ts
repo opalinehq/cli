@@ -12,6 +12,7 @@ import {
 	type AnalysisUploadEnvironment,
 	type AnalysisUploadTarget,
 	checkAnalysisUploadSupport,
+	getAnalysisDestination,
 	resolveAnalysisTargets,
 	settleMarker,
 	uploadAnalysisTargets,
@@ -84,7 +85,9 @@ export async function runAnalysisImport(
 
 	const marker = await recordAnalysisMarker({
 		analysisId: options.analysisId,
+		destination: getAnalysisDestination(uploadEnvironment),
 		memberIds: resolved.targets.map((target) => target.sessionId),
+		related: options.related,
 		sessionId: resolved.sessionId,
 		source: resolved.source,
 	});

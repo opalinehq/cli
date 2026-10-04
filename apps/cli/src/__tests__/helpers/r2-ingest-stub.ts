@@ -19,9 +19,20 @@ export type R2StubCommitAnswer =
 
 export type R2StubStatusAnswer =
 	| { readonly kind: "pending" | "running"; readonly errorCode?: string }
-	| { readonly kind: "completed" }
+	| {
+			readonly kind: "completed";
+			/** Defaults to the session of the init that created the job. */
+			readonly sessionId?: string;
+			readonly analysisId?: string;
+	  }
 	| { readonly kind: "failed"; readonly code: string; readonly message: string }
-	| { readonly kind: "not-found" };
+	| { readonly kind: "not-found" }
+	| {
+			readonly kind: "http-error";
+			readonly status: number;
+			readonly code: string;
+			readonly message: string;
+	  };
 
 export interface R2IngestStub {
 	readonly baseUrl: string;
@@ -120,18 +131,27 @@ export function startR2IngestStub(): R2IngestStub {
 			}
 			if (url.pathname === "/rpc/ingest/status") {
 				const answer = stub.status(jobId);
-				if (answer.kind === "not-found")
+				if (answer.kind === "not-found" || answer.kind === "http-error") {
+					const error =
+						answer.kind === "not-found"
+							? {
+									code: "NOT_FOUND",
+									message: "Ingest job not found",
+									status: 404,
+								}
+							: answer;
 					return Response.json(
 						{
 							json: {
-								code: "NOT_FOUND",
+								code: error.code,
 								defined: false,
-								message: "Ingest job not found",
-								status: 404,
+								message: error.message,
+								status: error.status,
 							},
 						},
-						{ status: 404 },
+						{ status: error.status },
 					);
+				}
 				return rpc({
 					attempts: 1,
 					availableAt: new Date().toISOString(),
@@ -145,7 +165,16 @@ export function startR2IngestStub(): R2IngestStub {
 					jobId,
 					leaseExpiresAt: null,
 					protocol: "r2_multipart_v1",
-					result: answer.kind === "completed" ? result : null,
+					result:
+						answer.kind === "completed"
+							? {
+									...result,
+									sessionId: answer.sessionId ?? result.sessionId,
+									...(answer.analysisId === undefined
+										? {}
+										: { analysisId: answer.analysisId }),
+								}
+							: null,
 					status: answer.kind,
 					updatedAt: new Date().toISOString(),
 				});

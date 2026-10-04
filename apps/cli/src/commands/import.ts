@@ -9,13 +9,22 @@ import {
 	MissingTranscriptTimestampError,
 	type SessionFile,
 } from "../internal/agent-adapters/index.js";
+import {
+	type AnalysisSupport,
+	type AnalysisUploadEnvironment,
+	checkAnalysisUploadSupport,
+	getAnalysisDestination,
+	isSameAnalysisDestination,
+} from "../lib/analysis-upload.js";
 import type { BatchUploadItem } from "../lib/batch-upload.js";
 import { renderBatchSummary, runBatchUpload } from "../lib/batch-upload-ui.js";
 import { classifySessionFile } from "../lib/classifier.js";
 import { type Credentials, loadCredentials } from "../lib/credentials.js";
 import {
+	type FailedUpload,
 	isRetryCandidate,
 	loadFailedUploads,
+	recordFailedUpload,
 	recordPendingUpload,
 	removeFailedUpload,
 } from "../lib/failed-uploads.js";
@@ -234,6 +243,8 @@ async function runRetryUpload(
 				token: credentials.token,
 			},
 		);
+		for (const failure of reconciled.linkFailures)
+			p.log.warn(`Analysis upload failed for ${failure}`);
 		if (reconciled.checked > 0)
 			p.log.info(
 				`Checked ${reconciled.checked} upload(s) still processing on the server: ${reconciled.completed} completed, ${reconciled.stillPending} still processing, ${reconciled.requeued} to upload again, ${reconciled.failed} failed.`,
@@ -310,7 +321,12 @@ async function runRetryUpload(
 		failure: (typeof failures)[number];
 	};
 
-	const items: RetryItem[] = retryableFailures.map((f) => ({
+	const sendable = await filterAnalysisRetries(retryableFailures, {
+		allowInsecureEndpoint: allowPlaintextEndpoint,
+		credentials,
+		endpoint: flags.endpoint,
+	});
+	const items: RetryItem[] = sendable.map((f) => ({
 		sessionId: f.sessionId,
 		label: f.sessionId,
 		transcriptPath: f.transcriptPath,
@@ -318,6 +334,7 @@ async function runRetryUpload(
 		source: f.source,
 		organizationId: f.analysisId === undefined ? f.organizationId : undefined,
 		analysisId: f.analysisId,
+		analysisDestination: f.analysisDestination,
 		failure: f,
 	}));
 
@@ -377,6 +394,50 @@ async function runRetryUpload(
 		return new Error(`${summary.failed} upload(s) failed.`);
 	}
 	return evidenceRetryError;
+}
+
+/**
+ * Analysis uploads are retried only to the endpoint and account their import
+ * approved, and only once the server confirms it links analyses. Others are
+ * recorded as permanent (destination changed, server unsupported) or kept for
+ * later (server unreachable).
+ */
+async function filterAnalysisRetries(
+	failures: readonly FailedUpload[],
+	environment: AnalysisUploadEnvironment,
+): Promise<FailedUpload[]> {
+	const destination = getAnalysisDestination(environment);
+	let support: AnalysisSupport | undefined;
+	const sendable: FailedUpload[] = [];
+	for (const failure of failures) {
+		if (failure.analysisId === undefined) {
+			sendable.push(failure);
+			continue;
+		}
+		if (
+			!failure.analysisDestination ||
+			!isSameAnalysisDestination(failure.analysisDestination, destination)
+		) {
+			const error =
+				"Not retried: the Opaline server or account changed since `opaline import --analysis`. Run that command again to link this chat.";
+			p.log.warn(`  ${failure.sessionId}: ${error}`);
+			await recordFailedUpload({ ...failure, error, status: "permanent" });
+			continue;
+		}
+		support ??= await checkAnalysisUploadSupport(environment);
+		if (support.supported) {
+			sendable.push(failure);
+			continue;
+		}
+		p.log.warn(`  ${failure.sessionId}: not retried: ${support.reason}`);
+		if (support.kind === "unsupported")
+			await recordFailedUpload({
+				...failure,
+				error: support.reason,
+				status: "permanent",
+			});
+	}
+	return sendable;
 }
 
 async function runUpload(

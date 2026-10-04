@@ -3,6 +3,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getLogger } from "@logtape/logtape";
+import {
+	findAnalysisMarker,
+	recordAnalysisMarker,
+} from "../lib/analysis-markers.js";
 import { type BatchUploadItem, batchUpload } from "../lib/batch-upload.js";
 import {
 	isRetryCandidate,
@@ -198,7 +202,7 @@ describe("pending upload reconciliation", () => {
 	test("completed jobs are cleared, failed jobs carry the server error, pending jobs stay", async () => {
 		const stub = await startStub();
 		const answers = new Map([
-			["job-done", { kind: "completed" as const }],
+			["job-done", { kind: "completed" as const, sessionId: "session-done" }],
 			[
 				"job-broken",
 				{
@@ -236,6 +240,7 @@ describe("pending upload reconciliation", () => {
 			checked: 5,
 			completed: 1,
 			failed: 1,
+			linkFailures: [],
 			requeued: 2,
 			stillPending: 1,
 		});
@@ -325,6 +330,171 @@ describe("pending upload reconciliation", () => {
 		expect(await loadFailedUploads()).toMatchObject([
 			{ sessionId: "session-old", status: "retryable" },
 		]);
+	});
+});
+
+describe("pending analysis uploads and inaccessible jobs", () => {
+	const destination = { account: "user:test", endpoint: "https://x/rpc" };
+
+	test("a completed analysis job without the echoed link is a link failure and drops the marker", async () => {
+		const stub = await startStub();
+		stub.status = (jobId) =>
+			jobId === "job-linked"
+				? {
+						analysisId: "analysis-1",
+						kind: "completed",
+						sessionId: "session-linked",
+					}
+				: { kind: "completed", sessionId: "session-unlinked" };
+		for (const sessionId of ["session-linked", "session-unlinked"]) {
+			await recordAnalysisMarker({
+				analysisId: "analysis-1",
+				destination,
+				memberIds: [],
+				related: false,
+				sessionId,
+				source: "codex",
+			});
+			await recordPendingUpload({
+				...pendingEntry(sessionId, sessionId.replace("session", "job")),
+				analysisDestination: destination,
+				analysisId: "analysis-1",
+			});
+		}
+
+		const summary = await reconcilePendingUploads(
+			{ maxEntries: 5 },
+			reconcileEnvironment(stub),
+		);
+
+		expect(summary).toMatchObject({ completed: 1, failed: 1 });
+		expect(summary.linkFailures).toEqual([
+			expect.stringContaining(
+				"session-unlinked: Opaline stored this session without its link to analysis analysis-1",
+			),
+		]);
+		expect(await loadFailedUploads()).toMatchObject([
+			{ sessionId: "session-unlinked", status: "permanent" },
+		]);
+		expect(await findAnalysisMarker("codex", "session-unlinked")).toBeNull();
+		expect(await findAnalysisMarker("codex", "session-linked")).not.toBeNull();
+	});
+
+	test("a completed job naming another session is not cleared", async () => {
+		const stub = await startStub();
+		stub.status = () => ({ kind: "completed", sessionId: "someone-else" });
+		await recordPendingUpload(pendingEntry("session-a", "job-a"));
+
+		await reconcilePendingUploads(
+			{ maxEntries: 5 },
+			reconcileEnvironment(stub),
+		);
+
+		expect(await loadFailedUploads()).toMatchObject([
+			{ sessionId: "session-a", status: "retryable" },
+		]);
+	});
+
+	test("a job-specific refusal settles that job and the pass continues", async () => {
+		const stub = await startStub();
+		stub.status = (jobId) =>
+			jobId === "job-forbidden"
+				? {
+						code: "FORBIDDEN",
+						kind: "http-error",
+						message: "Not your job",
+						status: 403,
+					}
+				: { kind: "completed", sessionId: "session-done" };
+		await recordPendingUpload(
+			pendingEntry("session-forbidden", "job-forbidden"),
+		);
+		await recordPendingUpload(pendingEntry("session-done", "job-done"));
+
+		const summary = await reconcilePendingUploads(
+			{ maxEntries: 5 },
+			reconcileEnvironment(stub),
+		);
+
+		expect(summary).toMatchObject({ checked: 2, completed: 1, requeued: 1 });
+		expect(await loadFailedUploads()).toMatchObject([
+			{
+				error: expect.stringContaining("403 Not your job"),
+				sessionId: "session-forbidden",
+				status: "retryable",
+			},
+		]);
+	});
+
+	test("an invalid key stops the pass without touching entries", async () => {
+		const stub = await startStub();
+		stub.status = () => ({
+			code: "UNAUTHORIZED",
+			kind: "http-error",
+			message: "Invalid API key",
+			status: 401,
+		});
+		await recordPendingUpload(pendingEntry("session-a", "job-a"));
+		await recordPendingUpload(pendingEntry("session-b", "job-b"));
+
+		const summary = await reconcilePendingUploads(
+			{ maxEntries: 5 },
+			reconcileEnvironment(stub),
+		);
+
+		expect(summary.checked).toBe(0);
+		expect(stub.calls).toHaveLength(1);
+		expect((await loadFailedUploads()).map((entry) => entry.status)).toEqual([
+			"pending",
+			"pending",
+		]);
+	});
+});
+
+describe("analysis markers across processes", () => {
+	test("concurrent hook processes keep every update and a removal", async () => {
+		const destination = { account: "user:test", endpoint: "https://x/rpc" };
+		const kept = await recordAnalysisMarker({
+			analysisId: "analysis-kept",
+			destination,
+			memberIds: [],
+			related: true,
+			sessionId: "thread-kept",
+			source: "codex",
+		});
+		const removed = await recordAnalysisMarker({
+			analysisId: "analysis-removed",
+			destination,
+			memberIds: [],
+			related: true,
+			sessionId: "thread-removed",
+			source: "codex",
+		});
+		const worker = join(
+			import.meta.dir,
+			"helpers",
+			"analysis-marker-worker.ts",
+		);
+		const members = Array.from({ length: 8 }, (_, index) => `child-${index}`);
+		const runs = [
+			["remove", removed.markerId],
+			...members.map((member) => ["merge", kept.markerId, member]),
+			["merge", removed.markerId, "late-child"],
+		].map((args) =>
+			Bun.spawn(["bun", worker, ...args], {
+				env: { ...process.env },
+				stderr: "pipe",
+			}),
+		);
+		const exitCodes = await Promise.all(runs.map((run) => run.exited));
+
+		expect(exitCodes.every((code) => code === 0)).toBe(true);
+		const marker = await findAnalysisMarker("codex", "thread-kept");
+		expect(marker?.memberIds.slice().sort()).toEqual(
+			["thread-kept", ...members].sort(),
+		);
+		expect(Object.keys(marker?.uploaded ?? {}).sort()).toEqual(members);
+		expect(await findAnalysisMarker("codex", "thread-removed")).toBeNull();
 	});
 });
 

@@ -29,6 +29,8 @@ export interface FailedUpload {
 	organizationId?: string;
 	/** Analysis link to keep on retries (`opaline import --analysis`). */
 	analysisId?: string;
+	/** Endpoint and account the analysis upload was approved for. */
+	analysisDestination?: { endpoint: string; account: string };
 	error: string;
 	failedAt: string;
 	status: "permanent" | "retryable" | "pending";
@@ -46,6 +48,8 @@ export type PendingUploadOutcome =
 			readonly kind: "failed";
 			readonly error: string;
 			readonly status: "permanent" | "retryable";
+			/** A completed analysis upload without a confirmed link. */
+			readonly analysisLinkMissing?: boolean;
 	  };
 
 interface FailedUploadsData {

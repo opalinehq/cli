@@ -23,6 +23,7 @@ export interface BatchUploadItem {
 	source?: Source;
 	organizationId?: string;
 	analysisId?: string;
+	analysisDestination?: FailedUpload["analysisDestination"];
 }
 
 export interface BatchUploadOptions<T extends BatchUploadItem> {
@@ -76,6 +77,7 @@ export async function batchUpload<T extends BatchUploadItem>(
 			source: item.source,
 			organizationId: item.organizationId,
 			analysisId: item.analysisId,
+			analysisDestination: item.analysisDestination,
 			...failure,
 		});
 	};
@@ -130,6 +132,7 @@ export async function batchUpload<T extends BatchUploadItem>(
 						source: item.source,
 						organizationId: item.organizationId,
 						analysisId: item.analysisId,
+						analysisDestination: item.analysisDestination,
 						error: result.error ?? "Still processing on the server",
 						jobId: result.pendingJobId,
 					});

@@ -81,10 +81,11 @@ async function runTurnComplete(
 			codexAdapter.source,
 			input.threadId,
 		);
-		if (marker) {
-			await runMarkedAnalysisHook(logger, marker, undefined);
+		if (
+			marker &&
+			(await runMarkedAnalysisHook(logger, marker, undefined)) === "handled"
+		)
 			return;
-		}
 		const gitInfo = await getGitInfo(input.cwd);
 		const repository = resolveUploadRepositoryIdentity(input.cwd, gitInfo);
 		if (

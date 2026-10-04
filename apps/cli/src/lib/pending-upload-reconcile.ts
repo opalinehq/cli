@@ -1,5 +1,6 @@
 import { ORPCError } from "@orpc/client";
 import { parseSafeApiEndpoint } from "../contracts/index.js";
+import { invalidateAnalysisMarkers } from "./analysis-markers.js";
 import {
 	type FailedUpload,
 	loadFailedUploads,
@@ -9,11 +10,13 @@ import {
 import {
 	createR2IngestRpcClient,
 	isR2IngestStatusOutput,
+	type R2IngestSuccess,
 } from "./r2-ingest-contract.js";
 import {
 	formatR2JobFailure,
 	isRetryableR2JobFailure,
 } from "./r2-upload-flow.js";
+import { ANALYSIS_UPLOAD_UNSUPPORTED_MESSAGE } from "./uploader.js";
 
 // Server jobs expire after 24 hours; an entry still pending well past that is
 // re-uploaded instead of being checked forever.
@@ -40,13 +43,22 @@ export interface PendingReconcileSummary {
 	readonly failed: number;
 	readonly requeued: number;
 	readonly stillPending: number;
+	/** Completed analysis uploads the server stored without confirming the link. */
+	readonly linkFailures: readonly string[];
 }
+
+type PendingCheck =
+	| { readonly kind: "settle"; readonly outcome: PendingUploadOutcome }
+	/** The server or the key is unavailable: stop this pass, change nothing. */
+	| { readonly kind: "stop" };
 
 /**
  * Ask the server about uploads it accepted but had not finished: completed
  * jobs are cleared, failed jobs become real failures with the server's error,
- * and expired or unknown jobs return to the retry queue for a fresh upload.
- * Stops at the first transport error so an unreachable server costs one call.
+ * and expired, unknown or inaccessible jobs return to the retry queue for a
+ * fresh upload. A completed job counts only when its result names the saved
+ * session (and analysis, for analysis uploads). Stops at the first transport
+ * or authentication error so an unreachable server costs one call.
  */
 export async function reconcilePendingUploads(
 	options: PendingReconcileOptions,
@@ -56,6 +68,7 @@ export async function reconcilePendingUploads(
 		checked: 0,
 		completed: 0,
 		failed: 0,
+		linkFailures: [] as string[],
 		requeued: 0,
 		stillPending: 0,
 	};
@@ -79,15 +92,21 @@ export async function reconcilePendingUploads(
 	const now = options.now ?? new Date();
 
 	for (const entry of pending) {
-		const outcome = await checkPendingUpload(entry, now, (jobId) =>
+		const check = await checkPendingUpload(entry, now, (jobId) =>
 			client.ingest.status(
 				{ jobId },
 				{ signal: AbortSignal.timeout(STATUS_TIMEOUT_MS) },
 			),
 		);
-		if (outcome === null) break;
+		if (check.kind === "stop") break;
+		const { outcome } = check;
 		counts.checked += 1;
 		await settlePendingUpload(entry.sessionId, entry.jobId, outcome);
+		if (outcome.kind === "failed" && outcome.analysisLinkMissing) {
+			counts.linkFailures.push(`${entry.sessionId}: ${outcome.error}`);
+			if (entry.analysisId !== undefined)
+				await invalidateAnalysisMarkers(entry.analysisId, entry.sessionId);
+		}
 		if (outcome.kind === "completed") counts.completed += 1;
 		else if (outcome.kind === "still-pending") counts.stillPending += 1;
 		else if (outcome.status === "retryable") counts.requeued += 1;
@@ -123,40 +142,86 @@ async function checkPendingUpload(
 	entry: FailedUpload & { jobId: string },
 	now: Date,
 	readStatus: (jobId: string) => Promise<unknown>,
-): Promise<PendingUploadOutcome | null> {
+): Promise<PendingCheck> {
 	let status: unknown;
 	try {
 		status = await readStatus(entry.jobId);
 	} catch (error) {
-		if (error instanceof ORPCError && error.status === 404) {
-			return {
-				kind: "failed",
-				error:
-					"Opaline no longer has this upload job; the session will be uploaded again.",
-				status: "retryable",
-			};
-		}
-		return null;
+		return classifyStatusError(error);
 	}
+	// A malformed or foreign answer says nothing about this job: note the
+	// check so the next pass rotates to other entries.
 	if (!isR2IngestStatusOutput(status) || status.jobId !== entry.jobId)
-		return null;
-	if (status.status === "completed") return { kind: "completed" };
+		return settle({ kind: "still-pending" });
+	if (status.status === "completed")
+		return settle(checkCompletedResult(entry, status.result));
 	if (status.status === "failed") {
-		return {
+		return settle({
 			kind: "failed",
 			error: formatR2JobFailure(status.error),
 			status: isRetryableR2JobFailure(status.error?.code)
 				? "retryable"
 				: "permanent",
-		};
+		});
 	}
 	if (now.getTime() - Date.parse(entry.failedAt) > PENDING_MAX_AGE_MS) {
-		return {
+		return settle({
 			kind: "failed",
 			error:
 				"Opaline did not finish processing this upload within 48 hours; the session will be uploaded again.",
 			status: "retryable",
-		};
+		});
 	}
-	return { kind: "still-pending" };
+	return settle({ kind: "still-pending" });
+}
+
+function classifyStatusError(error: unknown): PendingCheck {
+	if (!(error instanceof ORPCError)) return { kind: "stop" };
+	// Outages, throttling and an invalid key affect every job alike.
+	if (
+		error.status === 401 ||
+		error.status === 408 ||
+		error.status === 425 ||
+		error.status === 429 ||
+		error.status >= 500
+	)
+		return { kind: "stop" };
+	if (error.status === 404)
+		return settle({
+			kind: "failed",
+			error:
+				"Opaline no longer has this upload job; the session will be uploaded again.",
+			status: "retryable",
+		});
+	// Any other refusal (403 and similar) concerns this job only: it can
+	// never be confirmed, so the session goes back to the retry queue.
+	return settle({
+		kind: "failed",
+		error: `Opaline refused the status of this upload job (${error.status} ${error.message}); the session will be uploaded again.`,
+		status: "retryable",
+	});
+}
+
+function checkCompletedResult(
+	entry: FailedUpload,
+	result: R2IngestSuccess | null,
+): PendingUploadOutcome {
+	if (result !== null && result.sessionId !== entry.sessionId)
+		return {
+			kind: "failed",
+			error: `Opaline completed this upload job for a different session (${result.sessionId}); the session will be uploaded again.`,
+			status: "retryable",
+		};
+	if (entry.analysisId !== undefined && result?.analysisId !== entry.analysisId)
+		return {
+			analysisLinkMissing: true,
+			kind: "failed",
+			error: `Opaline stored this session without its link to analysis ${entry.analysisId}. ${ANALYSIS_UPLOAD_UNSUPPORTED_MESSAGE}`,
+			status: "permanent",
+		};
+	return { kind: "completed" };
+}
+
+function settle(outcome: PendingUploadOutcome): PendingCheck {
+	return { kind: "settle", outcome };
 }

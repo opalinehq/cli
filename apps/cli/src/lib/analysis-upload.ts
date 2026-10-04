@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { ORPCError } from "@orpc/client";
 import { parseSafeApiEndpoint, type Source } from "../contracts/index.js";
@@ -6,6 +7,7 @@ import {
 	MissingTranscriptTimestampError,
 } from "../internal/agent-adapters/index.js";
 import {
+	type AnalysisDestination,
 	type AnalysisMarker,
 	removeAnalysisMarker,
 	type TranscriptFingerprint,
@@ -46,7 +48,10 @@ import {
 
 export interface AnalysisUploadEnvironment {
 	readonly allowInsecureEndpoint: boolean;
-	readonly credentials: Pick<Credentials, "authType" | "token">;
+	readonly credentials: Pick<
+		Credentials,
+		"apiKeyId" | "authType" | "token" | "user"
+	>;
 	/** RPC endpoint, e.g. `https://opaline.so/rpc`. */
 	readonly endpoint: string;
 }
@@ -73,7 +78,42 @@ export interface AnalysisTargetOutcome {
 
 export type AnalysisSupport =
 	| { readonly supported: true }
-	| { readonly supported: false; readonly reason: string };
+	| {
+			readonly supported: false;
+			/** `unavailable` is transient: the server could not be asked. */
+			readonly kind: "unsupported" | "unauthenticated" | "unavailable";
+			readonly reason: string;
+	  };
+
+/**
+ * Where an analysis upload goes: the normalized RPC endpoint and the account
+ * of the credentials. Markers and retries are bound to the destination the
+ * import approved; any other destination is refused.
+ */
+export function getAnalysisDestination(
+	environment: AnalysisUploadEnvironment,
+): AnalysisDestination {
+	const endpoint = parseSafeApiEndpoint(environment.endpoint, {
+		allowPlaintext: true,
+	});
+	const { credentials } = environment;
+	const account = credentials.user?.id
+		? `user:${credentials.user.id}`
+		: credentials.apiKeyId
+			? `key:${credentials.apiKeyId}`
+			: `token:${createHash("sha256").update(credentials.token).digest("hex").slice(0, 32)}`;
+	return {
+		account,
+		endpoint: endpoint.ok ? new URL(endpoint.url).href : environment.endpoint,
+	};
+}
+
+export function isSameAnalysisDestination(
+	left: AnalysisDestination,
+	right: AnalysisDestination,
+): boolean {
+	return left.endpoint === right.endpoint && left.account === right.account;
+}
 
 export async function checkAnalysisUploadSupport(
 	environment: AnalysisUploadEnvironment,
@@ -82,7 +122,11 @@ export async function checkAnalysisUploadSupport(
 		allowPlaintext: environment.allowInsecureEndpoint,
 	});
 	if (!endpoint.ok)
-		return { supported: false, reason: "The upload endpoint was refused." };
+		return {
+			kind: "unavailable",
+			supported: false,
+			reason: "The upload endpoint was refused.",
+		};
 	const url = new URL(endpoint.url);
 	const authType = environment.credentials.authType ?? "bearer";
 	const { token } = environment.credentials;
@@ -95,20 +139,30 @@ export async function checkAnalysisUploadSupport(
 			token,
 		}).cli.authStatus(undefined, { signal: AbortSignal.timeout(15_000) });
 		if (status.capabilities?.analysisLinkedUploads !== true)
-			return { supported: false, reason: ANALYSIS_UPLOAD_UNSUPPORTED_MESSAGE };
+			return {
+				kind: "unsupported",
+				supported: false,
+				reason: ANALYSIS_UPLOAD_UNSUPPORTED_MESSAGE,
+			};
 	} catch (error) {
 		if (
 			error instanceof ORPCError &&
 			(error.status === 401 || error.status === 403)
 		)
 			return {
+				kind: "unauthenticated",
 				supported: false,
 				reason: "Not authenticated. Run `opaline login` first.",
 			};
 		if (error instanceof ORPCError && error.status === 404)
-			return { supported: false, reason: ANALYSIS_UPLOAD_UNSUPPORTED_MESSAGE };
+			return {
+				kind: "unsupported",
+				supported: false,
+				reason: ANALYSIS_UPLOAD_UNSUPPORTED_MESSAGE,
+			};
 		const detail = error instanceof Error ? error.message : String(error);
 		return {
+			kind: "unavailable",
 			supported: false,
 			reason: `Could not reach Opaline to check analysis upload support: ${detail}`,
 		};
@@ -208,6 +262,7 @@ export async function uploadAnalysisTargets(
 		const outcome = await recordOutcome(
 			target,
 			analysisId,
+			getAnalysisDestination(environment),
 			result,
 			fingerprint,
 		);
@@ -219,8 +274,8 @@ export async function uploadAnalysisTargets(
 
 /**
  * Hook entry point for a marked chat: upload the marked conversation (with
- * related threads re-resolved, so newly spawned subagents are included) and
- * remember what was uploaded. Returns the error lines to surface, if any.
+ * related threads re-resolved when the import included them, so newly spawned
+ * subagents are covered) and remember what was uploaded.
  */
 export async function uploadMarkedConversation(
 	marker: AnalysisMarker,
@@ -237,7 +292,7 @@ export async function uploadMarkedConversation(
 		: (
 				await resolveAnalysisTargets(marker.sessionId, {
 					codexHome: options.codexHome,
-					related: true,
+					related: marker.related,
 				}).catch(() => ({ targets: [] }))
 			).targets;
 	const outcomes = await uploadAnalysisTargets(
@@ -256,7 +311,7 @@ export async function uploadMarkedConversation(
 
 /** Persist upload fingerprints, or drop the marker when linking cannot work. */
 export async function settleMarker(
-	marker: Pick<AnalysisMarker, "sessionId" | "source">,
+	marker: Pick<AnalysisMarker, "markerId">,
 	targets: readonly AnalysisUploadTarget[],
 	outcomes: readonly AnalysisTargetOutcome[],
 	environment: AnalysisUploadEnvironment,
@@ -338,6 +393,7 @@ async function uploadTarget(
 async function recordOutcome(
 	target: AnalysisUploadTarget,
 	analysisId: string,
+	analysisDestination: AnalysisDestination,
 	result: UploadResult,
 	fingerprint: TranscriptFingerprint | undefined,
 ): Promise<AnalysisTargetOutcome> {
@@ -347,6 +403,7 @@ async function recordOutcome(
 		projectPath: target.projectPath,
 		source: target.source,
 		analysisId,
+		analysisDestination,
 	};
 	if (result.success) {
 		await removeFailedUpload(target.sessionId);
