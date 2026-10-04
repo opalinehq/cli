@@ -571,6 +571,96 @@ describe("opaline import --analysis", () => {
 		expect(await readFailedUploads(fixture)).toEqual([]);
 	});
 
+	test("import, the marked hook and --retry all send slimmed transcripts with the link", async () => {
+		const api = startApiStub();
+		const fixture = await createFixture(api.baseUrl);
+		const sessionId = "7d1e2f30-4a5b-4c6d-8e9f-0a1b2c3d4e5f";
+		const projectDir = join(fixture.home, ".claude", "projects", "-tmp-chat");
+		await mkdir(projectDir, { recursive: true });
+		const transcriptPath = join(projectDir, `${sessionId}.jsonl`);
+		const pixels = Buffer.from(
+			Array.from({ length: 30_000 }, (_, index) => (index * 37 + 11) % 256),
+		).toString("base64");
+		const screenshotLine = (timestamp: string, text: string) =>
+			`${JSON.stringify({
+				message: {
+					content: [
+						{
+							source: { data: pixels, media_type: "image/png", type: "base64" },
+							type: "image",
+						},
+						{ text, type: "text" },
+					],
+					role: "user",
+				},
+				sessionId,
+				timestamp,
+				type: "user",
+			})}\n`;
+		await writeFile(
+			transcriptPath,
+			screenshotLine("2026-10-04T10:00:00.000Z", "Why did this fail?"),
+		);
+		const expectSlimmed = (upload: Record<string, unknown> | undefined) => {
+			const content = String(upload?.content);
+			expect(upload).toMatchObject({ analysisId: "analysis-12", sessionId });
+			expect(content).toContain("opaline-image-omitted:v1;sha256=");
+			expect(content).not.toContain(pixels);
+		};
+
+		const imported = await cli(fixture, [
+			"import",
+			sessionId,
+			"--analysis",
+			"analysis-12",
+		]);
+		expect(imported.exitCode).toBe(0);
+		expectSlimmed(api.ingests[0]);
+
+		await writeFile(
+			transcriptPath,
+			screenshotLine("2026-10-04T10:01:00.000Z", "And this one?"),
+			{ flag: "a" },
+		);
+		const hook = await cli(
+			fixture,
+			["hooks", "claude", "session-end"],
+			JSON.stringify({
+				cwd: fixture.chatPath,
+				hook_event_name: "SessionEnd",
+				session_id: sessionId,
+				transcript_path: transcriptPath,
+			}),
+		);
+		expect(hook.exitCode).toBe(0);
+		expectSlimmed(api.ingests[1]);
+		expect(String(api.ingests[1]?.content)).toContain("And this one?");
+
+		await writeFile(
+			join(fixture.home, ".rudel", "failed-uploads.json"),
+			JSON.stringify({
+				failures: [
+					{
+						analysisDestination: destinationOf(api.baseUrl),
+						analysisId: "analysis-12",
+						error: "Temporary Opaline server/proxy error",
+						failedAt: new Date().toISOString(),
+						projectPath: fixture.chatPath,
+						sessionId,
+						source: "claude_code",
+						status: "retryable",
+						transcriptPath,
+					},
+				],
+			}),
+		);
+		const retried = await cli(fixture, ["import", "--retry", "--yes"]);
+		expect(retried.exitCode).toBe(0);
+		expect(api.ingests).toHaveLength(3);
+		expectSlimmed(api.ingests[2]);
+		expect(await readFailedUploads(fixture)).toEqual([]);
+	});
+
 	test("a marked Claude Code session uploads at session end with its analysis", async () => {
 		const api = startApiStub();
 		const fixture = await createFixture(api.baseUrl);
