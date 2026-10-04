@@ -88,7 +88,9 @@ describe("facet coverage matrix: each limit cuts only its own facet", () => {
 		[
 			"general content budget",
 			{ maxTotalContentBytes: 1 },
-			{ hooks: "truncated" },
+			// The repository's .mcp.json is content-bearing, so its facet is cut
+			// along with the hook file.
+			{ hooks: "truncated", mcp: "truncated" },
 			{},
 		],
 		["general blob-count cap", { maxBlobs: 1 }, { hooks: "truncated" }, {}],

@@ -662,6 +662,27 @@ export interface UserAgentConfigurationSource {
 	readonly status: "parsed" | "absent" | "unreadable";
 }
 
+/** An MCP server and where it is configured. */
+export interface UserAgentScopedMcpServer extends UserAgentMcpServer {
+	readonly scope: "user" | "project" | "managed";
+}
+
+/**
+ * One layer of Claude Code's effective settings, sanitized: `env` keeps only
+ * variable names, values under credential-like keys are replaced, every string
+ * passes the inline-credential and known-secret filters, and lists and depth
+ * are bounded.
+ */
+export interface UserAgentSettingsLayer extends UserAgentConfigurationSource {
+	readonly scope:
+		| "user"
+		| "user-local"
+		| "project"
+		| "project-local"
+		| "managed";
+	readonly settings: unknown;
+}
+
 export interface UserAgentConfiguration {
 	readonly claude: {
 		readonly settings: UserAgentConfigurationSource;
@@ -675,6 +696,14 @@ export interface UserAgentConfiguration {
 			readonly additionalDirectories: readonly string[];
 		};
 		readonly installedPlugins: readonly string[];
+		/** Every settings layer that applies to the session, lowest first. */
+		readonly settingsLayers: readonly UserAgentSettingsLayer[];
+		/**
+		 * MCP servers from ~/.claude.json (only its `mcpServers` sections: the
+		 * global one and the session project's) and managed-mcp.json.
+		 */
+		readonly mcpServers: readonly UserAgentScopedMcpServer[];
+		readonly stateFile: UserAgentConfigurationSource;
 	};
 	readonly codex: {
 		readonly config: UserAgentConfigurationSource;
@@ -683,6 +712,13 @@ export interface UserAgentConfiguration {
 		readonly notify: readonly string[];
 		readonly hooks: readonly UserAgentHook[];
 		readonly plugins: Readonly<Record<string, boolean>>;
+		/** Enablement flags of features, apps, connectors and tools. */
+		readonly features: Readonly<Record<string, boolean>>;
+		readonly apps: Readonly<Record<string, boolean>>;
+		readonly connectors: Readonly<Record<string, boolean>>;
+		readonly tools: Readonly<Record<string, boolean>>;
+		readonly approvalPolicy: string | null;
+		readonly sandboxMode: string | null;
 	};
 	readonly truncated: boolean;
 }

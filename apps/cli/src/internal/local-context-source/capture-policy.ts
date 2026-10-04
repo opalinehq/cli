@@ -50,6 +50,8 @@ export function getSessionContentPriority(
 	categories: readonly ContextFileCategory[],
 	observedSkillNames: ReadonlySet<string>,
 ): number {
+	// The repository's MCP server files decide which tools a session has.
+	if (rootId === "repository" && isRepositoryMcpFile(path)) return 2;
 	if (isSessionContentPolicyExcluded(path, categories)) return 4;
 	if (isClaudeRuleFile(rootId, path)) return 0;
 	if (categories.includes("skill-definition")) {
@@ -98,6 +100,13 @@ export function isSessionInstructionContent(
 		return !isSessionContentPolicyExcluded(path, categories);
 	if (rootId !== "repository") return false;
 	return getSessionContentPriority(rootId, path, categories, new Set()) <= 0;
+}
+
+/** MCP server definitions checked into a repository (`.mcp.json` and kin). */
+export function isRepositoryMcpFile(path: string): boolean {
+	return [".mcp.json", "mcp.json", "mcp-config.json"].includes(
+		basename(path).toLowerCase(),
+	);
 }
 
 /**

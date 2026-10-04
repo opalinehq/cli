@@ -216,7 +216,10 @@ describe("real repository sidecar capture", () => {
 					entry.rootId !== "repository" ||
 					entry.categories?.includes("skill-definition") ||
 					basename(entry.path).toLowerCase().endsWith(".local.md") ||
-					/(?:^|\/)\.claude\/rules\//u.test(entry.path);
+					/(?:^|\/)\.claude\/rules\//u.test(entry.path) ||
+					[".mcp.json", "mcp.json", "mcp-config.json"].includes(
+						basename(entry.path).toLowerCase(),
+					);
 				for (const entry of localContext.entries) {
 					if (!fullContent(entry) || entry.kind !== "file") continue;
 					if (entry.content?.status !== "available" || !entry.content.blobId)
@@ -355,6 +358,14 @@ describe("real repository sidecar capture", () => {
 						)
 						.map((credential) => credential.name),
 				).toEqual([]);
+				// Only the MCP sections of ~/.claude.json are captured: no account
+				// identifier, prompt history or allowed tool from it is delivered.
+				const statePrivateValues = await readClaudeStatePrivateValues();
+				expect(
+					statePrivateValues.filter((value) =>
+						delivered.some((text) => text.includes(value)),
+					).length,
+				).toBe(0);
 				const userConfiguration = localContext.userConfiguration;
 				assert(userConfiguration);
 				const gitWorktrees = execFileSync(
@@ -408,8 +419,17 @@ describe("real repository sidecar capture", () => {
 						codexMcpServers: userConfiguration.codex.mcpServers.length,
 						codexHooks: userConfiguration.codex.hooks.length,
 						codexPlugins: Object.keys(userConfiguration.codex.plugins).length,
+						claudeSettingsLayers: userConfiguration.claude.settingsLayers.map(
+							(layer) => `${layer.scope}: ${layer.status}`,
+						),
+						claudeMcpServers: userConfiguration.claude.mcpServers.map(
+							(server) => `${server.scope}:${server.name}`,
+						),
+						codexFeatures: Object.keys(userConfiguration.codex.features).length,
+						codexApps: Object.keys(userConfiguration.codex.apps).length,
 					},
 					credentialsChecked: configuredCredentials.length,
+					claudeStatePrivateValuesChecked: statePrivateValues.length,
 					warnings,
 				};
 				console.log(`REAL_REPO_CAPTURE ${JSON.stringify(summary)}`);
@@ -516,7 +536,76 @@ async function readConfiguredCredentials(): Promise<
 		"utf8",
 	).catch(() => null);
 	if (settings !== null) collect("claude.env", JSON.parse(settings).env, true);
+	const localSettings = await readFile(
+		join(homedir(), ".claude", "settings.local.json"),
+		"utf8",
+	).catch(() => null);
+	if (localSettings !== null)
+		collect("claude.local.env", JSON.parse(localSettings).env, false);
+	// MCP server environment values and headers in ~/.claude.json.
+	const state = await readClaudeState();
+	const servers = [
+		...Object.entries(state.mcpServers ?? {}),
+		...Object.values(state.projects ?? {}).flatMap((project) =>
+			Object.entries(project.mcpServers ?? {}),
+		),
+	];
+	for (const [name, server] of servers) {
+		collect(`claude.mcpServers.${name}.env`, server.env, false);
+		collect(`claude.mcpServers.${name}.headers`, server.headers, false);
+	}
 	return credentials;
+}
+
+interface ClaudeState {
+	readonly mcpServers?: Record<string, ClaudeMcpServer>;
+	readonly projects?: Record<
+		string,
+		{
+			readonly mcpServers?: Record<string, ClaudeMcpServer>;
+			readonly history?: readonly { readonly display?: unknown }[];
+			readonly allowedTools?: readonly unknown[];
+		}
+	>;
+	readonly userID?: unknown;
+	readonly anonymousId?: unknown;
+	readonly oauthAccount?: { readonly emailAddress?: unknown };
+}
+
+interface ClaudeMcpServer {
+	readonly env?: Record<string, unknown>;
+	readonly headers?: Record<string, unknown>;
+}
+
+async function readClaudeState(): Promise<ClaudeState> {
+	const text = await readFile(join(homedir(), ".claude.json"), "utf8").catch(
+		() => null,
+	);
+	return text === null ? {} : JSON.parse(text);
+}
+
+/**
+ * Distinctive values from the parts of ~/.claude.json that must never be
+ * captured: account identifiers and every project's prompt history and
+ * allowed tools. Only their count is reported.
+ */
+async function readClaudeStatePrivateValues(): Promise<readonly string[]> {
+	const state = await readClaudeState();
+	const values: string[] = [];
+	for (const value of [
+		state.userID,
+		state.anonymousId,
+		state.oauthAccount?.emailAddress,
+	])
+		if (typeof value === "string" && value.length >= 8) values.push(value);
+	for (const project of Object.values(state.projects ?? {})) {
+		for (const entry of project.history ?? [])
+			if (typeof entry.display === "string" && entry.display.length >= 24)
+				values.push(entry.display);
+		for (const tool of project.allowedTools ?? [])
+			if (typeof tool === "string" && tool.length >= 24) values.push(tool);
+	}
+	return values;
 }
 
 function codexHome(): string {

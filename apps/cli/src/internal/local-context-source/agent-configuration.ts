@@ -4,6 +4,8 @@ import type {
 	UserAgentConfigurationSource,
 	UserAgentHook,
 	UserAgentMcpServer,
+	UserAgentScopedMcpServer,
+	UserAgentSettingsLayer,
 } from "./types.js";
 
 /**
@@ -20,12 +22,29 @@ const MAX_SUMMARY_BYTES = 64 * 1024;
 const CREDENTIAL_KEY =
 	/(?:token|secret|passw(?:or)?d|authori[sz]ation|auth|api[-_]?key|cookie|credential|private[-_]?key|session)/iu;
 const REDACTED = "[REDACTED]";
+const MAX_SETTINGS_DEPTH = 8;
 
 export interface AgentConfigurationInputs {
 	readonly claudeSettings: ParsedSource;
 	readonly claudeInstalledPlugins: readonly string[];
 	readonly codexConfig: ParsedSource;
 	readonly codexHooks: ParsedSource;
+	/** Further Claude Code settings layers (user-local, project, managed). */
+	readonly claudeSettingsLayers?: readonly ScopedSource[];
+	/**
+	 * ~/.claude.json reduced to its MCP sections when it was read: the rest of
+	 * that file (project history, caches) is never passed here.
+	 */
+	readonly claudeState?: {
+		readonly source: UserAgentConfigurationSource;
+		readonly mcpServers: unknown;
+		readonly projectMcpServers: unknown;
+	};
+	readonly managedMcp?: ParsedSource;
+}
+
+export interface ScopedSource extends ParsedSource {
+	readonly scope: UserAgentSettingsLayer["scope"];
 }
 
 export interface ParsedSource {
@@ -56,6 +75,29 @@ export function summarizeUserAgentConfiguration(
 				additionalDirectories: cleanStrings(permissions?.additionalDirectories),
 			},
 			installedPlugins: cleanStrings(inputs.claudeInstalledPlugins),
+			settingsLayers: [
+				{ ...inputs.claudeSettings, scope: "user" as const },
+				...(inputs.claudeSettingsLayers ?? []),
+			].map(
+				(layer): UserAgentSettingsLayer => ({
+					scope: layer.scope,
+					...describeSource(layer),
+					settings:
+						layer.status === "parsed" ? sanitizeSettings(layer.value, 0) : null,
+				}),
+			),
+			mcpServers: [
+				...scopeServers(inputs.claudeState?.mcpServers, "user"),
+				...scopeServers(inputs.claudeState?.projectMcpServers, "project"),
+				...scopeServers(
+					asRecord(inputs.managedMcp?.value)?.mcpServers,
+					"managed",
+				),
+			].slice(0, MAX_LIST_ITEMS),
+			stateFile: inputs.claudeState?.source ?? {
+				path: "~/.claude.json",
+				status: "absent",
+			},
 		},
 		codex: {
 			config: describeSource(inputs.codexConfig),
@@ -63,10 +105,13 @@ export function summarizeUserAgentConfiguration(
 			mcpServers: summarizeMcpServers(codex?.mcp_servers),
 			notify: cleanStrings(codex?.notify),
 			hooks: summarizeHooks(codexHooks?.hooks),
-			plugins: summarizeFlags(codex?.plugins, (value) => {
-				const enabled = asRecord(value)?.enabled;
-				return typeof enabled === "boolean" ? enabled : null;
-			}),
+			plugins: summarizeFlags(codex?.plugins, readEnabled),
+			features: summarizeFlags(codex?.features, readEnabled),
+			apps: summarizeFlags(codex?.apps, readEnabled),
+			connectors: summarizeFlags(codex?.connectors, readEnabled),
+			tools: summarizeFlags(codex?.tools, readEnabled),
+			approvalPolicy: cleanString(codex?.approval_policy),
+			sandboxMode: cleanString(codex?.sandbox_mode),
 		},
 		truncated: false,
 	};
@@ -79,6 +124,14 @@ export function summarizeUserAgentConfiguration(
 		claude: {
 			...summary.claude,
 			hooks: summary.claude.hooks.map((hook) => ({ ...hook, command: null })),
+			settingsLayers: summary.claude.settingsLayers.map((layer) => ({
+				...layer,
+				settings: null,
+			})),
+			mcpServers: summary.claude.mcpServers.map((server) => ({
+				...server,
+				args: [],
+			})),
 			permissions: {
 				...summary.claude.permissions,
 				allow: [],
@@ -134,6 +187,52 @@ function summarizeHooks(value: unknown): readonly UserAgentHook[] {
 	return hooks;
 }
 
+function readEnabled(value: unknown): boolean | null {
+	if (typeof value === "boolean") return value;
+	const enabled = asRecord(value)?.enabled;
+	return typeof enabled === "boolean" ? enabled : null;
+}
+
+function scopeServers(
+	value: unknown,
+	scope: UserAgentScopedMcpServer["scope"],
+): readonly UserAgentScopedMcpServer[] {
+	return summarizeMcpServers(value).map((server) => ({ ...server, scope }));
+}
+
+/**
+ * A settings layer with credentials removed: `env` keeps variable names only,
+ * any value under a credential-like key is replaced, strings are cleaned and
+ * length-bounded, and lists and nesting are bounded.
+ */
+function sanitizeSettings(value: unknown, depth: number): unknown {
+	if (typeof value === "string") return truncate(value);
+	if (typeof value === "number" || typeof value === "boolean" || value === null)
+		return value;
+	if (depth >= MAX_SETTINGS_DEPTH) return REDACTED;
+	if (Array.isArray(value))
+		return value
+			.slice(0, MAX_LIST_ITEMS)
+			.map((item) => sanitizeSettings(item, depth + 1));
+	const record = asRecord(value);
+	if (!record) return null;
+	const sanitized: Record<string, unknown> = {};
+	for (const [key, child] of Object.entries(record).slice(0, MAX_LIST_ITEMS)) {
+		const name = truncate(key);
+		if (key === "env") {
+			sanitized[name] = Object.keys(asRecord(child) ?? {})
+				.slice(0, MAX_LIST_ITEMS)
+				.map((variable) => truncate(variable));
+			continue;
+		}
+		sanitized[name] =
+			CREDENTIAL_KEY.test(key) && child !== null && typeof child !== "boolean"
+				? REDACTED
+				: sanitizeSettings(child, depth + 1);
+	}
+	return sanitized;
+}
+
 function summarizeMcpServers(value: unknown): readonly UserAgentMcpServer[] {
 	const servers = asRecord(value);
 	if (!servers) return [];
@@ -143,10 +242,17 @@ function summarizeMcpServers(value: unknown): readonly UserAgentMcpServer[] {
 			const server = asRecord(configuration);
 			const command = cleanString(server?.command);
 			const url = sanitizeUrl(server?.url);
+			const declared = server?.type;
 			return {
 				name: cleanString(name) ?? "",
 				transport:
-					command !== null ? "stdio" : url !== null ? "http" : "unknown",
+					declared === "stdio" || (declared === undefined && command !== null)
+						? "stdio"
+						: declared === "http" ||
+								declared === "sse" ||
+								(declared === undefined && url !== null)
+							? "http"
+							: "unknown",
 				command,
 				args: cleanArguments(server?.args),
 				url,
@@ -157,6 +263,7 @@ function summarizeMcpServers(value: unknown): readonly UserAgentMcpServer[] {
 				headerKeys: [
 					...Object.keys(asRecord(server?.http_headers) ?? {}),
 					...Object.keys(asRecord(server?.env_http_headers) ?? {}),
+					...Object.keys(asRecord(server?.headers) ?? {}),
 				]
 					.slice(0, MAX_LIST_ITEMS)
 					.map((key) => truncate(key)),

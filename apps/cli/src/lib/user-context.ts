@@ -35,6 +35,8 @@ const MAX_IMPORT_DEPTH = 5;
 const MAX_IMPORTED_FILES = 64;
 const MAX_INSTRUCTION_READ_BYTES = 2 * 1024 * 1024;
 const MAX_CONFIGURATION_READ_BYTES = 4 * 1024 * 1024;
+// ~/.claude.json also holds project history; only its MCP sections are kept.
+const MAX_CLAUDE_STATE_READ_BYTES = 32 * 1024 * 1024;
 // Claude Code shortens project directory names longer than this and appends
 // a hash of the full path.
 const CLAUDE_PROJECT_KEY_MAX_LENGTH = 200;
@@ -103,18 +105,46 @@ export async function canonicalizeUserContextLocations(
 export async function readUserAgentSources(
 	locations: UserContextLocations,
 	repositoryRoot: string,
+	projectPaths: readonly string[] = [repositoryRoot],
 ): Promise<UserAgentSources> {
 	const claudeDirectory = join(locations.home, ".claude");
-	const [claudeSettings, installed, codexConfig, codexHooks] =
-		await Promise.all([
-			readSource(join(claudeDirectory, "settings.json"), JSON.parse),
-			readSource(
-				join(claudeDirectory, "plugins", "installed_plugins.json"),
-				JSON.parse,
-			),
-			readSource(join(locations.codexHome, "config.toml"), parseToml),
-			readSource(join(locations.codexHome, "hooks.json"), JSON.parse),
-		]);
+	const managed = locations.managedClaudeDirectory ?? null;
+	const [
+		claudeSettings,
+		installed,
+		codexConfig,
+		codexHooks,
+		claudeLocalSettings,
+		projectSettings,
+		projectLocalSettings,
+		managedSettings,
+		managedMcp,
+		claudeState,
+	] = await Promise.all([
+		readSource(join(claudeDirectory, "settings.json"), JSON.parse),
+		readSource(
+			join(claudeDirectory, "plugins", "installed_plugins.json"),
+			JSON.parse,
+		),
+		readSource(join(locations.codexHome, "config.toml"), parseToml),
+		readSource(join(locations.codexHome, "hooks.json"), JSON.parse),
+		readSource(join(claudeDirectory, "settings.local.json"), JSON.parse),
+		readSource(join(repositoryRoot, ".claude", "settings.json"), JSON.parse),
+		readSource(
+			join(repositoryRoot, ".claude", "settings.local.json"),
+			JSON.parse,
+		),
+		managed === null
+			? null
+			: readSource(join(managed, "managed-settings.json"), JSON.parse),
+		managed === null
+			? null
+			: readSource(join(managed, "managed-mcp.json"), JSON.parse),
+		readClaudeStateMcpSections(
+			join(locations.home, ".claude.json"),
+			projectPaths,
+		),
+	]);
 	const claudePlugins = getApplicableClaudePlugins(
 		installed.value,
 		repositoryRoot,
@@ -126,6 +156,77 @@ export async function readUserAgentSources(
 		codexConfig: { ...codexConfig, path: "$CODEX_HOME/config.toml" },
 		codexHooks: { ...codexHooks, path: "$CODEX_HOME/hooks.json" },
 		codexPluginNames: getEnabledCodexPlugins(codexConfig.value),
+		claudeSettingsLayers: [
+			{
+				...claudeLocalSettings,
+				path: "~/.claude/settings.local.json",
+				scope: "user-local",
+			},
+			{ ...projectSettings, path: ".claude/settings.json", scope: "project" },
+			{
+				...projectLocalSettings,
+				path: ".claude/settings.local.json",
+				scope: "project-local",
+			},
+			...(managedSettings === null
+				? []
+				: [{ ...managedSettings, scope: "managed" as const }]),
+		],
+		claudeState,
+		...(managedMcp === null ? {} : { managedMcp }),
+	};
+}
+
+/**
+ * Only the MCP sections of ~/.claude.json: the global `mcpServers` and the
+ * `mcpServers` of the session's project entries. That file also holds every
+ * project's history, trust decisions and caches, none of which leaves this
+ * function.
+ */
+async function readClaudeStateMcpSections(
+	path: string,
+	projectPaths: readonly string[],
+): Promise<NonNullable<UserAgentSources["claudeState"]>> {
+	const source = { path: "~/.claude.json" };
+	let text: string | null;
+	try {
+		text = await readTextIfFile(path, MAX_CLAUDE_STATE_READ_BYTES);
+	} catch {
+		return {
+			source: { ...source, status: "unreadable" },
+			mcpServers: undefined,
+			projectMcpServers: undefined,
+		};
+	}
+	if (text === null)
+		return {
+			source: { ...source, status: "absent" },
+			mcpServers: undefined,
+			projectMcpServers: undefined,
+		};
+	let state: Record<string, unknown> | undefined;
+	try {
+		state = asRecord(JSON.parse(text));
+	} catch {
+		state = undefined;
+	}
+	if (state === undefined)
+		return {
+			source: { ...source, status: "unreadable" },
+			mcpServers: undefined,
+			projectMcpServers: undefined,
+		};
+	const projects = asRecord(state.projects) ?? {};
+	const projectMcpServers: Record<string, unknown> = {};
+	for (const projectPath of projectPaths)
+		Object.assign(
+			projectMcpServers,
+			asRecord(asRecord(projects[projectPath])?.mcpServers) ?? {},
+		);
+	return {
+		source: { ...source, status: "parsed" },
+		mcpServers: state.mcpServers,
+		projectMcpServers,
 	};
 }
 

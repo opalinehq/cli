@@ -643,6 +643,159 @@ describe("user-level context roots", () => {
 		}
 	});
 
+	test("summarizes every settings layer and only the MCP sections of ~/.claude.json, without secrets", async () => {
+		const home = await createHome();
+		const repository = join(home, "repo");
+		const managed = join(home, "managed-root");
+		const token = `ghp_${"E".repeat(36)}`;
+		const files: Record<string, string> = {
+			".claude/settings.json": JSON.stringify({ model: "opus" }),
+			".claude/settings.local.json": JSON.stringify({
+				env: { ANTHROPIC_API_KEY: "sk-ant-local-0123456789", DEBUG: "1" },
+				permissions: { allow: ["Bash(npm test)"] },
+				apiKeyHelper: "/usr/local/bin/print-key --token abc123secretvalue",
+				statusLine: { type: "command", command: "status --api-key=xyz987" },
+			}),
+			"repo/.claude/settings.json": JSON.stringify({
+				enabledMcpjsonServers: ["github"],
+				hooks: {
+					PreToolUse: [
+						{ hooks: [{ type: "command", command: `guard ${token}` }] },
+					],
+				},
+			}),
+			"repo/.claude/settings.local.json": JSON.stringify({
+				permissions: { deny: ["Read(.env)"] },
+			}),
+			"managed-root/managed-settings.json": JSON.stringify({
+				permissions: { disableBypassPermissionsMode: "disable" },
+			}),
+			"managed-root/managed-mcp.json": JSON.stringify({
+				mcpServers: {
+					company: { type: "http", url: "https://mcp.corp/x?k=1" },
+				},
+			}),
+			".claude.json": JSON.stringify({
+				userID: "PRIVATE_USER_ID_CANARY",
+				oauthAccount: { emailAddress: "PRIVATE_EMAIL_CANARY" },
+				mcpServers: {
+					linear: { type: "sse", url: "https://user:pw@mcp.linear.app/sse" },
+				},
+				projects: {
+					[repository]: {
+						history: [{ display: "PRIVATE_HISTORY_CANARY" }],
+						allowedTools: ["PRIVATE_ALLOWED_TOOL_CANARY"],
+						mcpServers: {
+							db: {
+								command: "db-mcp",
+								args: ["--password", "hunter2hunter2"],
+								env: { DB_URL: "postgres://u:secret@db/x" },
+							},
+						},
+					},
+					[join(home, "other")]: {
+						mcpServers: { other: { command: "PRIVATE_OTHER_PROJECT" } },
+					},
+				},
+			}),
+			"codex/config.toml": [
+				'approval_policy = "on-request"',
+				'sandbox_mode = "workspace-write"',
+				"[features]",
+				"goals = true",
+				"js_repl = false",
+				"[apps.github]",
+				"enabled = true",
+				"[apps.slack]",
+				"enabled = false",
+				`token = "${token}"`,
+				"",
+			].join("\n"),
+		};
+		for (const [path, content] of Object.entries(files)) {
+			await mkdir(dirname(join(home, path)), { recursive: true });
+			await writeFile(join(home, path), content);
+		}
+		await mkdir(repository, { recursive: true });
+		const locations = {
+			home,
+			codexHome: join(home, "codex"),
+			managedClaudeDirectory: managed,
+		};
+		const summary = summarizeUserAgentSources(
+			await readUserAgentSources(locations, repository, [repository]),
+		);
+		const serialized = JSON.stringify(summary);
+		for (const secret of [
+			token,
+			"sk-ant-local-0123456789",
+			"abc123secretvalue",
+			"xyz987",
+			"hunter2hunter2",
+			"postgres://u:secret",
+			"user:pw",
+			"PRIVATE_USER_ID_CANARY",
+			"PRIVATE_EMAIL_CANARY",
+			"PRIVATE_HISTORY_CANARY",
+			"PRIVATE_ALLOWED_TOOL_CANARY",
+			"PRIVATE_OTHER_PROJECT",
+		])
+			expect(serialized).not.toContain(secret);
+		expect(
+			summary.claude.settingsLayers.map((layer) => [
+				layer.scope,
+				layer.path,
+				layer.status,
+			]),
+		).toEqual([
+			["user", "~/.claude/settings.json", "parsed"],
+			["user-local", "~/.claude/settings.local.json", "parsed"],
+			["project", ".claude/settings.json", "parsed"],
+			["project-local", ".claude/settings.local.json", "parsed"],
+			["managed", join(managed, "managed-settings.json"), "parsed"],
+		]);
+		expect(summary.claude.settingsLayers[1]?.settings).toMatchObject({
+			env: ["ANTHROPIC_API_KEY", "DEBUG"],
+			permissions: { allow: ["Bash(npm test)"] },
+			apiKeyHelper: "[REDACTED]",
+			statusLine: { type: "command", command: "status --api-key=[REDACTED]" },
+		});
+		expect(summary.claude.settingsLayers[3]?.settings).toEqual({
+			permissions: { deny: ["Read(.env)"] },
+		});
+		expect(
+			summary.claude.mcpServers.map((server) => [
+				server.scope,
+				server.name,
+				server.transport,
+				server.url,
+				server.args,
+				server.envKeys,
+			]),
+		).toEqual([
+			["user", "linear", "http", "https://mcp.linear.app/sse", [], []],
+			[
+				"project",
+				"db",
+				"stdio",
+				null,
+				["--password", "[REDACTED]"],
+				["DB_URL"],
+			],
+			["managed", "company", "http", "https://mcp.corp/x", [], []],
+		]);
+		expect(summary.claude.stateFile).toEqual({
+			path: "~/.claude.json",
+			status: "parsed",
+		});
+		expect(summary.codex).toMatchObject({
+			approvalPolicy: "on-request",
+			sandboxMode: "workspace-write",
+			features: { goals: true, js_repl: false },
+			apps: { github: true, slack: false },
+		});
+	});
+
 	test("CODEX_HOME relocates Codex instructions, skills, plugins and configuration", () => {
 		expect(
 			getUserContextLocations({ CODEX_HOME: "/opt/codex-home" }, "/home/user"),

@@ -252,9 +252,9 @@ test("bounds a clean canary-shaped capture with every skill definition but no sk
 		reason: "capture-limit",
 	});
 	expect(bundle.manifest.coverage.limitsReached).toContain("maxManifestBytes");
-	// Two instruction files plus every one of the 120 skill definitions, in
-	// full, from the user-context pool.
-	expect(bundle.manifest.coverage.contentFiles).toBe(122);
+	// Two instruction files, .mcp.json and every one of the 120 skill
+	// definitions, in full, the definitions from the user-context pool.
+	expect(bundle.manifest.coverage.contentFiles).toBe(123);
 	expect(bundle.manifest.contextIndex.skills.length).toBeGreaterThan(0);
 	let definitions = 0;
 	for (const entry of bundle.manifest.entries) {
@@ -265,7 +265,7 @@ test("bounds a clean canary-shaped capture with every skill definition but no sk
 		expect(entry.hash).toMatchObject({ status: "available", scope: "stored" });
 	}
 	expect(definitions).toBe(120);
-	expect(bundle.blobs).toHaveLength(122);
+	expect(bundle.blobs).toHaveLength(123);
 	const resources = bundle.manifest.entries.filter(
 		(entry) =>
 			entry.kind === "file" &&
@@ -529,12 +529,9 @@ test("keeps Claude and Codex agent-definition Markdown but not skill-resource Ma
 	}
 });
 
-test("MCP files and agent settings are hash-only even when they contain unknown tokens", async () => {
+test("agent settings and other MCP package files are hash-only even when they contain unknown tokens", async () => {
 	const metadataPaths = [
 		"docs/private.LOCAL.MD",
-		".mcp.json",
-		"nested/mcp.json",
-		"mcp-config.json",
 		"mcp/server.json",
 		"nested/mcp/readme.md",
 		".claude/settings.json",
@@ -542,7 +539,6 @@ test("MCP files and agent settings are hash-only even when they contain unknown 
 		"nested/.claude/settings.private.json",
 		".codex/config.toml",
 		"nested/.codex/config.toml",
-		".cursor/mcp.json",
 		".cursor/settings.json",
 		"nested/.cursor/private.json",
 	];
@@ -596,6 +592,61 @@ test("MCP files and agent settings are hash-only even when they contain unknown 
 	}
 	expect(bundle.blobs).toHaveLength(4);
 	expect(bundle.manifest.coverage.truncated).toBeUndefined();
+});
+
+test("repository MCP server files are captured in full, secret-filtered", async () => {
+	const secret = `ghp_${"D".repeat(36)}`;
+	const servers = (name: string) =>
+		`${JSON.stringify(
+			{
+				mcpServers: {
+					[name]: {
+						command: "npx",
+						args: ["-y", `@example/${name}-server`],
+						env: { GITHUB_TOKEN: secret, LOG_LEVEL: "info" },
+					},
+					docs: { type: "http", url: "https://mcp.example/docs" },
+				},
+				notes: "Shared MCP servers for this repository. ".repeat(20),
+			},
+			null,
+			2,
+		)}\n`;
+	const files = {
+		".mcp.json": servers("github"),
+		"nested/mcp.json": servers("nested"),
+		"mcp-config.json": servers("config"),
+		".cursor/mcp.json": servers("cursor"),
+	};
+	const directory = await createSmallFixture({
+		...files,
+		"AGENTS.md": "Shared instructions\n",
+	});
+	const bundle = await collectLocalContextBundle(
+		directory,
+		{
+			...getDefaultLocalContextCollectionOptions(),
+			capturePolicy: "session-evidence",
+		},
+		createLocalContextSourceEnv(),
+	);
+	for (const [path, content] of Object.entries(files)) {
+		const entry = fileEntry(bundle, "repository", path);
+		expect(entry.content.status).toBe("available");
+		if (entry.content.status !== "available") continue;
+		const blobId = entry.content.blobId;
+		const blob = bundle.blobs.find((candidate) => candidate.id === blobId);
+		expect(blob?.content).toBe(filterKnownSecrets(content).text);
+		expect(blob?.content).not.toContain(secret);
+		expect(entry.content.secretFilter.redactedBytes).toBeGreaterThan(0);
+	}
+	const mcp = bundle.manifest.contextIndex.facets.find(
+		(facet) => facet.rootId === "repository" && facet.kind === "mcp",
+	);
+	expect(mcp).toMatchObject({ presence: "present", coverage: "complete" });
+	expect(
+		mcp?.resources.every((resource) => resource.access.status === "readable"),
+	).toBe(true);
 });
 
 test("personal instruction files are captured in full from the instruction pool, secret-filtered", async () => {
@@ -1099,7 +1150,7 @@ test("enforces the exact 2 MiB general-content boundary after instructions and s
 	const directory = await createSmallFixture({
 		...files,
 		".claude/agents/reviewer.md": "Agent definition\n",
-		".mcp.json": '{"mcpServers":{}}',
+		".claude/settings.json": '{"permissions":{}}',
 	});
 	const bundle = await collectLocalContextBundle(
 		directory,
@@ -1117,11 +1168,14 @@ test("enforces the exact 2 MiB general-content boundary after instructions and s
 	expect(bundle.blobs.reduce((total, blob) => total + blob.byteLength, 0)).toBe(
 		6 * 1024 * 1024,
 	);
-	for (const path of [".claude/agents/reviewer.md", ".mcp.json"]) {
+	for (const path of [".claude/agents/reviewer.md", ".claude/settings.json"]) {
 		const entry = fileEntry(bundle, "repository", path);
 		expect(entry.content).toMatchObject({
 			status: "omitted",
-			reason: path === ".mcp.json" ? "metadata-only" : "total-content-cap",
+			reason:
+				path === ".claude/settings.json"
+					? "metadata-only"
+					: "total-content-cap",
 		});
 		expect(entry.hash).toMatchObject({
 			status: "available",

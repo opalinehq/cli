@@ -184,19 +184,21 @@ export async function collectSessionRepositoryContext(input: {
 	const locations = await canonicalizeUserContextLocations(
 		getUserContextLocations(),
 	);
+	const mainWorktreeRoot = await resolveMainWorktreeRoot(
+		context.repositoryRoot,
+	);
+	const sessionPath = await resolveCanonicalPath(input.repositoryPath);
+	const projectPaths = [
+		...new Set([context.repositoryRoot, mainWorktreeRoot, sessionPath]),
+	];
 	const userSources = await readUserAgentSources(
 		locations,
 		context.repositoryRoot,
+		projectPaths,
 	);
 	const memoryDirectory = await resolveClaudeProjectMemoryDirectory(
 		locations,
-		[
-			...new Set([
-				await resolveMainWorktreeRoot(context.repositoryRoot),
-				context.repositoryRoot,
-				await resolveCanonicalPath(input.repositoryPath),
-			]),
-		],
+		[...new Set([mainWorktreeRoot, context.repositoryRoot, sessionPath])],
 		userSources.claudeSettings.value,
 	);
 	const additionalRoots = await resolveUserContextRoots({
