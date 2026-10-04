@@ -1011,11 +1011,42 @@ describe("capability-gated R2 upload flow", () => {
 	});
 
 	test.each([
-		{ status: 413, code: "PAYLOAD_TOO_LARGE" },
-		{ status: 400, code: "BAD_REQUEST" },
+		{
+			status: 413,
+			code: "PAYLOAD_TOO_LARGE",
+			message: "too large",
+			data: undefined,
+		},
+		// The shape oRPC gives a failed input validation of R2IngestInitInput.
+		{
+			status: 400,
+			code: "BAD_REQUEST",
+			message: "Input validation failed",
+			data: {
+				issues: [
+					{
+						message: "Number must be less than or equal to 134217728",
+						path: ["objects", 0, "byteLength"],
+					},
+				],
+			},
+		},
+		{
+			status: 400,
+			code: "BAD_REQUEST",
+			message: "Input validation failed",
+			data: {
+				issues: [
+					{
+						message: "Aggregate transcript content exceeds 134217728 bytes",
+						path: [{ key: "objects" }],
+					},
+				],
+			},
+		},
 	])(
-		"keeps a 128-256 MiB session retryable when an older server rejects its size at init ($status)",
-		async ({ status, code }) => {
+		"keeps a 128-256 MiB session retryable when an older server rejects its size at init ($status $message)",
+		async ({ status, code, message, data }) => {
 			await isolateCapabilityCache();
 			const directory = await mkdtemp(join(tmpdir(), "opaline-r2-old-limit-"));
 			temporaryDirectories.push(directory);
@@ -1032,7 +1063,7 @@ describe("capability-gated R2 upload flow", () => {
 				fetch(request) {
 					requestPaths.push(new URL(request.url).pathname);
 					return Response.json(
-						{ json: { code, defined: false, message: "too large", status } },
+						{ json: { code, defined: false, message, status, data } },
 						{ status },
 					);
 				},
@@ -1062,6 +1093,53 @@ describe("capability-gated R2 upload flow", () => {
 		},
 		60_000,
 	);
+
+	test("surfaces the server's message for a 400 at init that is not about size", async () => {
+		await isolateCapabilityCache();
+		const directory = await mkdtemp(join(tmpdir(), "opaline-r2-org-"));
+		temporaryDirectories.push(directory);
+		const transcriptPath = join(directory, "large.jsonl");
+		await writeCodexTranscriptAtLeast(
+			transcriptPath,
+			"clean",
+			INGEST_DIRECT_CONTENT_MAX_BYTES,
+		);
+		const server = serveFetchStub({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch() {
+				return Response.json(
+					{
+						json: {
+							code: "BAD_REQUEST",
+							defined: false,
+							message: "Choose an organization with --org or opaline set-org",
+							status: 400,
+						},
+					},
+					{ status: 400 },
+				);
+			},
+		});
+		activeServers.push(server);
+		const config = createUploadConfig(server);
+		await rememberR2UploadCapability(
+			new URL(config.endpoint),
+			"api-key",
+			TOKEN,
+		);
+
+		const result = await uploadSession(
+			createFileRequest("needs-org", transcriptPath),
+			config,
+		);
+
+		expect(result.success).toBe(false);
+		expect(result.error).toContain(
+			"Choose an organization with --org or opaline set-org",
+		);
+		expect(result.error).not.toContain("does not accept sessions this large");
+	}, 60_000);
 
 	test("keeps an init rejection permanent for a session the old limit allows", async () => {
 		await isolateCapabilityCache();

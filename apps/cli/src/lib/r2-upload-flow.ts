@@ -344,18 +344,34 @@ async function uploadStagedSession(
 
 /**
  * Servers released before the 256 MiB limit reject a larger session at init:
- * the request schema fails (400) or the size check answers 413. The session
- * is valid for an updated server, so the failure stays retryable.
+ * the size check answers 413, or input validation answers 400 with an issue
+ * about object sizes (`objects[n].byteLength` above the limit, or the
+ * "Aggregate transcript content exceeds N bytes" refinement on `objects`).
+ * Only those are size rejections; any other 400 (for example "Choose an
+ * organization with --org or opaline set-org") keeps the server's message.
  */
-function isServerSessionSizeRejection(
+export function isServerSessionSizeRejection(
 	error: unknown,
 	aggregateBytes: number,
 ): boolean {
-	return (
-		aggregateBytes > INGEST_DIRECT_CONTENT_MAX_BYTES &&
-		error instanceof ORPCError &&
-		(error.status === 413 || error.status === 400)
-	);
+	if (aggregateBytes <= INGEST_DIRECT_CONTENT_MAX_BYTES) return false;
+	if (!(error instanceof ORPCError)) return false;
+	if (error.status === 413) return true;
+	if (error.status !== 400) return false;
+	const issues = isRecord(error.data) ? error.data.issues : undefined;
+	if (!Array.isArray(issues)) return false;
+	return issues.some((issue) => {
+		if (!isRecord(issue)) return false;
+		const message = typeof issue.message === "string" ? issue.message : "";
+		const path = Array.isArray(issue.path)
+			? issue.path.map((key) => (isRecord(key) ? String(key.key) : String(key)))
+			: [];
+		return (
+			path.some((key) =>
+				/^(?:byteLength|expected_total_bytes|expectedTotalBytes)$/u.test(key),
+			) || /exceeds \d+ bytes|too (?:large|big)/iu.test(message)
+		);
+	});
 }
 
 function formatServerSessionSizeRejection(aggregateBytes: number): string {
