@@ -607,6 +607,9 @@ function buildAggregateCoverage(
 		if (root.status === "inaccessible") {
 			partialReasons.add(`inaccessible-root:${root.id}`);
 		}
+		if (root.status === "excluded") {
+			partialReasons.add(`excluded-root:${root.id}`);
+		}
 	}
 	return {
 		discoveredEntries: fileSystem.entries.length,

@@ -195,6 +195,7 @@ function getFacetCoverage(
 ): ContextIndexCoverageStatus {
 	if (root.status === "missing") return "complete";
 	if (root.status === "inaccessible") return "denied";
+	if (root.status === "excluded") return "excluded";
 	if (root.status === "limit-reached") return "truncated";
 	if (
 		errors.some(

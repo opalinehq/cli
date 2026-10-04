@@ -872,6 +872,81 @@ describe("user-level context roots", () => {
 		).toBe("# idle\n");
 	});
 
+	test("never reads a root or an included path whose real path leaves $HOME", async () => {
+		const home = await createHome();
+		const outside = await createHome();
+		await mkdir(join(outside, "skills/foreign"), { recursive: true });
+		await writeFile(
+			join(outside, "skills/foreign/SKILL.md"),
+			"OUTSIDE_ROOT_CANARY\n",
+		);
+		await mkdir(join(outside, "work"), { recursive: true });
+		await writeFile(
+			join(outside, "work/CLAUDE.md"),
+			"OUTSIDE_INCLUDE_CANARY\n",
+		);
+		await mkdir(join(home, ".claude"), { recursive: true });
+		await symlink(join(outside, "skills"), join(home, ".claude/skills"));
+		// The repository's parent directory is a link to a directory outside.
+		await symlink(join(outside, "work"), join(home, "work"));
+		const repository = join(home, "code/repo");
+		await mkdir(repository, { recursive: true });
+		await writeFile(join(repository, "AGENTS.md"), "Instructions\n");
+		execFileSync("git", ["init", "-q"], { cwd: repository });
+		const repositoryRoot = await realpath(repository);
+		const locations = { home, codexHome: join(home, ".codex") };
+		const sources = await readUserAgentSources(locations, repositoryRoot);
+		const additionalRoots = [
+			...(await resolveUserContextRoots({
+				locations,
+				repositoryRoot,
+				sources,
+			})),
+			{
+				absolutePath: home,
+				followSymlinksWithin: home,
+				id: "linked-parent",
+				include: [{ path: "work/CLAUDE.md", role: "instruction" as const }],
+				label: "Linked parent",
+				origin: "user" as const,
+				scope: "instructions" as const,
+			},
+		];
+		const bundle = await collectLocalContextBundle(
+			repositoryRoot,
+			{
+				...getDefaultLocalContextCollectionOptions(),
+				additionalRoots,
+				capturePolicy: "session-evidence",
+			},
+			createLocalContextSourceEnv(),
+		);
+		for (const blob of bundle.blobs) {
+			expect(blob.content).not.toContain("OUTSIDE_ROOT_CANARY");
+			expect(blob.content).not.toContain("OUTSIDE_INCLUDE_CANARY");
+		}
+		expect(
+			bundle.manifest.roots.find((root) => root.id === "claude-user-skills"),
+		).toMatchObject({ status: "excluded" });
+		expect(bundle.manifest.coverage.excludedPaths).toEqual(
+			expect.arrayContaining([
+				{ rootId: "claude-user-skills", path: "", reason: "outside-boundary" },
+				{
+					rootId: "linked-parent",
+					path: "work/CLAUDE.md",
+					reason: "outside-boundary",
+				},
+			]),
+		);
+		expect(
+			bundle.manifest.entries.some(
+				(entry) =>
+					entry.rootId === "claude-user-skills" ||
+					entry.path === "work/CLAUDE.md",
+			),
+		).toBe(false);
+	});
+
 	test("CODEX_HOME relocates Codex instructions, skills, plugins and configuration", () => {
 		expect(
 			getUserContextLocations({ CODEX_HOME: "/opt/codex-home" }, "/home/user"),

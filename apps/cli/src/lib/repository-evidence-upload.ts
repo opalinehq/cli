@@ -574,6 +574,9 @@ function getSkillInventoryGap(bundle: LocalContextBundle): string | null {
 	const roots = bundle.manifest.roots.filter(
 		(root) => root.scope === "skills" || root.scope === "repository",
 	);
+	const outside = roots.filter((root) => root.status === "excluded");
+	if (outside.length > 0)
+		return `Skill roots outside the allowed boundary were not read: ${outside.map((root) => root.id).join(", ")}`;
 	const unreadable = roots.filter((root) => root.status === "inaccessible");
 	if (unreadable.length > 0)
 		return `Skill roots could not be read: ${unreadable.map((root) => root.id).join(", ")}`;

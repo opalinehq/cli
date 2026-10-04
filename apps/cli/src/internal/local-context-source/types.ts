@@ -351,7 +351,9 @@ export interface ExcludedPath {
 		| "cache"
 		| "explicit"
 		// A Git-ignored directory the entry budget did not reach.
-		| "ignored";
+		| "ignored"
+		// A root or included path whose real path leaves its allowed boundary.
+		| "outside-boundary";
 }
 
 export interface RootCoverage {
@@ -377,7 +379,16 @@ export interface ContextRootManifest {
 	readonly absolutePath: string;
 	readonly origin: ContextRootOrigin;
 	readonly scope: ContextRootScope;
-	readonly status: "collected" | "missing" | "inaccessible" | "limit-reached";
+	/**
+	 * `excluded`: the root resolves (through a symlink) outside its allowed
+	 * boundary, so nothing in it was read.
+	 */
+	readonly status:
+		| "collected"
+		| "missing"
+		| "inaccessible"
+		| "limit-reached"
+		| "excluded";
 	readonly coverage: RootCoverage;
 	readonly aliases?: readonly ContextRootAlias[];
 }

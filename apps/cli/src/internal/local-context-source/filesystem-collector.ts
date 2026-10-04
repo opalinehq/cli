@@ -539,7 +539,7 @@ async function discoverRoot(
 	errors: CoverageError[],
 ): Promise<{
 	readonly root: RootSpec;
-	readonly status: "missing" | "inaccessible" | null;
+	readonly status: "missing" | "inaccessible" | "excluded" | null;
 	readonly coverage: MutableRootCoverage;
 	readonly walk: RootWalk | null;
 }> {
@@ -557,6 +557,18 @@ async function discoverRoot(
 			coverage,
 			walk: null,
 		};
+	}
+	// A root that resolves outside its boundary (for example ~/.claude/skills
+	// linked outside \$HOME) is not read at all.
+	const boundary = await resolveSymlinkBoundary(rootSpec, fileSystem);
+	if (boundary !== null && !isContainedPath(boundary, canonicalRoot.path)) {
+		excludedPaths.push({
+			rootId: rootSpec.id,
+			path: "",
+			reason: "outside-boundary",
+		});
+		coverage.excludedPaths += 1;
+		return { root: rootSpec, status: "excluded", coverage, walk: null };
 	}
 	const root = { ...rootSpec, absolutePath: canonicalRoot.path };
 	const walk: RootWalk = {
@@ -585,6 +597,7 @@ async function discoverRoot(
 					options,
 					fileSystem,
 					aggregate,
+					excludedPaths,
 					errors,
 				),
 		options,
@@ -615,6 +628,7 @@ async function discoverIncludes(
 	options: LocalContextCollectionOptions,
 	fileSystem: LocalContextFileSystem,
 	aggregate: MutableAggregate,
+	excludedPaths: ExcludedPath[],
 	errors: CoverageError[],
 ): Promise<PendingDirectory[]> {
 	const { root, coverage, discovered } = walk;
@@ -627,6 +641,17 @@ async function discoverIncludes(
 		seen.add(include.path);
 		const absolutePath = resolve(root.absolutePath, include.path);
 		if (!isContainedPath(root.absolutePath, absolutePath)) continue;
+		// The included path's real location (through any symlinked directory
+		// on the way) must stay inside the root's boundary too.
+		if (!(await isWithinSymlinkBoundary(walk, absolutePath, fileSystem))) {
+			excludedPaths.push({
+				rootId: root.id,
+				path: include.path,
+				reason: "outside-boundary",
+			});
+			coverage.excludedPaths += 1;
+			continue;
+		}
 		let stat: FileSystemStat;
 		try {
 			stat = await fileSystem.lstat(absolutePath);
@@ -1530,6 +1555,37 @@ function getDedicatedPoolLimits(
 				filesLimit: "maxToolResultFiles",
 				bytesLimit: "maxToolResultContentBytes",
 			};
+	}
+}
+
+/** The canonical symlink boundary of a root, or null when it has none. */
+async function resolveSymlinkBoundary(
+	root: RootSpec,
+	fileSystem: LocalContextFileSystem,
+): Promise<string | null> {
+	if (root.followSymlinksWithin === undefined) return null;
+	return fileSystem
+		.realpath(root.followSymlinksWithin)
+		.catch(() => root.followSymlinksWithin ?? null);
+}
+
+/**
+ * Whether a path's real location is inside the root's boundary. A path that
+ * does not exist is judged by its nearest existing ancestor.
+ */
+async function isWithinSymlinkBoundary(
+	walk: RootWalk,
+	absolutePath: string,
+	fileSystem: LocalContextFileSystem,
+): Promise<boolean> {
+	const boundary = await resolveSymlinkBoundary(walk.root, fileSystem);
+	if (boundary === null) return true;
+	for (let path = absolutePath; ; path = dirname(path)) {
+		try {
+			return isContainedPath(boundary, await fileSystem.realpath(path));
+		} catch {
+			if (dirname(path) === path) return false;
+		}
 	}
 }
 
