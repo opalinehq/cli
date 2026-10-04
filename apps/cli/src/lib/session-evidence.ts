@@ -88,6 +88,10 @@ const EVIDENCE_CAPTURE_BUDGET_MS = 45_000;
 // Delivery inside the hook. Whatever is not delivered by then stays spooled
 // and is delivered by a detached background process.
 const EVIDENCE_INLINE_DELIVERY_BUDGET_MS = 30_000;
+// Inline delivery also ends this long after the hook received its input, so
+// a slow capture plus delivery stays inside Claude Code's default 60 s hook
+// timeout and the hook itself starts the background deliverer.
+const EVIDENCE_HOOK_SOFT_LIMIT_MS = 50_000;
 export const EVIDENCE_BACKGROUND_DELIVERY_BUDGET_MS = 15 * 60_000;
 const EVIDENCE_BACKGROUND_MAX_ITEMS = 200;
 // Per item in the background: one minute plus 256 KiB/s of evidence bytes.
@@ -119,6 +123,12 @@ export async function captureAndUploadSessionEvidence(input: {
 		readonly startedAt: string;
 	};
 	readonly terminalTranscript: boolean;
+	/**
+	 * Hooks start a detached `opaline hooks evidence-deliver` process for
+	 * captures they could not deliver within their budget. In-process callers
+	 * leave spooled captures to the next hook or `upload --retry`.
+	 */
+	readonly backgroundDelivery?: "spawn" | "none";
 }): Promise<
 	{ readonly contextId: string; readonly receiptId: string } | undefined
 > {
@@ -241,12 +251,25 @@ export async function captureAndUploadSessionEvidence(input: {
 		// killed hook and is delivered by a later hook or the background process.
 		await writePendingRepositoryEvidence(currentPending, configDir);
 		hasPending = true;
-		await supersedePendingRepositoryEvidence(
-			currentPending,
-			configDir,
-			(warning) => input.onWarning?.(warning.message),
+		try {
+			await supersedePendingRepositoryEvidence(
+				currentPending,
+				configDir,
+				(warning) => input.onWarning?.(warning.message),
+			);
+		} catch (error) {
+			// Superseding is housekeeping; the new capture is already spooled.
+			input.onWarning?.(
+				`Could not supersede older pending captures: ${getErrorMessage(error)}`,
+			);
+		}
+		const hookStartedAt = Date.parse(input.hookReceivedAt);
+		const deliveryDeadlineAt = Math.min(
+			Date.now() + EVIDENCE_INLINE_DELIVERY_BUDGET_MS,
+			Number.isFinite(hookStartedAt)
+				? hookStartedAt + EVIDENCE_HOOK_SOFT_LIMIT_MS
+				: Number.POSITIVE_INFINITY,
 		);
-		const deliveryDeadlineAt = Date.now() + EVIDENCE_INLINE_DELIVERY_BUDGET_MS;
 		const outcome = await deliverPendingRepositoryEvidence(
 			currentPending,
 			input.credentials,
@@ -272,12 +295,13 @@ export async function captureAndUploadSessionEvidence(input: {
 				pendingError = error;
 			}
 		}
-		await scheduleBackgroundEvidenceDelivery(
-			user.id,
-			endpoint,
-			configDir,
-			input.onWarning,
-		);
+		if (input.backgroundDelivery === "spawn")
+			await scheduleBackgroundEvidenceDelivery(
+				user.id,
+				endpoint,
+				configDir,
+				input.onWarning,
+			);
 		switch (outcome.status) {
 			case "delivered":
 				if (pendingError !== undefined) throw pendingError;

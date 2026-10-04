@@ -121,6 +121,7 @@ async function runTurnComplete(
 					organizationId,
 					request,
 					terminalTranscript: false,
+					backgroundDelivery: "spawn",
 				})
 					.then((receipt) => {
 						if (!receipt) return;
