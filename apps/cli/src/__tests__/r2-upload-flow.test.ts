@@ -10,7 +10,10 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { IngestSessionInput } from "../contracts/index.js";
+import {
+	INGEST_DIRECT_CONTENT_MAX_BYTES,
+	type IngestSessionInput,
+} from "../contracts/index.js";
 import type { FileBackedUploadRequest } from "../internal/agent-adapters/index.js";
 import {
 	R2_INGEST_PART_SIZE_BYTES,
@@ -794,6 +797,226 @@ describe("capability-gated R2 upload flow", () => {
 		).toBe(false);
 	}, 120_000);
 
+	test("uploads a raw-oversized transcript once slimming brings it under the limit", async () => {
+		await isolateCapabilityCache();
+		const directory = await mkdtemp(join(tmpdir(), "opaline-r2-slim-"));
+		temporaryDirectories.push(directory);
+		const transcriptPath = join(directory, "rollout.jsonl");
+		const screenshot = Buffer.alloc(256 * 1024, 9).toString("base64");
+		const output = "o".repeat(64 * 1024);
+		const lines = [
+			JSON.stringify({
+				timestamp: "2026-08-25T12:00:00.000Z",
+				type: "event_msg",
+				payload: { type: "user_message", message: "take a screenshot" },
+			}),
+		];
+		for (let index = 0; index < 4; index += 1) {
+			lines.push(
+				JSON.stringify({
+					timestamp: "2026-08-25T12:00:01.000Z",
+					type: "response_item",
+					payload: {
+						type: "function_call_output",
+						call_id: `call_${index}`,
+						output: [
+							{
+								type: "input_image",
+								image_url: `data:image/png;base64,${screenshot}`,
+							},
+						],
+					},
+				}),
+				JSON.stringify({
+					timestamp: "2026-08-25T12:00:02.000Z",
+					type: "event_msg",
+					payload: {
+						type: "item_completed",
+						item: {
+							type: "CommandExecution",
+							stdout: output,
+							stderr: "",
+							aggregated_output: output,
+							formatted_output: output,
+						},
+					},
+				}),
+			);
+		}
+		await writeFile(transcriptPath, `${lines.join("\n")}\n`);
+		const rawBytes = (await stat(transcriptPath)).size;
+		const maxAggregateBytes = 512 * 1024;
+		let uploadedBody = "";
+		let initByteLength = 0;
+		let server: FetchStub;
+		server = serveFetchStub({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				const pathname = new URL(request.url).pathname;
+				if (pathname === "/r2/part/1") {
+					uploadedBody = await request.text();
+					return new Response(null, { headers: { etag: '"etag-1"' } });
+				}
+				const input = await readRpcInput(request);
+				if (pathname === "/rpc/ingest/init") {
+					const main = getMainObject(input);
+					initByteLength = getRequiredNumber(main, "byteLength");
+					return rpcResponse({
+						expiresAt: "2026-08-25T12:15:00.000Z",
+						jobId: JOB_ID,
+						objects: [
+							{
+								byteLength: initByteLength,
+								kind: "main",
+								objectKey: `ingest/${JOB_ID}/main.jsonl`,
+								parts: [
+									{
+										byteLength: initByteLength,
+										headers: {
+											"Content-Length": initByteLength.toString(),
+										},
+										partNumber: 1,
+										uploadUrl: `http://127.0.0.1:${server.port}/r2/part/1`,
+									},
+								],
+								sha256: getRequiredString(main, "sha256"),
+								uploadId: "upload-1",
+							},
+						],
+						partSizeBytes: 8 * 1024 * 1024,
+						protocol: "r2_multipart_v1",
+					});
+				}
+				if (pathname === "/rpc/ingest/commit") {
+					return rpcResponse({
+						jobId: JOB_ID,
+						protocol: "r2_multipart_v1",
+						result: createSuccessResult("slimmed-rollout"),
+						status: "completed",
+					});
+				}
+				if (pathname === "/rpc/ingest/status") {
+					return rpcResponse({
+						attempts: 1,
+						availableAt: "2026-08-25T12:00:00.000Z",
+						error: null,
+						jobId: JOB_ID,
+						leaseExpiresAt: null,
+						protocol: "r2_multipart_v1",
+						result: createSuccessResult("slimmed-rollout"),
+						status: "completed",
+						updatedAt: "2026-08-25T12:00:01.000Z",
+					});
+				}
+				return new Response("not found", { status: 404 });
+			},
+		});
+		activeServers.push(server);
+		const config = { ...createUploadConfig(server), maxAggregateBytes };
+		await rememberR2UploadCapability(
+			new URL(config.endpoint),
+			"api-key",
+			TOKEN,
+		);
+
+		const result = await uploadSession(
+			createFileRequest("slimmed-rollout", transcriptPath),
+			config,
+		);
+
+		expect(rawBytes).toBeGreaterThan(maxAggregateBytes);
+		expect(result.success).toBe(true);
+		expect(initByteLength).toBe(Buffer.byteLength(uploadedBody));
+		expect(initByteLength).toBeLessThan(maxAggregateBytes);
+		expect(uploadedBody).not.toContain(screenshot);
+		expect(uploadedBody.split("opaline-image-omitted:v1;")).toHaveLength(5);
+		expect(uploadedBody.split(output)).toHaveLength(5);
+	});
+
+	test.each([
+		{ status: 413, code: "PAYLOAD_TOO_LARGE" },
+		{ status: 400, code: "BAD_REQUEST" },
+	])(
+		"keeps a 128-256 MiB session retryable when an older server rejects its size at init ($status)",
+		async ({ status, code }) => {
+			await isolateCapabilityCache();
+			const directory = await mkdtemp(join(tmpdir(), "opaline-r2-old-limit-"));
+			temporaryDirectories.push(directory);
+			const transcriptPath = join(directory, "large.jsonl");
+			const rawBytes = await writeCodexTranscriptAtLeast(
+				transcriptPath,
+				"clean",
+				INGEST_DIRECT_CONTENT_MAX_BYTES,
+			);
+			const requestPaths: string[] = [];
+			const server = serveFetchStub({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch(request) {
+					requestPaths.push(new URL(request.url).pathname);
+					return Response.json(
+						{ json: { code, defined: false, message: "too large", status } },
+						{ status },
+					);
+				},
+			});
+			activeServers.push(server);
+			const config = createUploadConfig(server);
+			await rememberR2UploadCapability(
+				new URL(config.endpoint),
+				"api-key",
+				TOKEN,
+			);
+
+			const result = await uploadSession(
+				createFileRequest("old-server-limit", transcriptPath),
+				config,
+			);
+
+			expect(rawBytes).toBeGreaterThan(INGEST_DIRECT_CONTENT_MAX_BYTES);
+			expect(result).toMatchObject({ success: false, retryable: true });
+			expect(result.error).toContain("does not accept sessions this large yet");
+			expect(requestPaths).toEqual(["/rpc/ingest/init"]);
+		},
+		60_000,
+	);
+
+	test("keeps an init rejection permanent for a session the old limit allows", async () => {
+		await isolateCapabilityCache();
+		const server = serveFetchStub({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch() {
+				return Response.json(
+					{
+						json: {
+							code: "BAD_REQUEST",
+							defined: false,
+							message: "bad",
+							status: 400,
+						},
+					},
+					{ status: 400 },
+				);
+			},
+		});
+		activeServers.push(server);
+		const config = createUploadConfig(server);
+		await rememberR2UploadCapability(
+			new URL(config.endpoint),
+			"api-key",
+			TOKEN,
+		);
+
+		const result = await uploadSession(
+			createRequest("small-bad-request", '{"type":"user"}\n'),
+			config,
+		);
+
+		expect(result).toMatchObject({ success: false, retryable: false });
+	});
+
 	test("rejects an empty main transcript locally before any R2 request", async () => {
 		await isolateCapabilityCache();
 		let requestCount = 0;
@@ -864,10 +1087,11 @@ describe("capability-gated R2 upload flow", () => {
 		expect(result).toMatchObject({
 			success: false,
 			attempts: 0,
-			retryable: false,
+			retryable: true,
 		});
 		expect(result.error).toContain("Transcript too large for this server");
 		expect(result.error).toContain("32.00 MiB safe limit for legacy uploads");
+		expect(result.error).toContain("opaline upload --retry");
 		expect(requestPaths).toEqual(["/rpc/ingest/init"]);
 		expect(
 			hasAdvertisedR2UploadCapability(

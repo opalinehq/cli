@@ -5,6 +5,7 @@ import type { ContractRouterClient } from "@orpc/contract";
 import {
 	type contract,
 	INGEST_AGGREGATE_CONTENT_MAX_BYTES,
+	INGEST_DIRECT_CONTENT_MAX_BYTES,
 	INGEST_LIMIT_REASONS,
 	type IngestSessionInput,
 	parseSafeApiEndpoint,
@@ -23,7 +24,6 @@ import {
 	filterSessionTextFields,
 	getRedactionBudgetAnomaly,
 	getRedactionCount,
-	MAX_REDACTION_RATIO,
 	mergeRedactionCounts,
 	type RedactionBudgetAnomaly,
 	type RedactionCounts,
@@ -31,6 +31,7 @@ import {
 	SecretFilterJsonIntegrityError,
 	type SessionTextFilterResult,
 } from "../internal/secret-filter/index.js";
+import { MAX_RAW_TRANSCRIPT_BYTES } from "./filtered-upload-staging.js";
 import { hasR2IngestUpgradeHint } from "./r2-ingest-contract.js";
 import type { R2MultipartProgress } from "./r2-multipart-upload.js";
 import {
@@ -45,6 +46,7 @@ import {
 	R2IngestPendingError,
 	uploadSessionViaR2,
 } from "./r2-upload-flow.js";
+import { slimTranscriptText } from "./transcript-slim.js";
 import type { UploadResult, UploadTransferProgress } from "./types.js";
 import { describeUploadEndpointRejection } from "./upload-endpoint.js";
 
@@ -54,6 +56,8 @@ export interface UploadConfig {
 	allowInsecureEndpoint: boolean;
 	authType?: "bearer" | "api-key";
 	maxAggregateBytes?: number;
+	/** Raw source size above which a session is skipped unread. */
+	maxRawSourceBytes?: number;
 	onRetry?: (attempt: number, maxAttempts: number, error: string) => void;
 	onProgress?: (progress: R2MultipartProgress) => void;
 	onTransferProgress?: (progress: UploadTransferProgress) => void;
@@ -95,6 +99,11 @@ type LegacyUploadPreparation =
 			readonly actualBytes: number;
 			readonly maxBytes: number;
 			readonly status: "legacy-too-large";
+	  }
+	| {
+			readonly actualBytes: number;
+			readonly maxBytes: number;
+			readonly status: "direct-too-large";
 	  }
 	| {
 			readonly actualBytes: number;
@@ -366,15 +375,15 @@ export async function uploadSession(
 	}
 
 	// Stat file-backed transcripts before reading, filtering or staging them.
+	// The per-session limit applies to the slimmed, filtered upload; only a
+	// raw source beyond any plausible slimmed fit is skipped unread.
 	const sourceBytes = isFileBackedUploadRequest(request)
 		? await getFileBackedAggregateBytes(request)
 		: getUploadAggregateBytes(request);
-	const sizeFailure =
-		sourceBytes > LEGACY_MATERIALIZATION_MAX_BYTES &&
-		(isFileBackedUploadRequest(request) ||
-			sourceBytes * (1 - MAX_REDACTION_RATIO) > maxAggregateBytes)
-			? getUploadSizeFailure(sourceBytes, maxAggregateBytes)
-			: undefined;
+	const sizeFailure = getRawTranscriptSizeFailure(
+		sourceBytes,
+		config.maxRawSourceBytes,
+	);
 	if (sizeFailure) return sizeFailure;
 	config.signal?.throwIfAborted();
 
@@ -389,11 +398,12 @@ export async function uploadSession(
 	const client: ContractRouterClient<typeof contract> = createORPCClient(link);
 	const authType = config.authType ?? "bearer";
 	const endpointUrl = new URL(endpoint.url);
+	// Sources the direct request cannot carry probe R2 even without a cached
+	// capability; an unsupported server falls back to the bounded direct path.
 	const shouldProbeR2 =
 		authType === "api-key" &&
 		(hasAdvertisedR2UploadCapability(endpointUrl, authType, config.token) ||
-			(isFileBackedUploadRequest(request) &&
-				sourceBytes > LEGACY_MATERIALIZATION_MAX_BYTES));
+			sourceBytes > LEGACY_MATERIALIZATION_MAX_BYTES);
 	if (authType === "api-key" && shouldProbeR2) {
 		try {
 			const r2Result = await uploadSessionViaR2(request, {
@@ -495,7 +505,12 @@ export async function uploadSession(
 	if (legacy.status === "empty-main") {
 		return getEmptyMainUploadFailure();
 	}
-	if (legacy.status === "legacy-too-large") {
+	if (
+		legacy.status === "legacy-too-large" ||
+		legacy.status === "direct-too-large"
+	) {
+		// Direct R2 upload (API-key login on a server that supports it) can
+		// carry this session, so a later retry can still succeed.
 		return {
 			totalBytes: legacy.actualBytes,
 			maxBytes: legacy.maxBytes,
@@ -503,9 +518,10 @@ export async function uploadSession(
 			error: formatLegacyServerTooLargeError(
 				legacy.actualBytes,
 				legacy.maxBytes,
+				authType,
 			),
 			attempts: 0,
-			retryable: false,
+			retryable: true,
 		};
 	}
 	if (legacy.status === "too-large") {
@@ -673,7 +689,9 @@ async function prepareLegacyUpload(
 			};
 		}
 	}
-	const materialized = await materializeLegacyUploadRequest(request);
+	const materialized = slimUploadRequest(
+		await materializeLegacyUploadRequest(request),
+	);
 	const inputBytes = getUploadAggregateBytes(materialized);
 	const filteredText = filterSessionTextFields({
 		content: materialized.content,
@@ -708,6 +726,13 @@ async function prepareLegacyUpload(
 			status: "too-large",
 		};
 	}
+	if (aggregateBytes > INGEST_DIRECT_CONTENT_MAX_BYTES) {
+		return {
+			actualBytes: aggregateBytes,
+			maxBytes: INGEST_DIRECT_CONTENT_MAX_BYTES,
+			status: "direct-too-large",
+		};
+	}
 	return { filteredRequest, filteredText, status: "ready" };
 }
 
@@ -721,16 +746,16 @@ async function getFileBackedAggregateBytes(
 	return files.reduce((total, file) => total + file.size, 0);
 }
 
-export function getUploadSizeFailure(
+export function getRawTranscriptSizeFailure(
 	totalBytes: number,
-	maxBytes = INGEST_AGGREGATE_CONTENT_MAX_BYTES,
+	maxBytes = MAX_RAW_TRANSCRIPT_BYTES,
 ): UploadResult | undefined {
 	if (totalBytes <= maxBytes) return undefined;
 	return {
 		success: false,
 		totalBytes,
 		maxBytes,
-		error: `Skipped: session files total ${formatMebibytes(totalBytes)} MiB, above the ${formatMebibytes(maxBytes)} MiB per-session limit. No upload attempted.`,
+		error: `Skipped: session files total ${formatMebibytes(totalBytes)} MiB, above the ${formatMebibytes(maxBytes)} MiB raw transcript limit. No upload attempted.`,
 		attempts: 0,
 		retryable: false,
 	};
@@ -752,6 +777,17 @@ async function materializeLegacyUploadRequest(
 		...request.metadata,
 		content,
 		subagents: subagents.length > 0 ? subagents : undefined,
+	};
+}
+
+function slimUploadRequest(request: IngestSessionInput): IngestSessionInput {
+	return {
+		...request,
+		content: slimTranscriptText(request.content),
+		subagents: request.subagents?.map((subagent) => ({
+			...subagent,
+			content: slimTranscriptText(subagent.content),
+		})),
 	};
 }
 
@@ -927,8 +963,13 @@ function formatTranscriptTooLargeError(
 function formatLegacyServerTooLargeError(
 	actualBytes: number,
 	maxBytes: number,
+	authType: "api-key" | "bearer",
 ): string {
-	return `Transcript too large for this server: the ${formatMebibytes(actualBytes)} MiB transcript/subagent payload exceeds the CLI's ${formatMebibytes(maxBytes)} MiB safe limit for legacy uploads. Upgrade the Opaline server to one that supports direct R2 uploads, or upload a smaller transcript.`;
+	const remedy =
+		authType === "api-key"
+			? "Upgrade the Opaline server to one that supports direct R2 uploads"
+			: "Run `opaline login` to upload with an API key over direct R2 uploads";
+	return `Transcript too large for this server: the ${formatMebibytes(actualBytes)} MiB transcript/subagent payload exceeds the CLI's ${formatMebibytes(maxBytes)} MiB safe limit for legacy uploads. ${remedy}, then retry with: opaline upload --retry`;
 }
 
 function formatMebibytes(bytes: number): string {

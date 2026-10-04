@@ -1,5 +1,8 @@
 import { ORPCError } from "@orpc/client";
-import type { IngestSessionInput } from "../contracts/index.js";
+import {
+	INGEST_DIRECT_CONTENT_MAX_BYTES,
+	type IngestSessionInput,
+} from "../contracts/index.js";
 import type { FileBackedUploadRequest } from "../internal/agent-adapters/index.js";
 import {
 	getRedactionBudgetAnomaly,
@@ -140,7 +143,7 @@ export async function uploadSessionViaR2(
 	config: R2UploadFlowConfig,
 ): Promise<R2UploadFlowResult> {
 	const staged = await stageFilteredUpload(
-		createFilteredUploadSources(request),
+		createFilteredUploadSources(request, { slim: true }),
 	);
 	try {
 		const preflight = getPreflightFailure(staged, config.maxAggregateBytes);
@@ -171,7 +174,7 @@ function getPreflightFailure(
 	if (!main || main.byteLength === 0) return { status: "empty-main" };
 	const anomaly = getRedactionBudgetAnomaly(
 		staged.redactedBytes,
-		staged.inputBytes,
+		staged.filterInputBytes,
 		staged.redactions,
 	);
 	if (anomaly) return { anomaly, status: "redaction-budget" };
@@ -204,6 +207,12 @@ async function uploadStagedSession(
 			config.onRetry,
 		);
 	} catch (error) {
+		if (isServerSessionSizeRejection(error, staged.aggregateBytes)) {
+			throw new R2IngestFlowError(
+				formatServerSessionSizeRejection(staged.aggregateBytes),
+				true,
+			);
+		}
 		throw new R2IngestInitError(error, isRetryableRpcError(error));
 	}
 	if (!isR2IngestInitOutput(initCall.value)) {
@@ -295,6 +304,28 @@ async function uploadStagedSession(
 		result: serverResult,
 		status: "success",
 	};
+}
+
+/**
+ * Servers released before the 256 MiB limit reject a larger session at init:
+ * the request schema fails (400) or the size check answers 413. The session
+ * is valid for an updated server, so the failure stays retryable.
+ */
+function isServerSessionSizeRejection(
+	error: unknown,
+	aggregateBytes: number,
+): boolean {
+	return (
+		aggregateBytes > INGEST_DIRECT_CONTENT_MAX_BYTES &&
+		error instanceof ORPCError &&
+		(error.status === 413 || error.status === 400)
+	);
+}
+
+function formatServerSessionSizeRejection(aggregateBytes: number): string {
+	const size = (aggregateBytes / (1024 * 1024)).toFixed(2);
+	const limit = INGEST_DIRECT_CONTENT_MAX_BYTES / (1024 * 1024);
+	return `The Opaline server does not accept sessions this large yet: this session is ${size} MiB after slimming, and the server still accepts up to ${limit} MiB. It stays queued; retry with \`opaline upload --retry\` after the server is updated.`;
 }
 
 async function pollJobStatus(

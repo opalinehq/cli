@@ -15,6 +15,7 @@ import {
 	INGEST_MAX_SUBAGENT_COUNT,
 } from "../contracts/ingest.js";
 import { discoverClaudeSubagentFiles } from "../internal/agent-adapters/index.js";
+import { MAX_RAW_TRANSCRIPT_BYTES } from "../lib/filtered-upload-staging.js";
 
 const fixtureRoots: string[] = [];
 
@@ -138,6 +139,26 @@ describe("Claude subagent discovery", () => {
 		expect(result.discovery.reason).toContain("count limit");
 	}, 20_000);
 
+	test("keeps a child file between the old 128 MiB and the 256 MiB session limit", async () => {
+		const root = await createFixtureRoot();
+		const sessionId = "session-native";
+		const childDir = join(root, sessionId, "subagents");
+		const childPath = join(childDir, "agent-large.jsonl");
+		await mkdir(childDir, { recursive: true });
+		await writeFile(
+			childPath,
+			`${JSON.stringify({ agentId: "large", sessionId })}\n`,
+		);
+		await truncate(childPath, INGEST_AGGREGATE_CONTENT_MAX_BYTES);
+
+		const result = await discoverClaudeSubagentFiles(root, sessionId);
+
+		expect(result.discovery).toMatchObject({ omittedCount: 0 });
+		expect(result.files).toEqual([
+			{ agentId: "large", path: await realpath(childPath) },
+		]);
+	}, 30_000);
+
 	test("rejects a child file before reading beyond the total byte bound", async () => {
 		const root = await createFixtureRoot();
 		const sessionId = "session-native";
@@ -145,7 +166,7 @@ describe("Claude subagent discovery", () => {
 		const childPath = join(childDir, "agent-oversized.jsonl");
 		await mkdir(childDir, { recursive: true });
 		await writeFile(childPath, "");
-		await truncate(childPath, INGEST_AGGREGATE_CONTENT_MAX_BYTES + 1);
+		await truncate(childPath, MAX_RAW_TRANSCRIPT_BYTES + 1);
 
 		const result = await discoverClaudeSubagentFiles(root, sessionId);
 

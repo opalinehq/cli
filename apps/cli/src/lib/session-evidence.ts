@@ -2,8 +2,8 @@ import { spawn } from "node:child_process";
 import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
-	INGEST_AGGREGATE_CONTENT_MAX_BYTES,
 	type IngestSessionInput,
+	REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES,
 	type RepositoryEvidenceCommitOutput,
 } from "../contracts/index.js";
 import type {
@@ -98,8 +98,10 @@ const EVIDENCE_BACKGROUND_MAX_ITEMS = 200;
 // Per item in the background: one minute plus 256 KiB/s of evidence bytes.
 const EVIDENCE_BACKGROUND_ITEM_BASE_MS = 60_000;
 const EVIDENCE_BACKGROUND_ITEM_BYTES_PER_SECOND = 256 * 1024;
+// Evidence keeps the transcript's exact (unslimmed) bytes, so it is bounded by
+// the repository-evidence aggregate, not the 256 MiB slimmed ingest limit.
 export const EVIDENCE_TRANSCRIPT_INPUT_MAX_BYTES =
-	INGEST_AGGREGATE_CONTENT_MAX_BYTES;
+	REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES;
 
 export class EvidenceBudgetError extends Error {
 	constructor(readonly phase: "capture" | "delivery") {
@@ -870,7 +872,7 @@ async function materializeEvidenceRequest(
 	if ((request.subagents?.length ?? 0) >= 256)
 		throw new Error("Transcript capture exceeded its source-count budget.");
 	const staged = await stageFilteredUpload(
-		createFilteredUploadSources(request),
+		createFilteredUploadSources(request, { slim: false }),
 		{
 			deadlineAt,
 			maxInputBytes: EVIDENCE_TRANSCRIPT_INPUT_MAX_BYTES,

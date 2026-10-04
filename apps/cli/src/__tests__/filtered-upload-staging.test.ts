@@ -7,10 +7,16 @@ import { join } from "node:path";
 import { FILTER_VERSION } from "../internal/secret-filter/index.js";
 import {
 	cleanupStagedUpload,
+	createFilteredUploadSources,
 	stageFilteredUpload,
 } from "../lib/filtered-upload-staging.js";
 
 const temporaryDirectories: string[] = [];
+const SCREENSHOT = Buffer.from(
+	Array.from({ length: 6_000 }, (_, index) => (index * 31 + 7) % 256),
+);
+const SCREENSHOT_BASE64 = SCREENSHOT.toString("base64");
+const SCREENSHOT_MARKER = `opaline-image-omitted:v1;sha256=${createHash("sha256").update(SCREENSHOT).digest("hex")};bytes=6000;type=image/png`;
 
 afterEach(async () => {
 	await Promise.all(
@@ -35,6 +41,7 @@ describe("filtered upload staging", () => {
 						sessionId: "slow",
 						source: "claude_code",
 					},
+					slim: false,
 					subagents: [],
 				},
 				{ deadlineAt: Date.now() + 30, maxInputBytes: 2 * 1024 * 1024 },
@@ -51,6 +58,7 @@ describe("filtered upload staging", () => {
 					sessionId: "empty-child",
 					source: "claude_code",
 				},
+				slim: false,
 				subagents: [
 					{ agentId: "empty", source: { kind: "text", content: "" } },
 				],
@@ -82,6 +90,7 @@ describe("filtered upload staging", () => {
 						source: "claude_code",
 						projectPath: "/test",
 					},
+					slim: false,
 					subagents: [
 						{ agentId: "child", source: { kind: "file", path: sourcePath } },
 					],
@@ -101,6 +110,7 @@ describe("filtered upload staging", () => {
 						source: "claude_code",
 						projectPath: "/test",
 					},
+					slim: false,
 					subagents: [],
 				},
 				{ maxInputBytes: 100, deadlineAt: Date.now() - 1 },
@@ -129,6 +139,7 @@ describe("filtered upload staging", () => {
 				sessionId: "filtered-file",
 				source: "claude_code",
 			},
+			slim: false,
 			subagents: [],
 		});
 		temporaryDirectories.push(staged.directory);
@@ -175,6 +186,7 @@ describe("filtered upload staging", () => {
 				sessionId: "chunk-boundary",
 				source: "codex",
 			},
+			slim: false,
 			subagents: [],
 		});
 		temporaryDirectories.push(staged.directory);
@@ -194,6 +206,7 @@ describe("filtered upload staging", () => {
 				sessionId: "sorted-manifest",
 				source: "claude_code",
 			},
+			slim: false,
 			subagents: [
 				{ agentId: "agent-z", source: { content: "z", kind: "text" } },
 				{ agentId: "agent-a", source: { content: "a", kind: "text" } },
@@ -223,6 +236,7 @@ describe("filtered upload staging", () => {
 				sessionId: "empty-subagent",
 				source: "claude_code",
 			},
+			slim: false,
 			subagents: [
 				{
 					agentId: "agent-empty-file",
@@ -246,5 +260,138 @@ describe("filtered upload staging", () => {
 			),
 		).toEqual(["main", "agent-kept"]);
 		expect(staged.aggregateBytes).toBe(Buffer.byteLength("mainkept"));
+	});
+
+	test("slims main and subagent streams before secret filtering", async () => {
+		const sourceDirectory = await mkdtemp(join(tmpdir(), "opaline-slim-"));
+		temporaryDirectories.push(sourceDirectory);
+		const mainPath = join(sourceDirectory, "main.jsonl");
+		const childPath = join(sourceDirectory, "child.jsonl");
+		const canary = `AKIA${"A".repeat(16)}`;
+		const output = `deploy with ${canary}\n${"line\n".repeat(400)}`;
+		await writeFile(
+			mainPath,
+			`${[
+				JSON.stringify({
+					type: "event_msg",
+					payload: {
+						type: "item_completed",
+						item: {
+							type: "CommandExecution",
+							stdout: output,
+							stderr: "",
+							aggregated_output: output,
+							exit_code: 0,
+							formatted_output: output,
+						},
+					},
+				}),
+				JSON.stringify({
+					type: "response_item",
+					payload: {
+						type: "function_call_output",
+						output: [
+							{
+								type: "input_image",
+								image_url: `data:image/png;base64,${SCREENSHOT_BASE64}`,
+							},
+						],
+					},
+				}),
+			].join("\n")}\n`,
+		);
+		await writeFile(
+			childPath,
+			`${JSON.stringify({
+				type: "user",
+				message: {
+					content: [
+						{
+							type: "image",
+							source: {
+								type: "base64",
+								media_type: "image/jpeg",
+								data: SCREENSHOT_BASE64,
+							},
+						},
+					],
+				},
+			})}\n`,
+		);
+
+		const staged = await stageFilteredUpload(
+			createFilteredUploadSources(
+				{
+					kind: "file",
+					metadata: {
+						projectPath: "/test",
+						sessionId: "slimmed",
+						source: "codex",
+					},
+					subagents: [{ agentId: "child", path: childPath }],
+					transcriptPath: mainPath,
+				},
+				{ slim: true },
+			),
+		);
+		temporaryDirectories.push(staged.directory);
+		const [main, child] = staged.objects;
+		assert(main && child);
+		const mainText = await readFile(main.path, "utf8");
+		const childText = await readFile(child.path, "utf8");
+		const command = JSON.parse(mainText.split("\n")[0] ?? "").payload.item;
+
+		expect(command).toEqual({
+			type: "CommandExecution",
+			stderr: "",
+			aggregated_output: output.replace(canary, "[REDACTED:aws-access-key-id]"),
+			exit_code: 0,
+		});
+		expect(mainText).not.toContain(SCREENSHOT_BASE64);
+		expect(mainText).toContain(SCREENSHOT_MARKER);
+		expect(childText).not.toContain(SCREENSHOT_BASE64);
+		expect(JSON.parse(childText).message.content[0].source).toEqual({
+			type: "base64",
+			media_type: "image/jpeg",
+			data: SCREENSHOT_MARKER.replace("image/png", "image/jpeg"),
+		});
+		expect(staged.redactions).toEqual({ "aws-access-key-id": 1 });
+		expect(staged.filterInputBytes).toBeLessThan(staged.inputBytes / 2);
+		expect(staged.aggregateBytes).toBe(
+			Buffer.byteLength(mainText) + Buffer.byteLength(childText),
+		);
+		expect(main.sha256).toBe(
+			createHash("sha256").update(mainText).digest("hex"),
+		);
+		for (const line of `${mainText}${childText}`.split("\n")) {
+			if (line !== "") expect(() => JSON.parse(line)).not.toThrow();
+		}
+	});
+
+	test("keeps exact bytes when slimming is off for repository evidence", async () => {
+		const content = `${JSON.stringify({
+			type: "response_item",
+			payload: {
+				type: "message",
+				content: [
+					{
+						type: "input_image",
+						image_url: `data:image/png;base64,${SCREENSHOT_BASE64}`,
+					},
+				],
+			},
+		})}\n`;
+		const staged = await stageFilteredUpload(
+			createFilteredUploadSources(
+				{ content, projectPath: "/test", sessionId: "exact", source: "codex" },
+				{ slim: false },
+			),
+		);
+		temporaryDirectories.push(staged.directory);
+		const main = staged.objects[0];
+		assert(main);
+
+		expect(await readFile(main.path, "utf8")).toBe(content);
+		expect(staged.filterInputBytes).toBe(staged.inputBytes);
 	});
 });
