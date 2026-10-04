@@ -21,7 +21,7 @@ import {
 	type SessionUploadDetail,
 } from "./upload-progress.js";
 import {
-	getUploadSizeFailure,
+	getRawTranscriptSizeFailure,
 	type UploadConfig,
 	uploadSession,
 } from "./uploader.js";
@@ -213,10 +213,10 @@ export async function uploadRepositorySessions(
 					gitSha: item.gitSha ?? info.sha,
 					packageName: info.packageName,
 				};
-				// A large main file needs no transcript scan or subagent discovery.
-				let result = getUploadSizeFailure(
+				// A huge main file needs no transcript scan or subagent discovery.
+				let result = getRawTranscriptSizeFailure(
 					(await stat(item.transcriptPath)).size,
-					config.maxAggregateBytes,
+					config.maxRawSourceBytes,
 				);
 				if (!result) {
 					const request = await getAdapter(item.source).buildUploadRequest(

@@ -10,11 +10,9 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-	INGEST_AGGREGATE_CONTENT_MAX_BYTES,
-	INGEST_MAX_SUBAGENT_COUNT,
-} from "../contracts/ingest.js";
+import { INGEST_MAX_SUBAGENT_COUNT } from "../contracts/ingest.js";
 import { discoverClaudeSubagentFiles } from "../internal/agent-adapters/index.js";
+import { MAX_RAW_TRANSCRIPT_BYTES } from "../lib/filtered-upload-staging.js";
 
 const fixtureRoots: string[] = [];
 
@@ -145,7 +143,7 @@ describe("Claude subagent discovery", () => {
 		const childPath = join(childDir, "agent-oversized.jsonl");
 		await mkdir(childDir, { recursive: true });
 		await writeFile(childPath, "");
-		await truncate(childPath, INGEST_AGGREGATE_CONTENT_MAX_BYTES + 1);
+		await truncate(childPath, MAX_RAW_TRANSCRIPT_BYTES + 1);
 
 		const result = await discoverClaudeSubagentFiles(root, sessionId);
 

@@ -592,7 +592,7 @@ async function materializeEvidenceRequest(
 	if ((request.subagents?.length ?? 0) >= 256)
 		throw new Error("Transcript capture exceeded its source-count budget.");
 	const staged = await stageFilteredUpload(
-		createFilteredUploadSources(request),
+		createFilteredUploadSources(request, { slim: false }),
 		{
 			deadlineAt,
 			maxInputBytes: EVIDENCE_TRANSCRIPT_INPUT_MAX_BYTES,

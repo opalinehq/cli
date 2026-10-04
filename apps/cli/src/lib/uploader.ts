@@ -23,7 +23,6 @@ import {
 	filterSessionTextFields,
 	getRedactionBudgetAnomaly,
 	getRedactionCount,
-	MAX_REDACTION_RATIO,
 	mergeRedactionCounts,
 	type RedactionBudgetAnomaly,
 	type RedactionCounts,
@@ -31,6 +30,7 @@ import {
 	SecretFilterJsonIntegrityError,
 	type SessionTextFilterResult,
 } from "../internal/secret-filter/index.js";
+import { MAX_RAW_TRANSCRIPT_BYTES } from "./filtered-upload-staging.js";
 import { hasR2IngestUpgradeHint } from "./r2-ingest-contract.js";
 import type { R2MultipartProgress } from "./r2-multipart-upload.js";
 import {
@@ -43,6 +43,7 @@ import {
 	isR2InitUnsupported,
 	uploadSessionViaR2,
 } from "./r2-upload-flow.js";
+import { slimTranscriptText } from "./transcript-slim.js";
 import type { UploadResult, UploadTransferProgress } from "./types.js";
 import { describeUploadEndpointRejection } from "./upload-endpoint.js";
 
@@ -52,6 +53,8 @@ export interface UploadConfig {
 	allowInsecureEndpoint: boolean;
 	authType?: "bearer" | "api-key";
 	maxAggregateBytes?: number;
+	/** Raw source size above which a session is skipped unread. */
+	maxRawSourceBytes?: number;
 	onRetry?: (attempt: number, maxAttempts: number, error: string) => void;
 	onProgress?: (progress: R2MultipartProgress) => void;
 	onTransferProgress?: (progress: UploadTransferProgress) => void;
@@ -362,15 +365,15 @@ export async function uploadSession(
 	}
 
 	// Stat file-backed transcripts before reading, filtering or staging them.
+	// The per-session limit applies to the slimmed, filtered upload; only a
+	// raw source beyond any plausible slimmed fit is skipped unread.
 	const sourceBytes = isFileBackedUploadRequest(request)
 		? await getFileBackedAggregateBytes(request)
 		: getUploadAggregateBytes(request);
-	const sizeFailure =
-		sourceBytes > LEGACY_MATERIALIZATION_MAX_BYTES &&
-		(isFileBackedUploadRequest(request) ||
-			sourceBytes * (1 - MAX_REDACTION_RATIO) > maxAggregateBytes)
-			? getUploadSizeFailure(sourceBytes, maxAggregateBytes)
-			: undefined;
+	const sizeFailure = getRawTranscriptSizeFailure(
+		sourceBytes,
+		config.maxRawSourceBytes,
+	);
 	if (sizeFailure) return sizeFailure;
 	config.signal?.throwIfAborted();
 
@@ -631,7 +634,9 @@ async function prepareLegacyUpload(
 			};
 		}
 	}
-	const materialized = await materializeLegacyUploadRequest(request);
+	const materialized = slimUploadRequest(
+		await materializeLegacyUploadRequest(request),
+	);
 	const inputBytes = getUploadAggregateBytes(materialized);
 	const filteredText = filterSessionTextFields({
 		content: materialized.content,
@@ -679,16 +684,16 @@ async function getFileBackedAggregateBytes(
 	return files.reduce((total, file) => total + file.size, 0);
 }
 
-export function getUploadSizeFailure(
+export function getRawTranscriptSizeFailure(
 	totalBytes: number,
-	maxBytes = INGEST_AGGREGATE_CONTENT_MAX_BYTES,
+	maxBytes = MAX_RAW_TRANSCRIPT_BYTES,
 ): UploadResult | undefined {
 	if (totalBytes <= maxBytes) return undefined;
 	return {
 		success: false,
 		totalBytes,
 		maxBytes,
-		error: `Skipped: session files total ${formatMebibytes(totalBytes)} MiB, above the ${formatMebibytes(maxBytes)} MiB per-session limit. No upload attempted.`,
+		error: `Skipped: session files total ${formatMebibytes(totalBytes)} MiB, above the ${formatMebibytes(maxBytes)} MiB raw transcript limit. No upload attempted.`,
 		attempts: 0,
 		retryable: false,
 	};
@@ -710,6 +715,17 @@ async function materializeLegacyUploadRequest(
 		...request.metadata,
 		content,
 		subagents: subagents.length > 0 ? subagents : undefined,
+	};
+}
+
+function slimUploadRequest(request: IngestSessionInput): IngestSessionInput {
+	return {
+		...request,
+		content: slimTranscriptText(request.content),
+		subagents: request.subagents?.map((subagent) => ({
+			...subagent,
+			content: slimTranscriptText(subagent.content),
+		})),
 	};
 }
 

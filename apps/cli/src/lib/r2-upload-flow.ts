@@ -106,7 +106,7 @@ export async function uploadSessionViaR2(
 	config: R2UploadFlowConfig,
 ): Promise<R2UploadFlowResult> {
 	const staged = await stageFilteredUpload(
-		createFilteredUploadSources(request),
+		createFilteredUploadSources(request, { slim: true }),
 	);
 	try {
 		const preflight = getPreflightFailure(staged, config.maxAggregateBytes);
@@ -137,7 +137,7 @@ function getPreflightFailure(
 	if (!main || main.byteLength === 0) return { status: "empty-main" };
 	const anomaly = getRedactionBudgetAnomaly(
 		staged.redactedBytes,
-		staged.inputBytes,
+		staged.filterInputBytes,
 		staged.redactions,
 	);
 	if (anomaly) return { anomaly, status: "redaction-budget" };
