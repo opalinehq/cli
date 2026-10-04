@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { readFileSync, rmSync } from "node:fs";
 import {
 	chmod,
 	link,
@@ -1720,7 +1721,51 @@ async function writeMutablePrivateFile(
 	}
 }
 
-async function acquireSpoolWriteLock(
+/** Spool write locks this process holds: released if it is told to stop. */
+const heldWriteLocks = new Map<string, string>();
+const RELEASE_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"] as const;
+let releaseHandlersInstalled = false;
+
+function releaseHeldWriteLocksSync(): void {
+	for (const [lockPath, ownerToken] of heldWriteLocks) {
+		try {
+			if (readFileSync(join(lockPath, "owner"), "utf8") === ownerToken)
+				rmSync(lockPath, { recursive: true, force: true });
+		} catch {
+			// Already gone, or no longer ours.
+		}
+	}
+	heldWriteLocks.clear();
+}
+
+function onReleaseSignal(signal: NodeJS.Signals): void {
+	releaseHeldWriteLocksSync();
+	uninstallReleaseHandlers();
+	// Without another listener the signal's default action (exit) was
+	// replaced by ours: restore it so the process still ends.
+	if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
+}
+
+/**
+ * While a spool lock is held, a host that stops the hook (SIGTERM, SIGINT,
+ * SIGHUP, e.g. `claude -p` exiting about a second after start) or a normal
+ * exit releases it, instead of leaving other hooks to wait it out.
+ */
+function installReleaseHandlers(): void {
+	if (releaseHandlersInstalled) return;
+	releaseHandlersInstalled = true;
+	process.on("exit", releaseHeldWriteLocksSync);
+	for (const signal of RELEASE_SIGNALS) process.on(signal, onReleaseSignal);
+}
+
+function uninstallReleaseHandlers(): void {
+	if (!releaseHandlersInstalled) return;
+	releaseHandlersInstalled = false;
+	process.off("exit", releaseHeldWriteLocksSync);
+	for (const signal of RELEASE_SIGNALS) process.off(signal, onReleaseSignal);
+}
+
+export async function acquireSpoolWriteLock(
 	spoolRoot: string,
 	env: RepositorySpoolEnv,
 ): Promise<() => Promise<void>> {
@@ -1744,6 +1789,8 @@ async function acquireSpoolWriteLock(
 			}
 			await enforcePrivateFile(ownerPath);
 			await syncDirectory(spoolRoot);
+			heldWriteLocks.set(lockPath, ownerToken);
+			installReleaseHandlers();
 			const heartbeat = setInterval(
 				() => {
 					void renewOwnedWriteLock(lockPath, ownerPath, ownerToken).catch(
@@ -1754,6 +1801,8 @@ async function acquireSpoolWriteLock(
 			);
 			return async () => {
 				clearInterval(heartbeat);
+				heldWriteLocks.delete(lockPath);
+				if (heldWriteLocks.size === 0) uninstallReleaseHandlers();
 				const currentOwner = await readFileIfPresent(ownerPath);
 				if (currentOwner?.toString("utf8") === ownerToken) {
 					await rm(lockPath, { recursive: true, force: true });
@@ -1790,7 +1839,10 @@ async function recoverStaleWriteLock(
 		if (isErrorCode(error, "ENOENT")) return true;
 		throw error;
 	}
-	if (ageMs < env.writeLockStaleMs || (await isWriteLockOwnerAlive(lockPath))) {
+	// A holder whose process is gone (killed by its host, crashed) is stale
+	// at once; otherwise only once it stopped renewing the lock.
+	const owner = await getWriteLockOwnerState(lockPath);
+	if (owner !== "dead" && (ageMs < env.writeLockStaleMs || owner === "alive")) {
 		return false;
 	}
 	const stalePath = `${lockPath}.stale.${env.createNonce()}`;
@@ -1819,16 +1871,23 @@ async function renewOwnedWriteLock(
 	}
 }
 
-async function isWriteLockOwnerAlive(lockPath: string): Promise<boolean> {
+/**
+ * `dead` only when the owner file names a process that no longer exists;
+ * `unknown` when there is no readable owner yet (a lock being created).
+ */
+async function getWriteLockOwnerState(
+	lockPath: string,
+): Promise<"alive" | "dead" | "unknown"> {
 	const owner = await readFileIfPresent(join(lockPath, "owner"));
 	const processIdText = owner?.toString("utf8").split(":", 1)[0];
-	if (!processIdText || !/^\d+$/u.test(processIdText)) return false;
+	if (!processIdText || !/^\d+$/u.test(processIdText)) return "unknown";
 	const processId = Number(processIdText);
+	if (processId === process.pid) return "alive";
 	try {
 		process.kill(processId, 0);
-		return true;
+		return "alive";
 	} catch (error) {
-		return !isErrorCode(error, "ESRCH");
+		return isErrorCode(error, "ESRCH") ? "dead" : "alive";
 	}
 }
 

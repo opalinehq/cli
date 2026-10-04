@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	acquireSpoolWriteLock,
 	createRepositorySpoolBinding,
 	createRepositorySpoolEnv,
 	getAcceptedRepositorySpoolParent,
@@ -330,6 +331,64 @@ describe("repository spool", () => {
 
 		expect(result.capture.integrity).toBe("valid");
 		await expect(stat(lockPath)).rejects.toThrow();
+	});
+
+	test.each(["SIGTERM", "SIGINT", "SIGHUP"] as const)(
+		"a writer stopped by %s releases its spool lock",
+		async (signal) => {
+			const spoolRoot = await mkdtemp(join(tempRoot, "signal-"));
+			const child = Bun.spawn(
+				[
+					process.execPath,
+					join(import.meta.dir, "helpers/spool-lock-holder.ts"),
+					spoolRoot,
+				],
+				{ stdout: "pipe", stderr: "pipe" },
+			);
+			const reader = child.stdout.getReader();
+			const { value } = await reader.read();
+			expect(new TextDecoder().decode(value)).toContain("locked");
+			const lockPath = join(spoolRoot, ".write-lock");
+			expect((await stat(lockPath)).isDirectory()).toBe(true);
+
+			child.kill(signal);
+			await child.exited;
+
+			await expect(stat(lockPath)).rejects.toThrow();
+			// The default action still ends the process.
+			expect(child.signalCode).toBe(signal);
+		},
+	);
+
+	test("takes over a fresh lock whose holder process is gone at once", async () => {
+		const spoolRoot = await mkdtemp(join(tempRoot, "dead-holder-"));
+		const child = Bun.spawn(
+			[
+				process.execPath,
+				join(import.meta.dir, "helpers/spool-lock-holder.ts"),
+				spoolRoot,
+			],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		const { value } = await child.stdout.getReader().read();
+		expect(new TextDecoder().decode(value)).toContain("locked");
+		// SIGKILL cannot be handled: the lock stays behind, fresh.
+		child.kill("SIGKILL");
+		await child.exited;
+		const lockPath = join(spoolRoot, ".write-lock");
+		expect((await stat(lockPath)).isDirectory()).toBe(true);
+		const env = {
+			...createRepositorySpoolEnv(spoolRoot),
+			writeLockTimeoutMs: 20_000,
+		};
+
+		const startedAt = performance.now();
+		const release = await acquireSpoolWriteLock(spoolRoot, env);
+		const waitedMs = performance.now() - startedAt;
+		await release();
+
+		// Well under the 60 s stale age and the 20 s wait limit.
+		expect(waitedMs).toBeLessThan(1_000);
 	});
 
 	test("keeps a live writer lease beyond the stale threshold", async () => {
