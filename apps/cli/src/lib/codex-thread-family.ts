@@ -32,7 +32,12 @@ export interface CodexThreadFamily {
 	readonly self: CodexThread;
 	/** Parent chain, nearest parent first. */
 	readonly ancestors: readonly CodexThread[];
-	/** Spawned subagent threads below `self`, transitively. */
+	/**
+	 * Spawned subagent threads of the whole conversation, transitively: all
+	 * below the top of the parent chain, so a subagent also brings the
+	 * siblings its parent spawned before or after it. Excludes `self` and
+	 * its ancestors.
+	 */
 	readonly descendants: readonly CodexThread[];
 }
 
@@ -51,7 +56,8 @@ export function getCodexHomeDir(
 
 /**
  * Resolve a Codex thread and the threads that belong to the same conversation:
- * its parent chain (the orchestrating chat) and the subagents it spawned.
+ * its parent chain (the orchestrating chat) and every subagent spawned in
+ * that chat, looked up afresh on each call so later spawns are included.
  * Returns null when the thread's rollout cannot be found.
  */
 export async function resolveCodexThreadFamily(
@@ -77,11 +83,17 @@ export async function resolveCodexThreadFamily(
 		parentId = parent.parentThreadId;
 	}
 
-	const descendants = await findDescendants(
-		self,
-		dayDirectories,
-		search.now ?? new Date(),
-	);
+	const chain = new Set([
+		self.threadId,
+		...ancestors.map((thread) => thread.threadId),
+	]);
+	const descendants = (
+		await findDescendants(
+			ancestors.at(-1) ?? self,
+			dayDirectories,
+			search.now ?? new Date(),
+		)
+	).filter((thread) => !chain.has(thread.threadId));
 	return { self, ancestors, descendants };
 }
 

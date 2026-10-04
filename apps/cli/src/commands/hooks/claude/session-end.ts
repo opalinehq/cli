@@ -6,7 +6,7 @@ import {
 	type SessionFile,
 } from "../../../internal/agent-adapters/index.js";
 import {
-	findHookAnalysisMarker,
+	findHookAnalysisMarkers,
 	runMarkedAnalysisHook,
 } from "../../../lib/analysis-hook.js";
 import { getApiBaseOverride } from "../../../lib/api-target.js";
@@ -75,14 +75,13 @@ async function runSessionEnd(): Promise<undefined | Error> {
 		}
 		// A session linked by `opaline import --analysis` uploads at session end
 		// whatever the folder's auto-upload setting, with the analysis link.
-		const marker = await findHookAnalysisMarker(
+		const markers = await findHookAnalysisMarkers(
 			logger,
 			claudeCodeAdapter.source,
 			input.session_id,
 		);
 		if (
-			marker &&
-			(await runMarkedAnalysisHook(logger, marker, {
+			(await runMarkedAnalysisHook(logger, markers, {
 				sessionId: input.session_id,
 				source: claudeCodeAdapter.source,
 				transcriptPath: input.transcript_path,

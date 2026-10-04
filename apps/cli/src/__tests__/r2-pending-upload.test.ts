@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getLogger } from "@logtape/logtape";
 import {
-	findAnalysisMarker,
+	findAnalysisMarkers,
 	recordAnalysisMarker,
 } from "../lib/analysis-markers.js";
 import { type BatchUploadItem, batchUpload } from "../lib/batch-upload.js";
@@ -376,8 +376,10 @@ describe("pending analysis uploads and inaccessible jobs", () => {
 		expect(await loadFailedUploads()).toMatchObject([
 			{ sessionId: "session-unlinked", status: "permanent" },
 		]);
-		expect(await findAnalysisMarker("codex", "session-unlinked")).toBeNull();
-		expect(await findAnalysisMarker("codex", "session-linked")).not.toBeNull();
+		expect(await findAnalysisMarkers("codex", "session-unlinked")).toEqual([]);
+		expect(await findAnalysisMarkers("codex", "session-linked")).toHaveLength(
+			1,
+		);
 	});
 
 	test("a completed job naming another session is not cleared", async () => {
@@ -489,12 +491,12 @@ describe("analysis markers across processes", () => {
 		const exitCodes = await Promise.all(runs.map((run) => run.exited));
 
 		expect(exitCodes.every((code) => code === 0)).toBe(true);
-		const marker = await findAnalysisMarker("codex", "thread-kept");
+		const [marker] = await findAnalysisMarkers("codex", "thread-kept");
 		expect(marker?.memberIds.slice().sort()).toEqual(
 			["thread-kept", ...members].sort(),
 		);
 		expect(Object.keys(marker?.uploaded ?? {}).sort()).toEqual(members);
-		expect(await findAnalysisMarker("codex", "thread-removed")).toBeNull();
+		expect(await findAnalysisMarkers("codex", "thread-removed")).toEqual([]);
 	});
 });
 

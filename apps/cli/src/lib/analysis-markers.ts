@@ -86,34 +86,43 @@ export async function recordAnalysisMarker(
 		source: input.source,
 		uploaded: {},
 	};
+	// A chat can belong to several analyses: only a re-import for the same
+	// analysis replaces its marker.
 	await mutateMarkers(now, (markers) => [
 		...markers.filter(
 			(existing) =>
 				existing.source !== marker.source ||
-				existing.sessionId !== marker.sessionId,
+				existing.sessionId !== marker.sessionId ||
+				existing.analysisId !== marker.analysisId,
 		),
 		marker,
 	]);
 	return marker;
 }
 
-/** The newest unexpired marker covering this session or thread id. */
-export async function findAnalysisMarker(
+/**
+ * Unexpired markers covering this session or thread id, newest first, one
+ * per analysis.
+ */
+export async function findAnalysisMarkers(
 	source: AnalysisMarker["source"],
 	sessionId: string,
 	now: Date = new Date(),
-): Promise<AnalysisMarker | null> {
-	const markers = (await readMarkers()).filter(
-		(marker) =>
-			marker.source === source &&
-			isLive(marker, now) &&
-			marker.memberIds.includes(sessionId),
-	);
-	return (
-		markers.sort((left, right) =>
-			right.createdAt.localeCompare(left.createdAt),
-		)[0] ?? null
-	);
+): Promise<AnalysisMarker[]> {
+	const markers = (await readMarkers())
+		.filter(
+			(marker) =>
+				marker.source === source &&
+				isLive(marker, now) &&
+				marker.memberIds.includes(sessionId),
+		)
+		.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+	const analyses = new Set<string>();
+	return markers.filter((marker) => {
+		if (analyses.has(marker.analysisId)) return false;
+		analyses.add(marker.analysisId);
+		return true;
+	});
 }
 
 /**

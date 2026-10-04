@@ -25,7 +25,7 @@ async function createCodexHome(): Promise<string> {
 }
 
 describe("Codex thread family", () => {
-	test("resolves the parent chain and spawned subagents, not reviewers or strangers", async () => {
+	test("resolves the parent chain and every subagent of the chat, not reviewers or strangers", async () => {
 		const codexHome = await createCodexHome();
 		const base = Date.parse("2026-10-04T09:21:11.000Z");
 		const root = codexThreadId(base);
@@ -54,7 +54,9 @@ describe("Codex thread family", () => {
 
 		expect(family?.self.threadId).toBe(child);
 		expect(family?.ancestors.map((thread) => thread.threadId)).toEqual([root]);
+		// The sibling was spawned by the parent: it is part of the same chat.
 		expect(family?.descendants.map((thread) => thread.threadId)).toEqual([
+			sibling,
 			grandchild,
 		]);
 	});
