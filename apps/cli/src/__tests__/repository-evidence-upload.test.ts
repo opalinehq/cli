@@ -342,7 +342,7 @@ describe("repository evidence delivery", () => {
 		}
 	});
 
-	test("persists the backoff across hooks, retries only when due, and leaves transcript delivery unchanged", async () => {
+	test("persists the backoff across deliveries, retries only when due, and never lets a pending capture block a new one", async () => {
 		const fixture = await createCliFixture("claude_code");
 		const configDir = join(fixture.home, ".rudel");
 		const deliveries: ReturnType<
@@ -415,6 +415,11 @@ describe("repository evidence delivery", () => {
 				preload,
 				"Date.now = () => Number(process.env.OPALINE_TEST_NOW);\n",
 			);
+			const env = () => ({
+				OPALINE_TEST_NOW: String(now),
+				OPALINE_ALLOW_INSECURE_ENDPOINT: "1",
+				RUDEL_ALLOW_INSECURE_ENDPOINT: "1",
+			});
 			const hook = (
 				sessionId = fixture.sessionId,
 				lifecycle = "session-start",
@@ -428,27 +433,51 @@ describe("repository evidence delivery", () => {
 						hook_event_name: "SessionEnd",
 						reason: "other",
 					}),
-					env: {
-						OPALINE_TEST_NOW: String(now),
-						OPALINE_ALLOW_INSECURE_ENDPOINT: "1",
-						RUDEL_ALLOW_INSECURE_ENDPOINT: "1",
-					},
+					env: env(),
 				});
-			let operationId: string | undefined;
+			const deliver = () =>
+				runCli(["hooks", "evidence-deliver"], fixture, {
+					preload,
+					env: env(),
+				});
+			expect((await hook()).exitCode).toBe(0);
+			const [first] = await readPendingRepositoryEvidence(configDir);
+			assert(first);
+			const operationId = first.upload.input.operationId;
+			expect(first).toMatchObject({
+				next_attempt_at: now + 5 * 60_000,
+				retry_attempts: 1,
+			});
+			// A second hook of the same session is captured and attempted at once,
+			// while the older capture waits for its own backoff.
+			now += 60_000;
+			expect((await hook()).exitCode).toBe(0);
+			expect(deliveries).toHaveLength(2);
+			expect(deliveries[1]?.operationId).not.toBe(operationId);
+			expect(deliveries[1]?.session.sessionId).toBe(fixture.sessionId);
+			const pendingAfterSecond = await readPendingRepositoryEvidence(configDir);
+			expect(pendingAfterSecond).toHaveLength(2);
+			const second = pendingAfterSecond.find(
+				(pending) => pending.upload.input.operationId !== operationId,
+			);
+			assert(second);
+			await removePendingRepositoryEvidence(second, configDir);
+			now -= 60_000;
 			for (const [index, minutes] of [5, 15, 60, 240, 240].entries()) {
-				expect((await hook()).exitCode).toBe(0);
 				const [pending] = await readPendingRepositoryEvidence(configDir);
 				assert(pending);
-				const value = pending;
-				expect(value.next_attempt_at).toBe(now + minutes * 60_000);
-				expect(value.retry_attempts).toBe(Math.min(index + 1, 4));
-				operationId ??= pending.upload.input.operationId;
 				expect(pending.upload.input.operationId).toBe(operationId);
+				const nextAttemptAt = pending.next_attempt_at ?? now;
+				expect(nextAttemptAt).toBe(now + minutes * 60_000);
+				expect(pending.retry_attempts).toBe(Math.min(index + 1, 4));
 				const requests = deliveries.length;
-				now = (value.next_attempt_at ?? now) - 1;
-				expect((await hook()).exitCode).toBe(0);
+				now = nextAttemptAt - 1;
+				expect((await deliver()).exitCode).toBe(0);
 				expect(deliveries).toHaveLength(requests);
-				now = value.next_attempt_at ?? now;
+				now = nextAttemptAt;
+				expect((await deliver()).exitCode).toBe(0);
+				expect(deliveries).toHaveLength(requests + 1);
+				expect(deliveries.at(-1)?.operationId).toBe(operationId);
 			}
 			const pendingDirectory = join(
 				configDir,
@@ -468,7 +497,7 @@ describe("repository evidence delivery", () => {
 					}),
 				);
 				const requests = deliveries.length;
-				expect((await hook()).exitCode).toBe(0);
+				expect((await deliver()).exitCode).toBe(0);
 				expect(deliveries).toHaveLength(requests + 1);
 				expect(deliveries.at(-1)?.operationId).toBe(operationId);
 				const [reset] = await readPendingRepositoryEvidence(configDir);
@@ -479,37 +508,31 @@ describe("repository evidence delivery", () => {
 			}
 			now += 5 * 60_000;
 			failEvidence = false;
-			expect((await hook()).exitCode).toBe(0);
+			expect((await deliver()).exitCode).toBe(0);
 			expect(await readPendingRepositoryEvidence(configDir)).toEqual([]);
 			failEvidence = true;
-			expect((await hook()).exitCode).toBe(0);
-			const [reset] = await readPendingRepositoryEvidence(configDir);
-			expect(reset).toMatchObject({
-				next_attempt_at: now + 5 * 60_000,
-				retry_attempts: 1,
-			});
-			const [resetName] = await readdir(pendingDirectory);
-			assert(resetName);
-			const resetPath = join(pendingDirectory, resetName);
 			const requests = deliveries.length;
 			expect((await hook(fixture.sessionId, "session-end")).exitCode).toBe(0);
 			expect(transcripts).toBe(1);
-			expect(deliveries).toHaveLength(requests);
-			expect((await hook("new-session")).exitCode).toBe(0);
 			expect(deliveries).toHaveLength(requests + 1);
-			expect(deliveries.at(-1)?.session.sessionId).toBe("new-session");
+			expect(deliveries.at(-1)?.capture.timing.lifecycle).toBe("end");
 			failEvidence = false;
 			expect((await hook("successful-new-session")).exitCode).toBe(0);
-			expect(deliveries).toHaveLength(requests + 2);
-			expect(await readPendingRepositoryEvidence(configDir)).toHaveLength(2);
-			const record = JSON.parse(await readFile(resetPath, "utf8"));
+			expect(deliveries.at(-1)?.session.sessionId).toBe(
+				"successful-new-session",
+			);
+			expect(await readPendingRepositoryEvidence(configDir)).toHaveLength(1);
+			const [remaining] = await readdir(pendingDirectory);
+			assert(remaining);
+			const remainingPath = join(pendingDirectory, remaining);
+			const record = JSON.parse(await readFile(remainingPath, "utf8"));
 			await writeFile(
-				resetPath,
+				remainingPath,
 				JSON.stringify({ ...record, objects: "garbage" }),
 			);
 			expect((await hook()).exitCode).toBe(0);
-			expect(deliveries).toHaveLength(requests + 3);
 			expect(deliveries.at(-1)?.operationId).not.toBe(operationId);
+			expect(await readPendingRepositoryEvidence(configDir)).toEqual([]);
 		} finally {
 			clock.mockRestore();
 			server.stop(true);

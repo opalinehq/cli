@@ -12,6 +12,7 @@ import {
 import { join } from "node:path";
 import { RepositoryEvidenceInitInputSchema } from "../contracts/index.js";
 import { FILTER_VERSION } from "../internal/secret-filter/index.js";
+import { type FileLease, tryAcquireFileLease } from "./file-lease.js";
 import {
 	createRepositorySpoolBinding,
 	createRepositorySpoolEnv,
@@ -273,6 +274,102 @@ export async function deferPendingRepositoryEvidence(
 		},
 		configDir,
 	);
+}
+
+/**
+ * Exclusive delivery lease for one pending capture. Only the lease holder
+ * uploads, defers or removes the item, so concurrent hooks, the background
+ * deliverer and `upload --retry` never deliver the same operation at once.
+ */
+export async function acquirePendingRepositoryEvidenceLease(
+	pending: PendingRepositoryEvidence,
+	configDir: string,
+): Promise<FileLease | null> {
+	return tryAcquireFileLease(
+		join(
+			getRepositoryEvidenceLeaseDirectory(configDir),
+			`${shortHash(pending.upload.input.operationId)}.lease`,
+		),
+	);
+}
+
+export function getRepositoryEvidenceLeaseDirectory(configDir: string): string {
+	return join(configDir, "repository-evidence-leases");
+}
+
+/**
+ * A newer checkpoint or end capture of a session covers the transcript of
+ * every older pending checkpoint of the same session, so those are removed
+ * instead of queueing behind it. Start captures and items another process is
+ * delivering right now are kept.
+ */
+export async function supersedePendingRepositoryEvidence(
+	current: PendingRepositoryEvidence,
+	configDir: string,
+	onWarning: ((warning: Error) => void) | undefined = undefined,
+): Promise<number> {
+	const currentInput = current.upload.input;
+	if (
+		currentInput.capture.timing.lifecycle !== "checkpoint" &&
+		currentInput.capture.timing.lifecycle !== "end"
+	)
+		return 0;
+	const completedAt = Date.parse(
+		currentInput.capture.timing.captureCompletedAt,
+	);
+	const older = await readPendingRepositoryEvidence(configDir, {
+		actorId: current.transcriptRevision.scope.actorId,
+		endpoint: current.endpoint,
+		sessionId: currentInput.session.sessionId,
+		isEligible: (pending) =>
+			pending.upload.input.operationId !== currentInput.operationId &&
+			pending.upload.input.organizationId === currentInput.organizationId &&
+			pending.upload.input.session.source === currentInput.session.source &&
+			pending.upload.input.capture.timing.lifecycle === "checkpoint" &&
+			Date.parse(pending.upload.input.capture.timing.captureCompletedAt) <=
+				completedAt,
+		onError: (error) =>
+			onWarning?.(error instanceof Error ? error : new Error(String(error))),
+		onWarning,
+	});
+	let removed = 0;
+	for (const pending of older) {
+		const lease = await acquirePendingRepositoryEvidenceLease(
+			pending,
+			configDir,
+		);
+		if (lease === null) continue;
+		try {
+			await removePendingRepositoryEvidence(pending, configDir);
+			if (pending.continuation)
+				await rm(
+					join(
+						configDir,
+						"repository-evidence-sources",
+						`${pending.continuation.sourceId}.jsonl`,
+					),
+					{ force: true },
+				);
+			await abandonPendingRepositoryCapture(pending, configDir);
+			removed += 1;
+		} finally {
+			await lease.release();
+		}
+	}
+	return removed;
+}
+
+export async function hasPendingRepositoryEvidence(
+	pending: PendingRepositoryEvidence,
+	configDir: string,
+): Promise<boolean> {
+	try {
+		await stat(join(pendingDirectory(configDir), pendingFileName(pending)));
+		return true;
+	} catch (error) {
+		if (isErrorCode(error, "ENOENT")) return false;
+		throw error;
+	}
 }
 
 export async function removePendingRepositoryEvidence(
