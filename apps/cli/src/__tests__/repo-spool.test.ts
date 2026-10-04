@@ -394,6 +394,152 @@ describe("repository spool", () => {
 		expect(maximumConcurrentCommits).toBe(1);
 	});
 
+	test("acceptance and abandonment take only their repository's lock", async () => {
+		const env: RepositorySpoolEnv = {
+			...createRepositorySpoolEnv(join(tempRoot, "per-binding")),
+			writeLockTimeoutMs: 300,
+			writeLockPollMs: 10,
+		};
+		const busyRoot = join(tempRoot, "busy-repository");
+		const idleRoot = join(tempRoot, "idle-repository");
+		const busy = await makeBinding(busyRoot, env, "account-a");
+		const idle = await makeBinding(idleRoot, env, "account-a");
+		for (const [binding, root, id] of [
+			[busy, busyRoot, "capture-busy"],
+			[idle, idleRoot, "capture-idle"],
+		] as const) {
+			await writeRepositoryBundle(
+				makeCandidate({
+					captureId: id,
+					capturedAt: "2026-09-18T11:00:00.000Z",
+					contents: [id],
+				}),
+				binding,
+				root,
+				"checkpoint",
+				env,
+			);
+		}
+		const spoolRoot = join(env.configDir, "repo-context-spool", "v2");
+		const holdLock = async (path: string) => {
+			await mkdir(path, { mode: 0o700 });
+			await writeFile(join(path, "owner"), `${process.pid}:held-by-test`);
+		};
+		// Another process is busy in one repository: only that repository waits.
+		const busyLock = join(spoolRoot, hash(JSON.stringify(busy)), ".write-lock");
+		await holdLock(busyLock);
+		await expect(
+			markRepositorySpoolCaptureAccepted(
+				busy,
+				"capture-busy",
+				"local-context",
+				env,
+			),
+		).rejects.toThrow("Timed out waiting for another repository spool writer");
+		expect(
+			await markRepositorySpoolCaptureAccepted(
+				idle,
+				"capture-idle",
+				"local-context",
+				env,
+			),
+		).toBe(true);
+		await rm(busyLock, { force: true, recursive: true });
+		// A long global section (accounting, retirement) never blocks markers.
+		const globalLock = join(spoolRoot, ".write-lock");
+		await holdLock(globalLock);
+		expect(
+			await markRepositorySpoolCaptureAccepted(
+				busy,
+				"capture-busy",
+				"local-context",
+				env,
+			),
+		).toBe(true);
+		expect(
+			await markRepositorySpoolCaptureAbandoned(
+				idle,
+				"capture-idle",
+				"local-context",
+				env,
+			),
+		).toBe(true);
+		await expect(
+			writeRepositoryBundle(
+				makeCandidate({
+					captureId: "capture-needs-global",
+					capturedAt: "2026-09-18T11:01:00.000Z",
+					contents: ["needs global"],
+				}),
+				idle,
+				idleRoot,
+				"checkpoint",
+				env,
+			),
+		).rejects.toThrow("Timed out waiting for another repository spool writer");
+		await rm(globalLock, { force: true, recursive: true });
+	});
+
+	test("keeps the global quota exact when repositories write concurrently", async () => {
+		const baseEnv = createRepositorySpoolEnv(
+			join(tempRoot, "per-binding-quota"),
+		);
+		const roots = ["quota-a", "quota-b", "quota-c"].map((name) =>
+			join(tempRoot, name),
+		);
+		const bindings = await Promise.all(
+			roots.map((root) => makeBinding(root, baseEnv, "account-a")),
+		);
+		const candidates = roots.map((_, index) =>
+			makeCandidate({
+				captureId: `capture-quota-${index}`,
+				capturedAt: `2026-09-18T11:1${index}:00.000Z`,
+				contents: [String(index).repeat(32_000)],
+			}),
+		);
+		const plans = await Promise.all(
+			candidates.map((candidate, index) =>
+				planRepositoryBundle(
+					candidate,
+					bindings[index] ?? bindings[0],
+					roots[index] ?? "",
+					"manual",
+					baseEnv,
+				),
+			),
+		);
+		const limitedEnv: RepositorySpoolEnv = {
+			...baseEnv,
+			maxStoredBytes:
+				Math.max(...plans.map((plan) => plan.storedNewBytes)) * 2 + 16,
+		};
+		const results = await Promise.allSettled(
+			candidates.map((candidate, index) =>
+				writeRepositoryBundle(
+					candidate,
+					bindings[index] ?? bindings[0],
+					roots[index] ?? "",
+					"manual",
+					limitedEnv,
+				),
+			),
+		);
+		expect(
+			results.filter((result) => result.status === "fulfilled"),
+		).toHaveLength(2);
+		const listings = await Promise.all(
+			bindings.map((binding, index) =>
+				listRepositorySpool(binding, roots[index] ?? "", limitedEnv),
+			),
+		);
+		expect(
+			listings.reduce((total, listing) => total + listing.captures.length, 0),
+		).toBe(2);
+		expect(listings[0]?.quota.usedBytes).toBeLessThanOrEqual(
+			limitedEnv.maxStoredBytes,
+		);
+	});
+
 	test("detects tampering with immutable indexes and metrics", async () => {
 		const env = createRepositorySpoolEnv(join(tempRoot, "record-tamper"));
 		const binding = await makeBinding(repositoryRoot, env, "account-a");
