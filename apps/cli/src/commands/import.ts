@@ -180,6 +180,7 @@ async function runSingleUpload(
 			organizationId,
 			error: result.error ?? "Still processing on the server",
 			jobId: result.pendingJobId,
+			uploadBytes: result.uploadBytes,
 		});
 		write(
 			"Upload accepted; Opaline is still processing it. Run `opaline upload --retry` later to confirm.",
@@ -335,6 +336,7 @@ async function runRetryUpload(
 		organizationId: f.analysisId === undefined ? f.organizationId : undefined,
 		analysisId: f.analysisId,
 		analysisDestination: f.analysisDestination,
+		uploadBytes: f.uploadBytes,
 		failure: f,
 	}));
 

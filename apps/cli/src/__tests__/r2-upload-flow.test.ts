@@ -978,6 +978,11 @@ describe("capability-gated R2 upload flow", () => {
 			expect(result).toMatchObject({ success: false, retryable: true });
 			expect(result.error).toContain("does not accept sessions this large yet");
 			expect(requestPaths).toEqual(["/rpc/ingest/init"]);
+			// The slimmed size is kept so retries can order by what is sent.
+			expect(result.uploadBytes).toBeGreaterThan(
+				INGEST_DIRECT_CONTENT_MAX_BYTES,
+			);
+			expect(result.uploadBytes).toBeLessThanOrEqual(rawBytes);
 		},
 		60_000,
 	);

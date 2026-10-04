@@ -404,6 +404,7 @@ async function recordOutcome(
 		source: target.source,
 		analysisId,
 		analysisDestination,
+		uploadBytes: result.uploadBytes,
 	};
 	if (result.success) {
 		await removeFailedUpload(target.sessionId);

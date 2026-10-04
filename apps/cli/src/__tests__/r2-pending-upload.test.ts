@@ -539,4 +539,68 @@ describe("batch upload ordering and pending results", () => {
 			{ jobId: "job-medium", sessionId: "medium", status: "pending" },
 		]);
 	});
+
+	test("orders by the slimmed size an earlier attempt measured, else the raw size, and keeps the measurement", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "opaline-slim-order-"));
+		directories.push(directory);
+		const write = async (name: string, size: number) => {
+			const transcriptPath = join(directory, `${name}.jsonl`);
+			await Bun.write(transcriptPath, "x".repeat(size));
+			return transcriptPath;
+		};
+		const items: BatchUploadItem[] = [
+			{
+				label: "screenshots",
+				projectPath: directory,
+				sessionId: "screenshots",
+				// Raw 9,000 bytes, but only 30 bytes once images are slimmed.
+				transcriptPath: await write("screenshots", 9_000),
+				uploadBytes: 30,
+			},
+			{
+				label: "plain",
+				projectPath: directory,
+				sessionId: "plain",
+				transcriptPath: await write("plain", 500),
+			},
+			{
+				label: "measured-large",
+				projectPath: directory,
+				sessionId: "measured-large",
+				transcriptPath: await write("measured-large", 50),
+				uploadBytes: 5_000,
+			},
+		];
+		const order: string[] = [];
+
+		await batchUpload({
+			concurrency: 1,
+			items,
+			upload: async (item) => {
+				order.push(item.sessionId);
+				if (item.sessionId === "screenshots")
+					return {
+						error: "server busy",
+						retryable: true,
+						success: false,
+						uploadBytes: 31,
+					};
+				if (item.sessionId === "measured-large")
+					return { error: "server busy", retryable: true, success: false };
+				return { success: true };
+			},
+		});
+
+		expect(order).toEqual(["screenshots", "plain", "measured-large"]);
+		const failures = await loadFailedUploads();
+		expect(
+			failures.map(({ sessionId, uploadBytes }) => ({
+				sessionId,
+				uploadBytes,
+			})),
+		).toEqual([
+			{ sessionId: "screenshots", uploadBytes: 31 },
+			{ sessionId: "measured-large", uploadBytes: 5_000 },
+		]);
+	});
 });

@@ -71,6 +71,8 @@ export interface R2UploadFlowConfig {
 	/** Status polls before an accepted job is left to later reconciliation. */
 	readonly statusMaxPolls: number | undefined;
 	readonly token: string;
+	/** Receives the slimmed, filtered session size once it is staged. */
+	readonly onStaged?: (aggregateBytes: number) => void;
 }
 
 export type R2UploadFlowResult =
@@ -145,6 +147,7 @@ export async function uploadSessionViaR2(
 	const staged = await stageFilteredUpload(
 		createFilteredUploadSources(request, { slim: true }),
 	);
+	config.onStaged?.(staged.aggregateBytes);
 	try {
 		const preflight = getPreflightFailure(staged, config.maxAggregateBytes);
 		if (preflight) return preflight;

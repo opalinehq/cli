@@ -111,6 +111,7 @@ type LegacyUploadPreparation =
 			readonly status: "too-large";
 	  }
 	| {
+			readonly aggregateBytes: number;
 			readonly filteredRequest: IngestSessionInput;
 			readonly filteredText: SessionTextFilterResult<UploadSubagent>;
 			readonly status: "ready";
@@ -358,6 +359,25 @@ export async function uploadSession(
 	request: UploadSessionRequest,
 	config: UploadConfig,
 ): Promise<UploadResult> {
+	const measured: { uploadBytes: number | undefined } = {
+		uploadBytes: undefined,
+	};
+	const result = await uploadSessionMeasured(request, config, measured);
+	// Only uploads that will be tried again need the size for ordering.
+	if (
+		result.success ||
+		result.retryable === false ||
+		measured.uploadBytes === undefined
+	)
+		return result;
+	return { ...result, uploadBytes: result.uploadBytes ?? measured.uploadBytes };
+}
+
+async function uploadSessionMeasured(
+	request: UploadSessionRequest,
+	config: UploadConfig,
+	measured: { uploadBytes: number | undefined },
+): Promise<UploadResult> {
 	config.signal?.throwIfAborted();
 	const maxAggregateBytes =
 		config.maxAggregateBytes ?? INGEST_AGGREGATE_CONTENT_MAX_BYTES;
@@ -417,6 +437,9 @@ export async function uploadSession(
 				statusPollIntervalMs: config.r2StatusPollIntervalMs,
 				statusMaxPolls: config.r2StatusMaxPolls,
 				token: config.token,
+				onStaged: (aggregateBytes) => {
+					measured.uploadBytes = aggregateBytes;
+				},
 			});
 			if (r2Result.status === "redaction-budget") {
 				return {
@@ -505,6 +528,10 @@ export async function uploadSession(
 	if (legacy.status === "empty-main") {
 		return getEmptyMainUploadFailure();
 	}
+	// Only slimmed, filtered sizes count; legacy-too-large is the raw size.
+	if (legacy.status === "ready") measured.uploadBytes = legacy.aggregateBytes;
+	else if (legacy.status !== "legacy-too-large")
+		measured.uploadBytes = legacy.actualBytes;
 	if (
 		legacy.status === "legacy-too-large" ||
 		legacy.status === "direct-too-large"
@@ -733,7 +760,7 @@ async function prepareLegacyUpload(
 			status: "direct-too-large",
 		};
 	}
-	return { filteredRequest, filteredText, status: "ready" };
+	return { aggregateBytes, filteredRequest, filteredText, status: "ready" };
 }
 
 async function getFileBackedAggregateBytes(

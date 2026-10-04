@@ -29,6 +29,7 @@ export async function reportHookUploadFailure(
 			...failure,
 			error: result.error ?? "Still processing on the server",
 			jobId: result.pendingJobId,
+			uploadBytes: result.uploadBytes,
 		});
 		return;
 	}
@@ -50,6 +51,7 @@ export async function reportHookUploadFailure(
 		error: uploadError,
 		failureKind: result.failureKind,
 		status: disposition,
+		uploadBytes: result.uploadBytes,
 	});
 
 	if (result.endpointRejected) {

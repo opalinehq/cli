@@ -24,6 +24,8 @@ export interface BatchUploadItem {
 	organizationId?: string;
 	analysisId?: string;
 	analysisDestination?: FailedUpload["analysisDestination"];
+	/** Slimmed upload size from an earlier attempt; orders before raw size. */
+	uploadBytes?: number;
 }
 
 export interface BatchUploadOptions<T extends BatchUploadItem> {
@@ -68,6 +70,7 @@ export async function batchUpload<T extends BatchUploadItem>(
 			error: string;
 			status: "permanent" | "retryable";
 			failureKind?: FailedUpload["failureKind"];
+			uploadBytes?: number;
 		},
 	) => {
 		await recordFailedUpload({
@@ -79,6 +82,8 @@ export async function batchUpload<T extends BatchUploadItem>(
 			analysisId: item.analysisId,
 			analysisDestination: item.analysisDestination,
 			...failure,
+			// A new measurement replaces the earlier one; otherwise keep it.
+			uploadBytes: failure.uploadBytes ?? item.uploadBytes,
 		});
 	};
 	const total = items.length;
@@ -135,6 +140,7 @@ export async function batchUpload<T extends BatchUploadItem>(
 						analysisDestination: item.analysisDestination,
 						error: result.error ?? "Still processing on the server",
 						jobId: result.pendingJobId,
+						uploadBytes: result.uploadBytes ?? item.uploadBytes,
 					});
 				} else if (result.retryable === false) {
 					skipped++;
@@ -146,6 +152,7 @@ export async function batchUpload<T extends BatchUploadItem>(
 						error: result.error ?? "Upload cannot be retried",
 						failureKind: result.failureKind,
 						status: "permanent",
+						uploadBytes: result.uploadBytes,
 					});
 				} else {
 					failed++;
@@ -158,6 +165,7 @@ export async function batchUpload<T extends BatchUploadItem>(
 						error,
 						failureKind: result.failureKind,
 						status: "retryable",
+						uploadBytes: result.uploadBytes,
 					});
 				}
 			} catch (err) {
@@ -212,21 +220,24 @@ export async function batchUpload<T extends BatchUploadItem>(
 }
 
 /**
- * Order uploads by main transcript size, smallest first. Unreadable files keep
+ * Order uploads smallest first: by the slimmed upload size an earlier attempt
+ * measured, otherwise by the raw main transcript size. Unreadable files keep
  * their relative order at the end, where their upload reports the real error.
  */
 export async function orderBySizeAscending<
-	T extends { transcriptPath: string },
+	T extends { transcriptPath: string; uploadBytes?: number },
 >(items: readonly T[]): Promise<T[]> {
 	const sized = await pMap(
 		items,
 		async (item, index) => ({
 			index,
 			item,
-			size: await stat(item.transcriptPath).then(
-				(stats) => stats.size,
-				() => Number.POSITIVE_INFINITY,
-			),
+			size:
+				item.uploadBytes ??
+				(await stat(item.transcriptPath).then(
+					(stats) => stats.size,
+					() => Number.POSITIVE_INFINITY,
+				)),
 		}),
 		{ concurrency: 16 },
 	);

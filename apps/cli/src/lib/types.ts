@@ -30,6 +30,12 @@ export interface UploadResult {
 	success: boolean;
 	totalBytes?: number;
 	maxBytes?: number;
+	/**
+	 * Slimmed, filtered size of the session when this attempt measured it, on
+	 * retryable failures and pending uploads. Failed uploads keep it so
+	 * retries can order sessions by what is sent.
+	 */
+	uploadBytes?: number;
 	status?: number;
 	error?: string;
 	attempts?: number;

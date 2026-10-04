@@ -39,6 +39,11 @@ export interface FailedUpload {
 	jobId?: string;
 	/** Last reconciliation check of a `pending` entry. */
 	checkedAt?: string;
+	/**
+	 * Slimmed, filtered size measured by the last attempt, if any. Retries
+	 * order by it and fall back to the raw transcript size.
+	 */
+	uploadBytes?: number;
 }
 
 export type PendingUploadOutcome =
