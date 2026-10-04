@@ -16,9 +16,11 @@ import { type Credentials, loadCredentials } from "../lib/credentials.js";
 import {
 	isRetryCandidate,
 	loadFailedUploads,
+	recordPendingUpload,
 	removeFailedUpload,
 } from "../lib/failed-uploads.js";
 import { getGitInfo } from "../lib/git-info.js";
+import { reconcilePendingUploads } from "../lib/pending-upload-reconcile.js";
 import { getProjectOrgId } from "../lib/project-config.js";
 import { retryPendingSessionEvidence } from "../lib/session-evidence.js";
 import { resolveSession } from "../lib/session-resolver.js";
@@ -29,6 +31,10 @@ import {
 } from "../lib/types.js";
 import { allowsInsecureEndpoint } from "../lib/upload-endpoint.js";
 import { formatRedactionSummary, uploadSession } from "../lib/uploader.js";
+import { runAnalysisImport } from "./import-analysis.js";
+
+// `--retry` checks every pending server job it can; hooks check only a few.
+const RETRY_RECONCILE_MAX_ENTRIES = 200;
 
 interface UploadFlags {
 	tag?: SessionTag;
@@ -41,6 +47,9 @@ interface UploadFlags {
 	yes: boolean;
 	concurrency: number;
 	forceReplace: boolean;
+	analysis?: string;
+	related: boolean;
+	json: boolean;
 }
 
 interface ResolvedUploadFlags extends UploadFlags {
@@ -153,6 +162,21 @@ async function runSingleUpload(
 		authType: credentials.authType,
 	});
 
+	if (result.pendingJobId !== undefined) {
+		await recordPendingUpload({
+			sessionId: request.metadata.sessionId,
+			transcriptPath: request.transcriptPath,
+			projectPath: sessionInfo.projectPath,
+			source: sessionInfo.source,
+			organizationId,
+			error: result.error ?? "Still processing on the server",
+			jobId: result.pendingJobId,
+		});
+		write(
+			"Upload accepted; Opaline is still processing it. Run `opaline upload --retry` later to confirm.",
+		);
+		return;
+	}
 	if (result.success) {
 		write("Upload successful!");
 		await removeFailedUpload(request.metadata.sessionId);
@@ -200,9 +224,32 @@ async function runRetryUpload(
 		}
 	}
 
+	if (!flags.dryRun && credentials) {
+		const reconciled = await reconcilePendingUploads(
+			{ maxEntries: RETRY_RECONCILE_MAX_ENTRIES },
+			{
+				allowInsecureEndpoint: allowPlaintextEndpoint,
+				authType: credentials.authType,
+				endpoint: flags.endpoint,
+				token: credentials.token,
+			},
+		);
+		if (reconciled.checked > 0)
+			p.log.info(
+				`Checked ${reconciled.checked} upload(s) still processing on the server: ${reconciled.completed} completed, ${reconciled.stillPending} still processing, ${reconciled.requeued} to upload again, ${reconciled.failed} failed.`,
+			);
+	}
+
 	const failures = await loadFailedUploads();
-	if (failures.length === 0) {
-		p.outro("No failed uploads to retry.");
+	const pendingUploads = failures.filter(
+		(failure) => failure.status === "pending",
+	);
+	if (failures.length === pendingUploads.length) {
+		p.outro(
+			pendingUploads.length > 0
+				? `No failed uploads to retry. ${pendingUploads.length} upload(s) are still processing on the server.`
+				: "No failed uploads to retry.",
+		);
 		return evidenceRetryError;
 	}
 
@@ -212,14 +259,17 @@ async function runRetryUpload(
 	const permanentFailures = failures.filter(
 		(failure) => failure.status === "permanent",
 	);
-	p.log.info(
-		`Found ${failures.length} failed upload(s): ${retryableFailures.length} retryable, ${permanentFailures.length} permanent`,
+	const failedUploads = failures.filter(
+		(failure) => failure.status !== "pending",
 	);
-	for (const f of failures.slice(0, 10)) {
+	p.log.info(
+		`Found ${failedUploads.length} failed upload(s): ${retryableFailures.length} retryable, ${permanentFailures.length} permanent${pendingUploads.length > 0 ? ` (${pendingUploads.length} still processing on the server)` : ""}`,
+	);
+	for (const f of failedUploads.slice(0, 10)) {
 		p.log.warn(`  [${f.status}] ${f.sessionId}: ${f.error} (${f.failedAt})`);
 	}
-	if (failures.length > 10) {
-		p.log.warn(`  ...and ${failures.length - 10} more`);
+	if (failedUploads.length > 10) {
+		p.log.warn(`  ...and ${failedUploads.length - 10} more`);
 	}
 	if (permanentFailures.length > 0) {
 		p.log.warn(
@@ -266,7 +316,8 @@ async function runRetryUpload(
 		transcriptPath: f.transcriptPath,
 		projectPath: f.projectPath,
 		source: f.source,
-		organizationId: f.organizationId,
+		organizationId: f.analysisId === undefined ? f.organizationId : undefined,
+		analysisId: f.analysisId,
 		failure: f,
 	}));
 
@@ -285,10 +336,13 @@ async function runRetryUpload(
 				projectPath: item.failure.projectPath,
 			};
 			const gitInfo = await getGitInfo(item.failure.projectPath);
+			// Analysis uploads go to the analysis's workspace, never an org.
 			const organizationId =
-				flags.org ??
-				item.failure.organizationId ??
-				(await getProjectOrgId(item.failure.projectPath));
+				item.analysisId === undefined
+					? (flags.org ??
+						item.failure.organizationId ??
+						(await getProjectOrgId(item.failure.projectPath)))
+					: undefined;
 
 			const request = await adapter.buildUploadRequest(sessionFile, {
 				tag: flags.tag,
@@ -297,6 +351,8 @@ async function runRetryUpload(
 				uploadMode: "retry",
 			});
 			if (flags.forceReplace) request.metadata.force_replace = true;
+			if (item.analysisId !== undefined)
+				request.metadata.analysisId = item.analysisId;
 
 			return uploadSession(request, {
 				endpoint: flags.endpoint,
@@ -341,6 +397,33 @@ async function runUpload(
 	const allowPlaintextEndpoint = allowsInsecureEndpoint(
 		resolvedFlags.allowInsecureEndpoint,
 	);
+	if (resolvedFlags.analysis !== undefined) {
+		const analysisId = resolvedFlags.analysis.trim();
+		const session = sessions[0];
+		if (!analysisId) return new Error("--analysis needs an analysis id.");
+		if (!session || sessions.length > 1)
+			return new Error(
+				"Pass exactly one session or Codex thread id with --analysis.",
+			);
+		if (resolvedFlags.retry || resolvedFlags.org !== undefined)
+			return new Error(
+				"--analysis cannot be combined with --retry or --org; the analysis decides the workspace.",
+			);
+		return runAnalysisImport(
+			{
+				analysisId,
+				dryRun: resolvedFlags.dryRun,
+				json: resolvedFlags.json,
+				related: resolvedFlags.related,
+				session,
+			},
+			{
+				allowInsecureEndpoint: allowPlaintextEndpoint,
+				credentials,
+				endpoint: resolvedFlags.endpoint,
+			},
+		);
+	}
 	if (resolvedFlags.retry) {
 		return runRetryUpload(resolvedFlags, allowPlaintextEndpoint, credentials);
 	}
@@ -421,6 +504,24 @@ export const importCommand = buildCommand({
 			forceReplace: {
 				kind: "boolean",
 				brief: "Intentionally replace a stored session with smaller content",
+				default: false,
+			},
+			analysis: {
+				kind: "parsed",
+				parse: String,
+				brief:
+					"Link the chat to an Opaline analysis (uploads into the analysis's workspace; later turns re-upload via hooks)",
+				optional: true,
+			},
+			related: {
+				kind: "boolean",
+				brief:
+					"With --analysis, include the Codex thread's parent chain and spawned subagent threads",
+				default: true,
+			},
+			json: {
+				kind: "boolean",
+				brief: "With --analysis, print one JSON object instead of a line",
 				default: false,
 			},
 		},

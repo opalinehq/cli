@@ -5,12 +5,20 @@ import {
 	claudeCodeAdapter,
 	type SessionFile,
 } from "../../../internal/agent-adapters/index.js";
+import {
+	findHookAnalysisMarker,
+	runMarkedAnalysisHook,
+} from "../../../lib/analysis-hook.js";
 import { getApiBaseOverride } from "../../../lib/api-target.js";
 import { isRepositoryAutoUploadAllowed } from "../../../lib/auto-upload-config.js";
 import { loadCredentials } from "../../../lib/credentials.js";
 import { removeFailedUpload } from "../../../lib/failed-uploads.js";
 import { getGitInfo } from "../../../lib/git-info.js";
-import { reportHookUploadFailure } from "../../../lib/hook-upload-failure.js";
+import {
+	HOOK_R2_STATUS_MAX_POLLS,
+	reconcilePendingUploadsInHook,
+	reportHookUploadFailure,
+} from "../../../lib/hook-upload-failure.js";
 import { getProjectOrgId } from "../../../lib/project-config.js";
 import {
 	getLegacyRepositoryKey,
@@ -62,6 +70,25 @@ async function runSessionEnd(): Promise<undefined | Error> {
 			logger.warn("Could not add the SessionStart hook: {error}", {
 				error: error instanceof Error ? error.message : String(error),
 			});
+		}
+		// A session linked by `opaline import --analysis` uploads at session end
+		// whatever the folder's auto-upload setting, with the analysis link.
+		const marker = await findHookAnalysisMarker(
+			logger,
+			claudeCodeAdapter.source,
+			input.session_id,
+		);
+		if (marker) {
+			await runMarkedAnalysisHook(logger, marker, {
+				sessionId: input.session_id,
+				source: claudeCodeAdapter.source,
+				transcriptPath: input.transcript_path,
+				projectPath: input.cwd,
+				relation: "marked",
+				gitBranch: undefined,
+				gitSha: undefined,
+			});
+			return;
 		}
 		const gitInfo = await getGitInfo(input.cwd);
 		const repository = resolveUploadRepositoryIdentity(input.cwd, gitInfo);
@@ -133,11 +160,18 @@ async function runSessionEnd(): Promise<undefined | Error> {
 
 		const apiBase = getApiBaseOverride() ?? credentials.apiBaseUrl;
 		const endpoint = `${apiBase}/rpc`;
+		const reconciliation = reconcilePendingUploadsInHook(logger, {
+			allowInsecureEndpoint: allowsInsecureEndpointFromEnv(),
+			authType: credentials.authType,
+			endpoint,
+			token: credentials.token,
+		});
 		const result = await uploadSession(request, {
 			endpoint,
 			token: credentials.token,
 			allowInsecureEndpoint: allowsInsecureEndpointFromEnv(),
 			authType: credentials.authType,
+			r2StatusMaxPolls: HOOK_R2_STATUS_MAX_POLLS,
 			onRetry: (attempt, maxAttempts, error) => {
 				logger.warn(
 					"Retrying upload for {sessionId} ({attempt}/{maxAttempts}): {error}",
@@ -145,7 +179,7 @@ async function runSessionEnd(): Promise<undefined | Error> {
 				);
 			},
 		});
-		await evidenceUpload;
+		await Promise.all([evidenceUpload, reconciliation]);
 
 		if (result.success) {
 			logger.info(

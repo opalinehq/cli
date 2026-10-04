@@ -1,3 +1,4 @@
+import { stat } from "node:fs/promises";
 import pMap from "p-map";
 import type { Source } from "../contracts/index.js";
 import { MissingTranscriptTimestampError } from "../internal/agent-adapters/index.js";
@@ -9,6 +10,7 @@ import {
 import {
 	type FailedUpload,
 	recordFailedUpload,
+	recordPendingUpload,
 	removeFailedUpload,
 } from "./failed-uploads.js";
 import type { UploadResult } from "./types.js";
@@ -20,6 +22,7 @@ export interface BatchUploadItem {
 	projectPath: string;
 	source?: Source;
 	organizationId?: string;
+	analysisId?: string;
 }
 
 export interface BatchUploadOptions<T extends BatchUploadItem> {
@@ -41,6 +44,8 @@ export interface BatchUploadOptions<T extends BatchUploadItem> {
 
 export interface BatchUploadSummary {
 	succeeded: number;
+	/** Accepted by the server but still processing; reconciled later. */
+	pending: number;
 	failed: number;
 	skipped: number;
 	total: number;
@@ -53,12 +58,14 @@ export interface BatchUploadSummary {
 export async function batchUpload<T extends BatchUploadItem>(
 	options: BatchUploadOptions<T>,
 ): Promise<BatchUploadSummary> {
-	const { items, upload, concurrency = 5, onItemComplete, onRetry } = options;
+	const { upload, concurrency = 5, onItemComplete, onRetry } = options;
+	// Small sessions first: one heavy transcript must not hold back the rest.
+	const items = await orderBySizeAscending(options.items);
 	const recordFailure = async (
 		item: T,
 		failure: {
 			error: string;
-			status: FailedUpload["status"];
+			status: "permanent" | "retryable";
 			failureKind?: FailedUpload["failureKind"];
 		},
 	) => {
@@ -68,11 +75,13 @@ export async function batchUpload<T extends BatchUploadItem>(
 			projectPath: item.projectPath,
 			source: item.source,
 			organizationId: item.organizationId,
+			analysisId: item.analysisId,
 			...failure,
 		});
 	};
 	const total = items.length;
 	let succeeded = 0;
+	let pending = 0;
 	let failed = 0;
 	let skipped = 0;
 	let deferred = 0;
@@ -112,6 +121,18 @@ export async function batchUpload<T extends BatchUploadItem>(
 					redacted = mergeRedactionCounts(redacted, result.redacted ?? {});
 					redactedBytes += result.redactedBytes ?? 0;
 					await removeFailedUpload(item.sessionId);
+				} else if (result.pendingJobId !== undefined) {
+					pending++;
+					await recordPendingUpload({
+						sessionId: item.sessionId,
+						transcriptPath: item.transcriptPath,
+						projectPath: item.projectPath,
+						source: item.source,
+						organizationId: item.organizationId,
+						analysisId: item.analysisId,
+						error: result.error ?? "Still processing on the server",
+						jobId: result.pendingJobId,
+					});
 				} else if (result.retryable === false) {
 					skipped++;
 					skippedItems.push({
@@ -176,6 +197,7 @@ export async function batchUpload<T extends BatchUploadItem>(
 
 	return {
 		succeeded,
+		pending,
 		failed,
 		skipped,
 		total,
@@ -184,4 +206,32 @@ export async function batchUpload<T extends BatchUploadItem>(
 		redacted,
 		redactedBytes,
 	};
+}
+
+/**
+ * Order uploads by main transcript size, smallest first. Unreadable files keep
+ * their relative order at the end, where their upload reports the real error.
+ */
+export async function orderBySizeAscending<
+	T extends { transcriptPath: string },
+>(items: readonly T[]): Promise<T[]> {
+	const sized = await pMap(
+		items,
+		async (item, index) => ({
+			index,
+			item,
+			size: await stat(item.transcriptPath).then(
+				(stats) => stats.size,
+				() => Number.POSITIVE_INFINITY,
+			),
+		}),
+		{ concurrency: 16 },
+	);
+	return sized
+		.sort((left, right) =>
+			left.size === right.size
+				? left.index - right.index
+				: left.size - right.size,
+		)
+		.map((entry) => entry.item);
 }

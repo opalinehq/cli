@@ -124,7 +124,7 @@ async function diagnoseAuth(config: ConfigDiagnosis): Promise<DoctorCheck> {
 
 	try {
 		const client = createApiClient(config.credentials);
-		const user = await withTimeout(
+		const user = await withTimeout<{ readonly email: string }>(
 			config.credentials.authType === "api-key"
 				? client.cli.authStatus()
 				: client.me(),

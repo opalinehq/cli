@@ -277,6 +277,11 @@ export async function uploadRepositorySessions(
 					repository.uploadedCount = (repository.uploadedCount ?? 0) + 1;
 					if (repository.upload)
 						repository.upload.completed = repository.uploadedCount;
+				} else if (result.pendingJobId !== undefined) {
+					// Accepted by the server and still processing there: not a
+					// failure, reconciled by a later hook or `upload --retry`.
+					detail.status = "processing";
+					detail.error = undefined;
 				} else {
 					detail.status =
 						result.attempts === 0 && result.maxBytes !== undefined
@@ -356,6 +361,7 @@ export async function uploadRepositorySessions(
 			(item) =>
 				item.repository === repository &&
 				item.detail.status !== "skipped" &&
+				item.detail.status !== "processing" &&
 				!repository.uploadedSessionIds?.has(item.sessionId),
 		);
 		if (repository.upload) repository.upload.failed = remaining.length;

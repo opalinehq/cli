@@ -7,12 +7,20 @@ import {
 	findActiveRolloutFile,
 	type SessionFile,
 } from "../../../internal/agent-adapters/index.js";
+import {
+	findHookAnalysisMarker,
+	runMarkedAnalysisHook,
+} from "../../../lib/analysis-hook.js";
 import { getApiBaseOverride } from "../../../lib/api-target.js";
 import { isRepositoryAutoUploadAllowed } from "../../../lib/auto-upload-config.js";
 import { loadCredentials } from "../../../lib/credentials.js";
 import { removeFailedUpload } from "../../../lib/failed-uploads.js";
 import { getGitInfo } from "../../../lib/git-info.js";
-import { reportHookUploadFailure } from "../../../lib/hook-upload-failure.js";
+import {
+	HOOK_R2_STATUS_MAX_POLLS,
+	reconcilePendingUploadsInHook,
+	reportHookUploadFailure,
+} from "../../../lib/hook-upload-failure.js";
 import { getProjectOrgId } from "../../../lib/project-config.js";
 import {
 	getLegacyRepositoryKey,
@@ -66,6 +74,17 @@ async function runTurnComplete(
 		const input = parseNotification(notification);
 		if (!input) return;
 		const hookReceivedAt = new Date().toISOString();
+		// A chat linked by `opaline import --analysis` uploads after every turn,
+		// whatever the folder's auto-upload setting, so the answer is included.
+		const marker = await findHookAnalysisMarker(
+			logger,
+			codexAdapter.source,
+			input.threadId,
+		);
+		if (marker) {
+			await runMarkedAnalysisHook(logger, marker, undefined);
+			return;
+		}
 		const gitInfo = await getGitInfo(input.cwd);
 		const repository = resolveUploadRepositoryIdentity(input.cwd, gitInfo);
 		if (
@@ -138,13 +157,20 @@ async function runTurnComplete(
 
 		const apiBase = getApiBaseOverride() ?? credentials.apiBaseUrl;
 		const endpoint = `${apiBase}/rpc`;
+		const reconciliation = reconcilePendingUploadsInHook(logger, {
+			allowInsecureEndpoint: allowsInsecureEndpointFromEnv(),
+			authType: credentials.authType,
+			endpoint,
+			token: credentials.token,
+		});
 		const result = await uploadSession(request, {
 			endpoint,
 			token: credentials.token,
 			allowInsecureEndpoint: allowsInsecureEndpointFromEnv(),
 			authType: credentials.authType,
+			r2StatusMaxPolls: HOOK_R2_STATUS_MAX_POLLS,
 		});
-		await evidenceUpload;
+		await Promise.all([evidenceUpload, reconciliation]);
 
 		if (result.success) {
 			const redactionSummary = formatRedactionSummary(

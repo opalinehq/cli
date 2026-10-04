@@ -15,17 +15,38 @@ function getFailedUploadsPath(): string {
 	return join(getConfigDir(), "failed-uploads.json");
 }
 
+/**
+ * One locally tracked upload that has not been confirmed by the server.
+ * `pending` entries were accepted (R2 job id kept) but not yet finished when
+ * the CLI stopped polling; they are reconciled with `ingest.status`, never
+ * re-uploaded or reported as failed while the server still works on them.
+ */
 export interface FailedUpload {
 	sessionId: string;
 	transcriptPath: string;
 	projectPath: string;
 	source?: Source;
 	organizationId?: string;
+	/** Analysis link to keep on retries (`opaline import --analysis`). */
+	analysisId?: string;
 	error: string;
 	failedAt: string;
-	status: "permanent" | "retryable";
+	status: "permanent" | "retryable" | "pending";
 	failureKind?: "json-integrity" | "session-shrink-rejected";
+	/** Server ingest job of a `pending` entry. */
+	jobId?: string;
+	/** Last reconciliation check of a `pending` entry. */
+	checkedAt?: string;
 }
+
+export type PendingUploadOutcome =
+	| { readonly kind: "completed" }
+	| { readonly kind: "still-pending" }
+	| {
+			readonly kind: "failed";
+			readonly error: string;
+			readonly status: "permanent" | "retryable";
+	  };
 
 interface FailedUploadsData {
 	failures: FailedUpload[];
@@ -49,11 +70,18 @@ export async function loadFailedUploads(): Promise<FailedUpload[]> {
 		return data.failures.map((f) => ({
 			...f,
 			source: normalizeSource(f.source),
-			status: f.status === "permanent" ? "permanent" : "retryable",
+			status: normalizeStatus(f),
 		}));
 	} catch {
 		return [];
 	}
+}
+
+function normalizeStatus(failure: FailedUpload): FailedUpload["status"] {
+	if (failure.status === "permanent") return "permanent";
+	if (failure.status === "pending" && typeof failure.jobId === "string")
+		return "pending";
+	return "retryable";
 }
 
 async function saveFailedUploads(failures: FailedUpload[]): Promise<void> {
@@ -67,8 +95,8 @@ async function saveFailedUploads(failures: FailedUpload[]): Promise<void> {
 }
 
 export async function recordFailedUpload(
-	failure: Omit<FailedUpload, "failedAt" | "status"> & {
-		status?: FailedUpload["status"];
+	failure: Omit<FailedUpload, "failedAt" | "status" | "jobId" | "checkedAt"> & {
+		status?: "permanent" | "retryable";
 	},
 ): Promise<void> {
 	await enqueueMutation(async () => {
@@ -85,6 +113,64 @@ export async function recordFailedUpload(
 			failures[existing] = entry;
 		} else {
 			failures.push(entry);
+		}
+		await saveFailedUploads(failures);
+	});
+}
+
+export async function recordPendingUpload(
+	pending: Omit<
+		FailedUpload,
+		"failedAt" | "status" | "failureKind" | "checkedAt" | "jobId"
+	> & { jobId: string },
+): Promise<void> {
+	await enqueueMutation(async () => {
+		const failures = await loadFailedUploads();
+		const entry: FailedUpload = {
+			...pending,
+			failedAt: new Date().toISOString(),
+			status: "pending",
+		};
+		const existing = failures.findIndex(
+			(f) => f.sessionId === pending.sessionId,
+		);
+		if (existing >= 0) failures[existing] = entry;
+		else failures.push(entry);
+		await saveFailedUploads(failures);
+	});
+}
+
+/**
+ * Apply a reconciliation result, but only to the same pending job: a newer
+ * upload of the session may already have replaced or cleared the entry.
+ */
+export async function settlePendingUpload(
+	sessionId: string,
+	jobId: string,
+	outcome: PendingUploadOutcome,
+): Promise<void> {
+	await enqueueMutation(async () => {
+		const failures = await loadFailedUploads();
+		const index = failures.findIndex(
+			(f) =>
+				f.sessionId === sessionId &&
+				f.status === "pending" &&
+				f.jobId === jobId,
+		);
+		const current = failures[index];
+		if (!current) return;
+		if (outcome.kind === "completed") {
+			failures.splice(index, 1);
+		} else if (outcome.kind === "still-pending") {
+			failures[index] = { ...current, checkedAt: new Date().toISOString() };
+		} else {
+			const { jobId: _jobId, checkedAt: _checkedAt, ...rest } = current;
+			failures[index] = {
+				...rest,
+				error: outcome.error,
+				failedAt: new Date().toISOString(),
+				status: outcome.status,
+			};
 		}
 		await saveFailedUploads(failures);
 	});
@@ -110,6 +196,7 @@ export function isRetryCandidate(
 	failure: FailedUpload,
 	forceReplace: boolean,
 ): boolean {
+	if (failure.status === "pending") return false;
 	if (failure.status === "retryable") return true;
 	if (!forceReplace) return false;
 	return (

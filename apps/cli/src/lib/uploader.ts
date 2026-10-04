@@ -41,6 +41,8 @@ import {
 import {
 	formatR2UploadFlowError,
 	isR2InitUnsupported,
+	R2IngestInitError,
+	R2IngestPendingError,
 	uploadSessionViaR2,
 } from "./r2-upload-flow.js";
 import type { UploadResult, UploadTransferProgress } from "./types.js";
@@ -58,6 +60,8 @@ export interface UploadConfig {
 	signal?: AbortSignal;
 	r2MultipartBaseDelayMs?: number;
 	r2StatusPollIntervalMs?: number;
+	/** Status polls after an R2 commit before the job is recorded as pending. */
+	r2StatusMaxPolls?: number;
 }
 
 const RETRYABLE_STATUS_CODES = new Set([408, 502, 503, 504]);
@@ -401,6 +405,7 @@ export async function uploadSession(
 				onTransferProgress: config.onTransferProgress,
 				onRetry: config.onRetry,
 				statusPollIntervalMs: config.r2StatusPollIntervalMs,
+				statusMaxPolls: config.r2StatusMaxPolls,
 				token: config.token,
 			});
 			if (r2Result.status === "redaction-budget") {
@@ -428,6 +433,12 @@ export async function uploadSession(
 					retryable: false,
 				};
 			}
+			const analysisFailure = getAnalysisLinkFailure(
+				request,
+				r2Result.result.analysisId,
+				r2Result.attempts,
+			);
+			if (analysisFailure) return analysisFailure;
 			return {
 				success: true,
 				status: 200,
@@ -439,6 +450,17 @@ export async function uploadSession(
 		} catch (error) {
 			const filterFailure = getSecretFilterUploadFailure(error);
 			if (filterFailure) return filterFailure;
+			if (error instanceof R2IngestPendingError) {
+				return {
+					success: false,
+					error: error.message,
+					attempts: MAX_ATTEMPTS,
+					pendingJobId: error.jobId,
+					retryable: true,
+				};
+			}
+			const analysisRejection = getAnalysisInitRejection(request, error);
+			if (analysisRejection) return analysisRejection;
 			if (isR2InitUnsupported(error)) {
 				await forgetR2UploadCapability(endpointUrl, authType, config.token);
 			} else {
@@ -528,6 +550,12 @@ export async function uploadSession(
 			if (authType === "api-key" && hasR2IngestUpgradeHint(response)) {
 				await rememberR2UploadCapability(endpointUrl, authType, config.token);
 			}
+			const analysisFailure = getAnalysisLinkFailure(
+				request,
+				response.analysisId,
+				attempt,
+			);
+			if (analysisFailure) return analysisFailure;
 			return {
 				success: true,
 				status: 200,
@@ -577,6 +605,20 @@ export async function uploadSession(
 					error: formatUploadError(error),
 					attempts: attempt,
 					failureKind: "json-integrity",
+					retryable: false,
+				};
+			}
+
+			if (
+				filteredRequest.analysisId !== undefined &&
+				error instanceof ORPCError &&
+				(error.status === 404 || error.status === 412)
+			) {
+				return {
+					success: false,
+					error: `${error.status} ${error.message}`,
+					attempts: attempt,
+					analysisRejected: true,
 					retryable: false,
 				};
 			}
@@ -719,6 +761,60 @@ function isFileBackedUploadRequest(
 	return "kind" in request && request.kind === "file";
 }
 
+export const ANALYSIS_UPLOAD_UNSUPPORTED_MESSAGE =
+	"This Opaline server does not support analysis uploads yet. Update the Opaline server or CLI (`opaline update`), or try again later.";
+
+/**
+ * An analysis upload only counts when the server confirms the link. A server
+ * that ignores `analysisId` stores the session in the default workspace, so a
+ * missing echo is reported instead of treated as success.
+ */
+function getAnalysisLinkFailure(
+	request: UploadSessionRequest,
+	echoedAnalysisId: string | undefined,
+	attempts: number,
+): UploadResult | null {
+	const analysisId = getRequestMetadata(request).analysisId;
+	if (analysisId === undefined || echoedAnalysisId === analysisId) return null;
+	return {
+		success: false,
+		error: `The upload was stored without its analysis link. ${ANALYSIS_UPLOAD_UNSUPPORTED_MESSAGE}`,
+		attempts,
+		analysisLinkMissing: true,
+		retryable: false,
+	};
+}
+
+// A rejected analysis id (404 not found or not visible, 412 analysis log off)
+// must reach the caller. Servers that link analyses always support R2 init, so
+// such an init 404 is never treated as "R2 unsupported" for these uploads.
+function getAnalysisInitRejection(
+	request: UploadSessionRequest,
+	error: unknown,
+): UploadResult | null {
+	if (getRequestMetadata(request).analysisId === undefined) return null;
+	if (!(error instanceof R2IngestInitError)) return null;
+	const cause = error.causeValue;
+	if (
+		!(cause instanceof ORPCError) ||
+		(cause.status !== 404 && cause.status !== 412)
+	)
+		return null;
+	return {
+		success: false,
+		error: `${cause.status} ${cause.message}`,
+		attempts: 1,
+		analysisRejected: true,
+		retryable: false,
+	};
+}
+
+function getRequestMetadata(
+	request: UploadSessionRequest,
+): Omit<IngestSessionInput, "content" | "subagents"> {
+	return isFileBackedUploadRequest(request) ? request.metadata : request;
+}
+
 function getEmptyMainUploadFailure(): UploadResult {
 	return {
 		success: false,
@@ -764,6 +860,7 @@ export function formatRedactionBudgetError(
 interface IngestSessionResponse {
 	readonly success: true;
 	readonly sessionId: string;
+	readonly analysisId?: string;
 	readonly upgradeHint?: { readonly protocol: "r2_multipart_v1" };
 	readonly redacted?: RedactionCounts;
 	readonly redactedBytes?: number;
@@ -783,6 +880,9 @@ function isIngestSessionResponse(
 		return false;
 	}
 	if (value.redacted !== undefined && !isRecord(value.redacted)) {
+		return false;
+	}
+	if (value.analysisId !== undefined && typeof value.analysisId !== "string") {
 		return false;
 	}
 	if (
