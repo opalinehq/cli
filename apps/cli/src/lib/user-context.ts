@@ -236,7 +236,32 @@ export async function resolveUserContextRoots(input: {
 			scope: "instructions",
 			include: uniqueIncludes(homeIncludes),
 		});
-	return roots;
+	return withoutRepositoryOverlap(roots, input.repositoryRoot);
+}
+
+/**
+ * A repository that contains user directories (for example a Git repository
+ * at $HOME) already inventories them: such roots and included paths are
+ * dropped instead of being collected twice.
+ */
+function withoutRepositoryOverlap(
+	roots: readonly AdditionalContextRoot[],
+	repositoryRoot: string,
+): readonly AdditionalContextRoot[] {
+	return roots.flatMap((root): readonly AdditionalContextRoot[] => {
+		if (root.include === undefined)
+			return isPathWithin(repositoryRoot, root.absolutePath) ||
+				isPathWithin(root.absolutePath, repositoryRoot)
+				? []
+				: [root];
+		const include = root.include.filter(
+			(entry) =>
+				!isPathWithin(repositoryRoot, resolve(root.absolutePath, entry.path)),
+		);
+		return include.length === 0 && root.include.length > 0
+			? []
+			: [{ ...root, include }];
+	});
 }
 
 /**

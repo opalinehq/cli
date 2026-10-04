@@ -348,6 +348,25 @@ describe("user-level context roots", () => {
 		expect(bundle.manifest.coverage.errors).toEqual([]);
 	});
 
+	test("a repository at $HOME keeps its own inventory and skips overlapping user roots", async () => {
+		const home = await createHome();
+		await mkdir(join(home, ".claude/skills/demo"), { recursive: true });
+		await writeFile(join(home, ".claude/CLAUDE.md"), "User instructions\n");
+		await writeFile(join(home, ".claude/skills/demo/SKILL.md"), "Skill\n");
+		execFileSync("git", ["init", "-q"], { cwd: home });
+		const bundle = await collectWithUserContext(
+			home,
+			{ home, codexHome: join(home, ".codex") },
+			[],
+		);
+		const rootIds = bundle.manifest.roots.map((root) => root.id);
+		expect(rootIds).not.toContain("claude-user-skills");
+		expect(rootIds).not.toContain("claude-user-home");
+		expect(readCaptured(bundle, "repository", ".claude/CLAUDE.md")).toBe(
+			"User instructions\n",
+		);
+	});
+
 	test("CODEX_HOME relocates Codex instructions, skills, plugins and configuration", () => {
 		expect(
 			getUserContextLocations({ CODEX_HOME: "/opt/codex-home" }, "/home/user"),
