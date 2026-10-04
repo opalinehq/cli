@@ -398,12 +398,14 @@ export async function collectFileSystemContext(
 			}
 		}
 	}
-	// Then the user-context pool in rank order (observed skills, then every
+	// Then the user-context pool in rank order (memory, observed skills, every
 	// other skill), from its own budget.
 	if (poolStores["user-context"] !== null) {
 		const ranked = files.flatMap((file) => {
 			if (processed.has(getFileKey(file.entry))) return [];
 			const rank = getSessionUserContextRank(
+				file.entry.rootId,
+				file.entry.path,
 				file.categories,
 				file.skillDirectory,
 				observedSkills,

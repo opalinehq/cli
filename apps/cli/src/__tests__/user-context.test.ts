@@ -20,8 +20,10 @@ import {
 	type LocalContextBundle,
 } from "../internal/local-context-source/index.js";
 import {
+	getClaudeProjectKey,
 	getUserContextLocations,
 	readUserAgentSources,
+	resolveClaudeProjectMemoryDirectory,
 	resolveUserContextRoots,
 	summarizeUserAgentSources,
 	type UserContextLocations,
@@ -176,6 +178,7 @@ describe("user-level context roots", () => {
 			"work/CLAUDE.md": "Work instructions, see @shared.md\n",
 			"work/shared.md": "Shared guidance\n",
 			"work/team/CLAUDE.local.md": "Personal parent instructions\n",
+			".claude/projects/elsewhere/memory/MEMORY.md": "Other project memory\n",
 			"outside-import.md": "Imported from home\n",
 			"codex/AGENTS.md": "Codex user instructions\n",
 			"codex/AGENTS.override.md": "Codex override\n",
@@ -295,6 +298,8 @@ describe("user-level context roots", () => {
 			"codex-plugins:mkt/plug/v2/skills/codex-skill/SKILL.md",
 		);
 		expect(paths).not.toContain("claude-user-home:ignored.md");
+		// Other projects' memory and session data are never read.
+		expect(paths.some((path) => path.includes("projects/"))).toBe(false);
 		expect(
 			bundle.manifest.contextIndex.skills.map((skill) => skill.name),
 		).toEqual(["codex-skill", "observed", "unused"]);
@@ -375,6 +380,123 @@ describe("user-level context roots", () => {
 		);
 	});
 
+	test("captures the session project's Claude auto-memory in full, index first, secret-filtered", async () => {
+		const home = await createHome();
+		const repository = join(home, "repo");
+		await mkdir(repository, { recursive: true });
+		await writeFile(join(repository, "AGENTS.md"), "Instructions\n");
+		execFileSync("git", ["init", "-q"], { cwd: repository });
+		const memory = join(
+			home,
+			".claude/projects",
+			getClaudeProjectKey(repository),
+			"memory",
+		);
+		const secret = `ghp_${"B".repeat(36)}`;
+		const files = {
+			"MEMORY.md": "# Memory Index\n- [Style](style.md) — house style\n",
+			"style.md": `${"Prefer named exports.\n".repeat(20)}Token ${secret}\n`,
+			"nested/topic.md": "Nested memory topic\n",
+		};
+		for (const [path, content] of Object.entries(files)) {
+			await mkdir(dirname(join(memory, path)), { recursive: true });
+			await writeFile(join(memory, path), content);
+		}
+		const locations = { home, codexHome: join(home, ".codex") };
+		const memoryDirectory = await resolveClaudeProjectMemoryDirectory(
+			locations,
+			[await realpath(repository)],
+			undefined,
+		);
+		expect(memoryDirectory).toBe(memory);
+		const bundle = await collectWithUserContext(
+			repository,
+			locations,
+			[],
+			memoryDirectory,
+		);
+		expect(readCaptured(bundle, "claude-project-memory", "MEMORY.md")).toBe(
+			files["MEMORY.md"],
+		);
+		expect(
+			readCaptured(bundle, "claude-project-memory", "nested/topic.md"),
+		).toBe(files["nested/topic.md"]);
+		const style = readCaptured(bundle, "claude-project-memory", "style.md");
+		expect(style).not.toContain(secret);
+		expect(style).toContain("Prefer named exports.");
+		const root = bundle.manifest.roots.find(
+			(candidate) => candidate.id === "claude-project-memory",
+		);
+		expect(root).toMatchObject({ origin: "user", status: "collected" });
+		for (const facet of bundle.manifest.contextIndex.facets)
+			expect(facet.coverage).toBe("complete");
+	});
+
+	test("finds auto-memory under the main worktree, then the repository, and honours autoMemoryDirectory", async () => {
+		const home = await createHome();
+		const main = join(home, "code", "main");
+		await mkdir(main, { recursive: true });
+		await writeFile(join(main, "README.md"), "main\n");
+		execFileSync("git", ["init", "-q"], { cwd: main });
+		execFileSync("git", ["add", "."], { cwd: main });
+		execFileSync(
+			"git",
+			[
+				"-c",
+				"user.name=Fixture",
+				"-c",
+				"user.email=fixture@example.com",
+				"commit",
+				"-qm",
+				"Fixture",
+			],
+			{ cwd: main },
+		);
+		const worktree = join(home, "work", "feature");
+		execFileSync("git", ["worktree", "add", "-q", worktree], { cwd: main });
+		const locations = { home, codexHome: join(home, ".codex") };
+		const projects = join(home, ".claude/projects");
+		const roots = [await realpath(main), await realpath(worktree)];
+		// Nothing exists yet: the main worktree's directory is reported (absent).
+		expect(
+			await resolveClaudeProjectMemoryDirectory(locations, roots, undefined),
+		).toBe(join(projects, getClaudeProjectKey(roots[0] ?? ""), "memory"));
+		// Only the worktree has memory: it is used.
+		const worktreeMemory = join(
+			projects,
+			getClaudeProjectKey(roots[1] ?? ""),
+			"memory",
+		);
+		await mkdir(worktreeMemory, { recursive: true });
+		expect(
+			await resolveClaudeProjectMemoryDirectory(locations, roots, undefined),
+		).toBe(worktreeMemory);
+		// The main worktree's memory wins once it exists, as in Claude Code.
+		const mainMemory = join(
+			projects,
+			getClaudeProjectKey(roots[0] ?? ""),
+			"memory",
+		);
+		await mkdir(mainMemory, { recursive: true });
+		expect(
+			await resolveClaudeProjectMemoryDirectory(locations, roots, undefined),
+		).toBe(mainMemory);
+		// The setting relocates memory inside $HOME; paths outside are ignored.
+		expect(
+			await resolveClaudeProjectMemoryDirectory(locations, roots, {
+				autoMemoryDirectory: "~/notes/memory",
+			}),
+		).toBe(join(home, "notes/memory"));
+		expect(
+			await resolveClaudeProjectMemoryDirectory(locations, roots, {
+				autoMemoryDirectory: "/etc/memory",
+			}),
+		).toBe(mainMemory);
+		expect(getClaudeProjectKey("/Users/me/conductor/athena.v2_x")).toBe(
+			"-Users-me-conductor-athena-v2-x",
+		);
+	});
+
 	test("CODEX_HOME relocates Codex instructions, skills, plugins and configuration", () => {
 		expect(
 			getUserContextLocations({ CODEX_HOME: "/opt/codex-home" }, "/home/user"),
@@ -390,11 +512,13 @@ async function collectWithUserContext(
 	repository: string,
 	locations: UserContextLocations,
 	observedSkillNames: readonly string[],
+	memoryDirectory: string | null = null,
 ): Promise<LocalContextBundle> {
 	const repositoryRoot = await realpath(repository);
 	const sources = await readUserAgentSources(locations, repositoryRoot);
 	const additionalRoots = await resolveUserContextRoots({
 		locations,
+		memoryDirectory,
 		repositoryRoot,
 		sources,
 	});

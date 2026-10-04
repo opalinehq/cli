@@ -1,5 +1,12 @@
 import { realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import {
+	basename,
+	dirname,
+	isAbsolute,
+	relative,
+	resolve,
+	sep,
+} from "node:path";
 import type { RepositoryEvidenceRemoteHint } from "../contracts/index.js";
 import {
 	SESSION_CONTEXT_MAX_BLOB_BYTES,
@@ -35,6 +42,7 @@ import {
 	canonicalizeUserContextLocations,
 	getUserContextLocations,
 	readUserAgentSources,
+	resolveClaudeProjectMemoryDirectory,
 	resolveUserContextRoots,
 	summarizeUserAgentSources,
 } from "./user-context.js";
@@ -171,8 +179,20 @@ export async function collectSessionRepositoryContext(input: {
 		locations,
 		context.repositoryRoot,
 	);
+	const memoryDirectory = await resolveClaudeProjectMemoryDirectory(
+		locations,
+		[
+			...new Set([
+				await resolveMainWorktreeRoot(context.repositoryRoot),
+				context.repositoryRoot,
+				await resolveCanonicalPath(input.repositoryPath),
+			]),
+		],
+		userSources.claudeSettings.value,
+	);
 	const additionalRoots = await resolveUserContextRoots({
 		locations,
+		memoryDirectory,
 		repositoryRoot: context.repositoryRoot,
 		sources: userSources,
 	});
@@ -385,6 +405,30 @@ function isPathWithin(parent: string, candidate: string): boolean {
 			!relativePath.startsWith(`..${sep}`) &&
 			!isAbsolute(relativePath))
 	);
+}
+
+/**
+ * The main worktree of a linked worktree (Claude Code keeps one auto-memory
+ * per repository, under the main worktree's path), else the repository root.
+ */
+async function resolveMainWorktreeRoot(
+	repositoryRoot: string,
+): Promise<string> {
+	const result = await exec("git", [
+		"-C",
+		repositoryRoot,
+		"rev-parse",
+		"--path-format=absolute",
+		"--git-common-dir",
+	]);
+	const commonDirectory = result.stdout.trim();
+	if (
+		result.exitCode !== 0 ||
+		!isAbsolute(commonDirectory) ||
+		basename(commonDirectory) !== ".git"
+	)
+		return repositoryRoot;
+	return resolveCanonicalPath(dirname(commonDirectory));
 }
 
 async function resolveGitRoot(path: string): Promise<string> {

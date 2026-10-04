@@ -7,6 +7,7 @@ import {
 	type ParsedSource,
 	summarizeUserAgentConfiguration,
 } from "../internal/local-context-source/agent-configuration.js";
+import { CLAUDE_PROJECT_MEMORY_ROOT_ID } from "../internal/local-context-source/capture-policy.js";
 import type {
 	AdditionalContextRoot,
 	ContextRootInclude,
@@ -28,6 +29,9 @@ const MAX_IMPORT_DEPTH = 5;
 const MAX_IMPORTED_FILES = 64;
 const MAX_INSTRUCTION_READ_BYTES = 2 * 1024 * 1024;
 const MAX_CONFIGURATION_READ_BYTES = 4 * 1024 * 1024;
+// Claude Code shortens project directory names longer than this and appends
+// a hash of the full path.
+const CLAUDE_PROJECT_KEY_MAX_LENGTH = 200;
 
 export interface UserContextLocations {
 	readonly home: string;
@@ -104,6 +108,8 @@ export async function resolveUserContextRoots(input: {
 	readonly locations: UserContextLocations;
 	readonly repositoryRoot: string;
 	readonly sources: UserAgentSources;
+	/** Claude auto-memory directory of the session's project, if known. */
+	readonly memoryDirectory?: string | null;
 }): Promise<readonly AdditionalContextRoot[]> {
 	const { home, codexHome } = input.locations;
 	const claudeDirectory = join(home, ".claude");
@@ -227,6 +233,14 @@ export async function resolveUserContextRoots(input: {
 			),
 		},
 	];
+	if (input.memoryDirectory)
+		roots.push({
+			absolutePath: input.memoryDirectory,
+			id: CLAUDE_PROJECT_MEMORY_ROOT_ID,
+			label: "Claude Code auto-memory of this project",
+			origin: "user",
+			scope: "custom",
+		});
 	if (homeIncludes.length > 0)
 		roots.push({
 			absolutePath: home,
@@ -237,6 +251,64 @@ export async function resolveUserContextRoots(input: {
 			include: uniqueIncludes(homeIncludes),
 		});
 	return withoutRepositoryOverlap(roots, input.repositoryRoot);
+}
+
+/**
+ * Claude Code's project directory name for a path: every character other
+ * than ASCII letters and digits becomes `-`.
+ */
+export function getClaudeProjectKey(path: string): string {
+	return path.replace(/[^a-zA-Z0-9]/gu, "-");
+}
+
+/**
+ * The auto-memory directory Claude Code uses for a project: the
+ * `autoMemoryDirectory` setting when it points inside $HOME, otherwise
+ * `~/.claude/projects/<project key>/memory` of the first candidate project
+ * root (the main worktree first, as Claude Code shares memory across
+ * worktrees) that has one. Returns the first candidate's directory when none
+ * exists yet, so a missing memory is recorded as absent.
+ */
+export async function resolveClaudeProjectMemoryDirectory(
+	locations: UserContextLocations,
+	projectRoots: readonly string[],
+	settings: unknown,
+): Promise<string | null> {
+	const configured = asRecord(settings)?.autoMemoryDirectory;
+	if (typeof configured === "string" && configured.trim().length > 0) {
+		const value = configured.trim();
+		const path = value.startsWith("~/")
+			? join(locations.home, value.slice(2))
+			: isAbsolute(value)
+				? resolve(value)
+				: null;
+		if (path !== null && isPathWithin(locations.home, path)) return path;
+	}
+	const projects = join(locations.home, ".claude", "projects");
+	const candidates: string[] = [];
+	for (const root of projectRoots) {
+		const key = getClaudeProjectKey(root);
+		if (key.length <= CLAUDE_PROJECT_KEY_MAX_LENGTH) {
+			candidates.push(join(projects, key, "memory"));
+			continue;
+		}
+		// Shortened keys end in a hash this CLI cannot compute: accept the one
+		// project directory with the shortened prefix.
+		const prefix = `${key.slice(0, CLAUDE_PROJECT_KEY_MAX_LENGTH)}-`;
+		const matches = (
+			await readdir(projects).catch(() => [] as string[])
+		).filter((name) => name.startsWith(prefix));
+		if (matches.length === 1 && matches[0] !== undefined)
+			candidates.push(join(projects, matches[0], "memory"));
+	}
+	for (const candidate of candidates)
+		if (
+			await stat(candidate)
+				.then((details) => details.isDirectory())
+				.catch(() => false)
+		)
+			return candidate;
+	return candidates[0] ?? null;
 }
 
 /**

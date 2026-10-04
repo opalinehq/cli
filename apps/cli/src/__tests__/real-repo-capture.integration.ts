@@ -207,9 +207,10 @@ describe("real repository sidecar capture", () => {
 						),
 				).toBe(true);
 				// Every captured file outside the repository (user and parent
-				// instructions and their imports, every skill definition), and
-				// every repository skill definition and personal instruction file,
-				// is stored byte for byte as on disk after the secret filter.
+				// instructions and their imports, every skill definition, the
+				// project's auto-memory),
+				// and every repository skill definition and personal instruction
+				// file, is stored byte for byte as on disk after the secret filter.
 				const userFiles: string[] = [];
 				const fullContent = (entry: (typeof localContext.entries)[number]) =>
 					entry.rootId !== "repository" ||
@@ -247,11 +248,13 @@ describe("real repository sidecar capture", () => {
 						`${entry.rootId}:${entry.path} (${onDisk.byteLength} B, sha256 ${redacted ? "match after secret filter" : "match"})`,
 					);
 				}
-				// Every skill definition, observed or not, has its content.
+				// Every skill definition (observed or not) and memory file has its
+				// content.
 				const contextFiles = localContext.entries.filter(
 					(entry) =>
 						entry.kind === "file" &&
-						entry.categories?.includes("skill-definition"),
+						(entry.categories?.includes("skill-definition") ||
+							entry.rootId === "claude-project-memory"),
 				);
 				expect(
 					contextFiles
@@ -265,6 +268,9 @@ describe("real repository sidecar capture", () => {
 					skillDefinitions: countContext(
 						(entry) => entry.categories?.includes("skill-definition") ?? false,
 					),
+					memoryFiles: countContext(
+						(entry) => entry.rootId === "claude-project-memory",
+					),
 					personalInstructions: localContext.entries.filter(
 						(entry) =>
 							entry.kind === "file" &&
@@ -272,6 +278,11 @@ describe("real repository sidecar capture", () => {
 							entry.content?.status === "available",
 					).length,
 				};
+				const memoryRoot = localContext.roots.find(
+					(root) => root.id === "claude-project-memory",
+				);
+				if (memoryRoot?.status === "collected")
+					expect(contextCounts.memoryFiles).toBeGreaterThan(0);
 				// The protocol's object and aggregate limits hold with every skill.
 				const aggregateBytes = capture.input.objects.reduce(
 					(total, object) => total + object.byteLength,
@@ -348,6 +359,9 @@ describe("real repository sidecar capture", () => {
 					objects: capture.input.objects.length,
 					aggregateBytes,
 					contextCounts,
+					memoryRoot: memoryRoot
+						? `${memoryRoot.status}: ${memoryRoot.absolutePath}`
+						: null,
 					entries: localContext.entries.length,
 					instructions: instructionResults,
 					userFiles,

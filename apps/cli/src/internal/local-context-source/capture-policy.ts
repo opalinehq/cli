@@ -17,11 +17,14 @@ export const SESSION_INSTRUCTION_MAX_FILES = 512;
 export const SESSION_INSTRUCTION_MAX_IMPORT_DEPTH = 5;
 // Working-tree and staged patches have their own pool as well.
 export const SESSION_DIFF_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
-// User context: every skill definition, observed ones first. Filled after the
-// instruction pool and never shares its budget.
+// User context: every skill definition (observed first) and the session
+// project's Claude auto-memory. Filled after the instruction pool and never
+// shares its budget.
 export const SESSION_USER_CONTEXT_MAX_FILE_BYTES = 2 * 1024 * 1024;
 export const SESSION_USER_CONTEXT_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
 export const SESSION_USER_CONTEXT_MAX_FILES = 1024;
+
+export const CLAUDE_PROJECT_MEMORY_ROOT_ID = "claude-project-memory";
 
 export const INSTRUCTION_IMPORT_EVIDENCE_REASON = "instruction-import";
 // Explicitly included files of user-level roots (see ContextRootInclude).
@@ -103,15 +106,20 @@ export function getInstructionRank(
 
 /**
  * Rank in the user-context pool (lower first), or null for content that does
- * not belong to it: observed skill definitions, then every other skill
- * definition, then the resources of observed skills.
+ * not belong to it: the auto-memory index, then memory files, then observed
+ * skill definitions, then every other skill definition, then the resources of
+ * observed skills.
  * Resources of other skills stay hash-only.
  */
 export function getSessionUserContextRank(
+	rootId: string,
+	path: string,
 	categories: readonly ContextFileCategory[],
 	skillDirectory: string | null,
 	observedSkillNames: ReadonlySet<string>,
 ): number | null {
+	if (rootId === CLAUDE_PROJECT_MEMORY_ROOT_ID)
+		return path.toLowerCase() === "memory.md" ? 0 : 1;
 	const observed =
 		skillDirectory !== null && observedSkillNames.has(basename(skillDirectory));
 	if (categories.includes("skill-definition")) return observed ? 3 : 4;
