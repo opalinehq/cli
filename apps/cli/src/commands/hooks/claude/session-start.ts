@@ -6,7 +6,7 @@ import {
 	claudeCodeAdapter,
 	type FileBackedUploadRequest,
 } from "../../../internal/agent-adapters/index.js";
-import { findHookAnalysisMarker } from "../../../lib/analysis-hook.js";
+import { findHookAnalysisMarkers } from "../../../lib/analysis-hook.js";
 import { isRepositoryAutoUploadAllowed } from "../../../lib/auto-upload-config.js";
 import { loadCredentials } from "../../../lib/credentials.js";
 import { getGitInfo } from "../../../lib/git-info.js";
@@ -46,11 +46,13 @@ async function runSessionStart(): Promise<undefined> {
 		// session) captures no repository evidence while the link is live, as
 		// in the SessionEnd and Codex turn-complete hooks.
 		if (
-			await findHookAnalysisMarker(
-				logger,
-				claudeCodeAdapter.source,
-				input.session_id,
-			)
+			(
+				await findHookAnalysisMarkers(
+					logger,
+					claudeCodeAdapter.source,
+					input.session_id,
+				)
+			).length > 0
 		) {
 			logger.info(
 				"Skipping start context for session {sessionId}: linked to an analysis",

@@ -8,7 +8,7 @@ import {
 	type SessionFile,
 } from "../../../internal/agent-adapters/index.js";
 import {
-	findHookAnalysisMarker,
+	findHookAnalysisMarkers,
 	runMarkedAnalysisHook,
 } from "../../../lib/analysis-hook.js";
 import { getApiBaseOverride } from "../../../lib/api-target.js";
@@ -76,15 +76,12 @@ async function runTurnComplete(
 		const hookReceivedAt = new Date().toISOString();
 		// A chat linked by `opaline import --analysis` uploads after every turn,
 		// whatever the folder's auto-upload setting, so the answer is included.
-		const marker = await findHookAnalysisMarker(
+		const markers = await findHookAnalysisMarkers(
 			logger,
 			codexAdapter.source,
 			input.threadId,
 		);
-		if (
-			marker &&
-			(await runMarkedAnalysisHook(logger, marker, undefined)) === "handled"
-		)
+		if ((await runMarkedAnalysisHook(logger, markers, undefined)) === "handled")
 			return;
 		const gitInfo = await getGitInfo(input.cwd);
 		const repository = resolveUploadRepositoryIdentity(input.cwd, gitInfo);

@@ -127,7 +127,7 @@ export async function batchUpload<T extends BatchUploadItem>(
 					succeeded++;
 					redacted = mergeRedactionCounts(redacted, result.redacted ?? {});
 					redactedBytes += result.redactedBytes ?? 0;
-					await removeFailedUpload(item.sessionId);
+					await removeFailedUpload(item.sessionId, item.analysisId);
 				} else if (result.pendingJobId !== undefined) {
 					pending++;
 					await recordPendingUpload({

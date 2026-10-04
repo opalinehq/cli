@@ -138,9 +138,7 @@ export async function recordFailedUpload(
 ): Promise<void> {
 	await enqueueMutation(async () => {
 		const failures = await loadFailedUploads();
-		const existing = failures.findIndex(
-			(f) => f.sessionId === failure.sessionId,
-		);
+		const existing = failures.findIndex((f) => isSameUpload(f, failure));
 		const entry: FailedUpload = {
 			...failure,
 			failedAt: new Date().toISOString(),
@@ -168,9 +166,7 @@ export async function recordPendingUpload(
 			failedAt: new Date().toISOString(),
 			status: "pending",
 		};
-		const existing = failures.findIndex(
-			(f) => f.sessionId === pending.sessionId,
-		);
+		const existing = failures.findIndex((f) => isSameUpload(f, pending));
 		if (existing >= 0) failures[existing] = entry;
 		else failures.push(entry);
 		await saveFailedUploads(failures);
@@ -213,14 +209,36 @@ export async function settlePendingUpload(
 	});
 }
 
-export async function removeFailedUpload(sessionId: string): Promise<void> {
+/**
+ * Clear the entry of one upload: the session without an analysis link, or
+ * the session's upload for one analysis. Other analyses keep their entries.
+ */
+export async function removeFailedUpload(
+	sessionId: string,
+	analysisId?: string,
+): Promise<void> {
 	await enqueueMutation(async () => {
 		const failures = await loadFailedUploads();
-		const filtered = failures.filter((f) => f.sessionId !== sessionId);
+		const filtered = failures.filter(
+			(f) => !isSameUpload(f, { analysisId, sessionId }),
+		);
 		if (filtered.length !== failures.length) {
 			await saveFailedUploads(filtered);
 		}
 	});
+}
+
+/**
+ * One entry per session and analysis link: uploads of a chat linked to
+ * several analyses are tracked (pending, failed, retried) separately.
+ */
+function isSameUpload(
+	left: Pick<FailedUpload, "analysisId" | "sessionId">,
+	right: Pick<FailedUpload, "analysisId" | "sessionId">,
+): boolean {
+	return (
+		left.sessionId === right.sessionId && left.analysisId === right.analysisId
+	);
 }
 
 async function enqueueMutation(operation: () => Promise<void>): Promise<void> {

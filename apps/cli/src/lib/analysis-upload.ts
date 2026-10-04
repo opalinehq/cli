@@ -407,7 +407,7 @@ async function recordOutcome(
 		uploadBytes: result.uploadBytes,
 	};
 	if (result.success) {
-		await removeFailedUpload(target.sessionId);
+		await removeFailedUpload(target.sessionId, analysisId);
 		return {
 			target,
 			status: "uploaded",

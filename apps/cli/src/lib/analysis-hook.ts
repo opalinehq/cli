@@ -1,7 +1,7 @@
 import type { Logger } from "@logtape/logtape";
 import {
 	type AnalysisMarker,
-	findAnalysisMarker,
+	findAnalysisMarkers,
 	removeAnalysisMarker,
 } from "./analysis-markers.js";
 import {
@@ -21,36 +21,50 @@ import {
 import { allowsInsecureEndpointFromEnv } from "./upload-endpoint.js";
 
 /**
- * Find a live analysis marker for the hook's session. Marker lookup failures
- * never stop the regular hook path.
+ * Find the live analysis markers for the hook's session, one per analysis.
+ * Marker lookup failures never stop the regular hook path.
  */
-export async function findHookAnalysisMarker(
+export async function findHookAnalysisMarkers(
 	logger: Logger,
 	source: AnalysisMarker["source"],
 	sessionId: string,
-): Promise<AnalysisMarker | null> {
+): Promise<AnalysisMarker[]> {
 	try {
-		return await findAnalysisMarker(source, sessionId);
+		return await findAnalysisMarkers(source, sessionId);
 	} catch (error) {
 		logger.warn("Could not read analysis markers: {error}", {
 			error: error instanceof Error ? error.message : String(error),
 		});
-		return null;
+		return [];
 	}
 }
 
 /**
  * Upload a chat marked by `opaline import --analysis` after the agent's turn
- * ended, so the final answer is included. Runs instead of the regular hook
- * upload: it bypasses the auto-upload setting (the user asked for this chat),
- * sends no organization and captures no repository evidence.
+ * ended, so the final answer is included, once per analysis it belongs to.
+ * Runs instead of the regular hook upload: it bypasses the auto-upload
+ * setting (the user asked for this chat), sends no organization and captures
+ * no repository evidence.
  *
  * Content only goes to the endpoint and account the import approved, after the
  * server confirms (now or from the positive cache) that it links analyses.
- * Returns `released` when the marker no longer applies and was removed, so
+ * Returns `released` when no marker applies any more (each was removed), so
  * the caller continues with the regular hook path.
  */
 export async function runMarkedAnalysisHook(
+	logger: Logger,
+	markers: readonly AnalysisMarker[],
+	hookTarget: AnalysisUploadTarget | undefined,
+): Promise<"handled" | "released"> {
+	let result: "handled" | "released" = "released";
+	for (const marker of markers) {
+		if ((await runMarker(logger, marker, hookTarget)) === "handled")
+			result = "handled";
+	}
+	return result;
+}
+
+async function runMarker(
 	logger: Logger,
 	marker: AnalysisMarker,
 	hookTarget: AnalysisUploadTarget | undefined,

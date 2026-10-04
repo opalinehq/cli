@@ -293,6 +293,100 @@ describe("opaline import --analysis", () => {
 		);
 	});
 
+	test("a subagent the chat spawns after linking is uploaded by the next turn hook", async () => {
+		const api = startApiStub();
+		const fixture = await createFixture(api.baseUrl);
+		const chat = await writeConversation(fixture);
+		// The analysis ran in a subagent: `$CODEX_THREAD_ID` is the child.
+		expect(
+			(await cli(fixture, ["import", chat.child, "--analysis", "analysis-a"]))
+				.exitCode,
+		).toBe(0);
+		const ingestsAfterImport = api.ingests.length;
+
+		// A follow-up turn of the parent chat spawns another subagent.
+		const later = codexThreadId(Date.now() - 60_000);
+		const laterPath = await writeCodexRollout(fixture.codexHome, {
+			cwd: fixture.chatPath,
+			spawnedBy: chat.root,
+			threadId: later,
+			userText: "Check the follow-up question.",
+		});
+		const skippedChildTurn = await turnComplete(fixture, later);
+		await appendCodexAssistantMessage(chat.rootPath, "Follow-up answer.");
+		const parentTurn = await turnComplete(fixture, chat.root);
+
+		expect(skippedChildTurn.exitCode).toBe(0);
+		expect(parentTurn.exitCode).toBe(0);
+		expect(parentTurn.stderr).toBe("");
+		const afterTurn = api.ingests.slice(ingestsAfterImport);
+		expect(afterTurn.map((input) => input.sessionId).sort()).toEqual(
+			[chat.root, later].sort(),
+		);
+		for (const input of afterTurn) expect(input.analysisId).toBe("analysis-a");
+		expect(await readMarkers(fixture)).toMatchObject({
+			markers: [
+				{
+					memberIds: expect.arrayContaining([chat.child, chat.root, later]),
+					sessionId: chat.child,
+				},
+			],
+		});
+
+		// The new subagent is now a member, so its own turns upload too.
+		await appendCodexAssistantMessage(laterPath, "Subagent result.");
+		const childTurn = await turnComplete(fixture, later);
+		expect(childTurn.exitCode).toBe(0);
+		expect(api.ingests.slice(ingestsAfterImport + 2)).toMatchObject([
+			{ analysisId: "analysis-a", sessionId: later },
+		]);
+	});
+
+	test("importing a linked chat for a second analysis links it to both", async () => {
+		const api = startApiStub();
+		const fixture = await createFixture(api.baseUrl);
+		const chat = await writeConversation(fixture);
+		expect(
+			(await cli(fixture, ["import", chat.root, "--analysis", "analysis-a"]))
+				.exitCode,
+		).toBe(0);
+		const ingestsAfterFirst = api.ingests.length;
+
+		const second = await cli(fixture, [
+			"import",
+			chat.root,
+			"--analysis",
+			"analysis-b",
+		]);
+
+		expect(second.exitCode).toBe(0);
+		const secondIngests = api.ingests.slice(ingestsAfterFirst);
+		expect(secondIngests.map((input) => input.sessionId).sort()).toEqual(
+			[chat.child, chat.root].sort(),
+		);
+		for (const input of secondIngests)
+			expect(input.analysisId).toBe("analysis-b");
+		expect(await readMarkers(fixture)).toMatchObject({
+			markers: [
+				{ analysisId: "analysis-a", sessionId: chat.root },
+				{ analysisId: "analysis-b", sessionId: chat.root },
+			],
+		});
+
+		await appendCodexAssistantMessage(chat.rootPath, "Answer for both.");
+		const ingestsBeforeTurn = api.ingests.length;
+		const hook = await turnComplete(fixture, chat.root);
+
+		expect(hook.exitCode).toBe(0);
+		expect(hook.stderr).toBe("");
+		const afterTurn = api.ingests.slice(ingestsBeforeTurn);
+		expect(
+			afterTurn.map((input) => `${input.sessionId}:${input.analysisId}`).sort(),
+		).toEqual([`${chat.root}:analysis-a`, `${chat.root}:analysis-b`].sort());
+		for (const input of afterTurn)
+			expect(String(input.content)).toContain("Answer for both.");
+	});
+
 	test("unmarked desktop chats stay skipped and expired markers stop uploads", async () => {
 		const api = startApiStub();
 		const fixture = await createFixture(api.baseUrl);

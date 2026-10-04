@@ -25,7 +25,7 @@ async function createCodexHome(): Promise<string> {
 }
 
 describe("Codex thread family", () => {
-	test("resolves the parent chain and spawned subagents, not reviewers or strangers", async () => {
+	test("resolves the parent chain and every subagent of the chat, not reviewers or strangers", async () => {
 		const codexHome = await createCodexHome();
 		const base = Date.parse("2026-10-04T09:21:11.000Z");
 		const root = codexThreadId(base);
@@ -54,7 +54,9 @@ describe("Codex thread family", () => {
 
 		expect(family?.self.threadId).toBe(child);
 		expect(family?.ancestors.map((thread) => thread.threadId)).toEqual([root]);
+		// The sibling was spawned by the parent: it is part of the same chat.
 		expect(family?.descendants.map((thread) => thread.threadId)).toEqual([
+			sibling,
 			grandchild,
 		]);
 	});
@@ -78,6 +80,31 @@ describe("Codex thread family", () => {
 		expect(family?.ancestors).toEqual([]);
 		expect(family?.descendants.map((thread) => thread.threadId)).toEqual([
 			lateChild,
+		]);
+	});
+
+	test("a resumed chat's subagents spawned weeks after the root are found", async () => {
+		const codexHome = await createCodexHome();
+		const rootStarted = Date.parse("2026-09-20T12:00:00.000Z");
+		const resumedAt = Date.parse("2026-10-04T12:00:00.000Z");
+		const root = codexThreadId(rootStarted);
+		const child = codexThreadId(rootStarted + 60_000);
+		const grandchild = codexThreadId(resumedAt);
+		await writeCodexRollout(codexHome, { threadId: root });
+		await writeCodexRollout(codexHome, { threadId: child, spawnedBy: root });
+		await writeCodexRollout(codexHome, {
+			threadId: grandchild,
+			spawnedBy: child,
+		});
+
+		const family = await resolveCodexThreadFamily(child, {
+			codexHome,
+			now: new Date(resumedAt + 3_600_000),
+		});
+
+		expect(family?.ancestors.map((thread) => thread.threadId)).toEqual([root]);
+		expect(family?.descendants.map((thread) => thread.threadId)).toEqual([
+			grandchild,
 		]);
 	});
 
