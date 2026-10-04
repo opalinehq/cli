@@ -305,7 +305,7 @@ describe("sidecar delivery under faults", () => {
 		}
 	}, 150_000);
 
-	test("an older pending checkpoint never blocks a newer one and is superseded by it", async () => {
+	test("older pending checkpoints never block a newer one and are retired only after an accepted capture dominates them", async () => {
 		let failing = true;
 		const stub = startEvidenceProtocolStub({
 			init: () => (failing ? { status: 400 } : undefined),
@@ -319,19 +319,23 @@ describe("sidecar delivery under faults", () => {
 				expect(
 					(await runHook(workspace, "codex", "alpha", "turns")).exitCode,
 				).toBe(0);
-			// Every hook captured and attempted its own capture.
+			// Every hook captured and attempted its own capture. Nothing was
+			// accepted, so no checkpoint was retired.
 			expect(stub.counts.init).toBe(4);
 			const pending = await readPendingRepositoryEvidence(workspace.configDir);
 			expect(
 				pending
 					.map((item) => item.upload.input.capture.timing.lifecycle)
 					.sort(),
-			).toEqual(["checkpoint", "start"]);
+			).toEqual(["checkpoint", "checkpoint", "checkpoint", "start"]);
 			failing = false;
 			expect(
 				(await runDeliverer(workspace, Date.now() + 5 * 60_000)).exitCode,
 			).toBe(0);
-			expect(stub.committed.size).toBe(2);
+			// Each checkpoint is delivered, or retired because an accepted one
+			// contains its transcript and context.
+			expect(stub.committed.size).toBeGreaterThanOrEqual(2);
+			expect(await countPending(workspace)).toBe(0);
 			await expectNothingDropped(workspace, stub);
 		} finally {
 			stub.stop();
@@ -1064,16 +1068,15 @@ async function expectNothingDropped(
 		} else if (record.state === "spooled") {
 			expect(pendingIds.has(record.captureId)).toBe(true);
 		} else {
-			// Superseded: only a checkpoint, and only by a newer capture of the
-			// same repository that is delivered or still spooled.
+			// Superseded: only a checkpoint, and only by a capture of the same
+			// repository the server accepted.
 			expect(record.lifecycle).toBe("checkpoint");
 			expect(
 				records.some(
-					(newer) =>
-						newer.repository === record.repository &&
-						newer.state !== "abandoned" &&
-						newer.capturedAt >= record.capturedAt &&
-						(newer.lifecycle === "checkpoint" || newer.lifecycle === "end"),
+					(other) =>
+						other.repository === record.repository &&
+						other.state === "accepted" &&
+						(other.lifecycle === "checkpoint" || other.lifecycle === "end"),
 				),
 			).toBe(true);
 		}

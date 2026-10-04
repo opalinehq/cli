@@ -286,18 +286,6 @@ export async function captureAndUploadSessionEvidence(input: {
 		// killed hook and is delivered by a later hook or the background process.
 		await writePendingRepositoryEvidence(currentPending, configDir);
 		hasPending = true;
-		try {
-			await supersedePendingRepositoryEvidence(
-				currentPending,
-				configDir,
-				(warning) => input.onWarning?.(warning.message),
-			);
-		} catch (error) {
-			// Superseding is housekeeping; the new capture is already spooled.
-			input.onWarning?.(
-				`Could not supersede older pending captures: ${getErrorMessage(error)}`,
-			);
-		}
 		// Elapsed hook time on the real wall clock (hookReceivedAt comes from a
 		// Date object); the deadline itself is kept on Date.now() like every
 		// other delivery deadline.
@@ -643,6 +631,18 @@ async function deliverPendingRepositoryEvidence(
 			getPendingDeliveryScope(pending),
 			configDir,
 		);
+		// Only now, with this capture accepted (and its transcript source still
+		// on disk for the prefix check), may older checkpoints it dominates be
+		// retired.
+		try {
+			await supersedePendingRepositoryEvidence(pending, configDir, (warning) =>
+				options.onWarning?.(warning.message),
+			);
+		} catch (error) {
+			options.onWarning?.(
+				`Could not supersede older pending captures: ${getErrorMessage(error)}`,
+			);
+		}
 		await continueAcceptedTranscript(pending, configDir);
 		return { status: "delivered", receipt };
 	} catch (error) {

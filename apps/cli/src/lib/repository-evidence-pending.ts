@@ -299,25 +299,126 @@ export function getRepositoryEvidenceLeaseDirectory(configDir: string): string {
 }
 
 /**
- * A newer checkpoint or end capture of a session covers the transcript of
- * every older pending checkpoint of the same session, so those are removed
- * instead of queueing behind it. Start captures and items another process is
- * delivering right now are kept.
+ * Whether an accepted capture makes a pending checkpoint redundant. Completion
+ * time proves nothing (captures can finish out of order), so both must hold:
+ * - the same context snapshot: the same Git commits, and every repository,
+ *   instruction and patch object of the checkpoint is part of the accepted
+ *   capture (a different snapshot stays its own pending item);
+ * - prefix domination: the checkpoint's whole transcript source (or, without
+ *   one, its delivered watermark) is a byte prefix of the accepted capture's
+ *   transcript source.
+ * A source that cannot be read proves nothing, so the checkpoint is kept.
+ */
+export async function isPendingCaptureDominated(
+	accepted: PendingRepositoryEvidence,
+	pending: PendingRepositoryEvidence,
+	configDir: string,
+): Promise<boolean> {
+	const acceptedCapture = accepted.upload.input.capture;
+	const pendingCapture = pending.upload.input.capture;
+	if (
+		acceptedCapture.baseGitCommit !== pendingCapture.baseGitCommit ||
+		acceptedCapture.headGitCommit !== pendingCapture.headGitCommit
+	)
+		return false;
+	const contextObjects = (item: PendingRepositoryEvidence) =>
+		item.upload.input.objects
+			.filter(
+				(object) => object.kind === "source-blob" || object.kind === "git-diff",
+			)
+			.map((object) => object.objectId);
+	const acceptedObjects = new Set(contextObjects(accepted));
+	if (
+		!contextObjects(pending).every((objectId) => acceptedObjects.has(objectId))
+	)
+		return false;
+	if (!accepted.continuation) return false;
+	const acceptedSource = transcriptSourceFile(
+		configDir,
+		accepted.continuation.sourceId,
+	);
+	let pendingPrefix: { readonly bytes: number; readonly sha256: string };
+	if (pending.continuation) {
+		const source = transcriptSourceFile(
+			configDir,
+			pending.continuation.sourceId,
+		);
+		const size = await stat(source).then(
+			(details) => details.size,
+			() => null,
+		);
+		if (size === null) return false;
+		const sha256 = await hashFilePrefix(source, size);
+		if (sha256 === null) return false;
+		pendingPrefix = { bytes: size, sha256 };
+	} else {
+		pendingPrefix = {
+			bytes: pending.transcriptRevision.watermark.byteOffset,
+			sha256: pending.transcriptRevision.watermark.prefixSha256,
+		};
+	}
+	return (
+		(await hashFilePrefix(acceptedSource, pendingPrefix.bytes)) ===
+		pendingPrefix.sha256
+	);
+}
+
+function transcriptSourceFile(configDir: string, sourceId: string): string {
+	return join(configDir, "repository-evidence-sources", `${sourceId}.jsonl`);
+}
+
+/** SHA-256 of the first `bytes` bytes, or null when the file is shorter or unreadable. */
+async function hashFilePrefix(
+	path: string,
+	bytes: number,
+): Promise<string | null> {
+	let handle: Awaited<ReturnType<typeof open>>;
+	try {
+		handle = await open(path, "r");
+	} catch {
+		return null;
+	}
+	try {
+		const hash = createHash("sha256");
+		const window = Buffer.alloc(1024 * 1024);
+		for (let offset = 0; offset < bytes; ) {
+			const { bytesRead } = await handle.read(
+				window,
+				0,
+				Math.min(window.length, bytes - offset),
+				offset,
+			);
+			if (bytesRead === 0) return null;
+			hash.update(window.subarray(0, bytesRead));
+			offset += bytesRead;
+		}
+		return hash.digest("hex");
+	} catch {
+		return null;
+	} finally {
+		await handle.close();
+	}
+}
+
+/**
+ * After a checkpoint or end capture of a session is accepted by the server,
+ * older pending checkpoints it dominates (isPendingCaptureDominated) are
+ * retired with their transcript sources. Pending captures with a different
+ * context snapshot or transcript, start captures and items another process is
+ * delivering right now are kept. Call only with an accepted capture.
  */
 export async function supersedePendingRepositoryEvidence(
-	current: PendingRepositoryEvidence,
+	accepted: PendingRepositoryEvidence,
 	configDir: string,
 	onWarning: ((warning: Error) => void) | undefined = undefined,
 ): Promise<number> {
+	const current = accepted;
 	const currentInput = current.upload.input;
 	if (
 		currentInput.capture.timing.lifecycle !== "checkpoint" &&
 		currentInput.capture.timing.lifecycle !== "end"
 	)
 		return 0;
-	const completedAt = Date.parse(
-		currentInput.capture.timing.captureCompletedAt,
-	);
 	const older = await readPendingRepositoryEvidence(configDir, {
 		actorId: current.transcriptRevision.scope.actorId,
 		endpoint: current.endpoint,
@@ -326,15 +427,15 @@ export async function supersedePendingRepositoryEvidence(
 			pending.upload.input.operationId !== currentInput.operationId &&
 			pending.upload.input.organizationId === currentInput.organizationId &&
 			pending.upload.input.session.source === currentInput.session.source &&
-			pending.upload.input.capture.timing.lifecycle === "checkpoint" &&
-			Date.parse(pending.upload.input.capture.timing.captureCompletedAt) <=
-				completedAt,
+			pending.upload.input.capture.timing.lifecycle === "checkpoint",
 		onError: (error) =>
 			onWarning?.(error instanceof Error ? error : new Error(String(error))),
 		onWarning,
 	});
 	let removed = 0;
 	for (const pending of older) {
+		if (!(await isPendingCaptureDominated(current, pending, configDir)))
+			continue;
 		const lease = await acquirePendingRepositoryEvidenceLease(
 			pending,
 			configDir,

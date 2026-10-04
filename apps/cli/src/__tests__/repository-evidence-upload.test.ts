@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { ok as assert } from "node:assert";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
 	mkdir,
 	mkdtemp,
@@ -44,6 +45,7 @@ import {
 	hasDuePendingRepositoryEvidence,
 	readPendingRepositoryEvidence,
 	removePendingRepositoryEvidence,
+	supersedePendingRepositoryEvidence,
 	writePendingRepositoryEvidence,
 } from "../lib/repository-evidence-pending.js";
 import {
@@ -70,6 +72,127 @@ const scope: TranscriptRevisionScope = {
 	providerInstanceId: "local-codex",
 	sessionId: "session-1",
 };
+
+describe("superseding pending checkpoints after an accepted capture", () => {
+	const line = (index: number) =>
+		`${JSON.stringify({ ordinal: index, text: "x".repeat(80) })}\n`;
+	const transcript = (records: number) =>
+		Array.from({ length: records }, (_, index) => line(index)).join("");
+
+	async function spool(
+		configDir: string,
+		content: string,
+		bundle: LocalContextBundle = makeBundle(),
+	) {
+		const plan = await planTranscriptRevision({
+			content: new TextEncoder().encode(content),
+			previous: undefined,
+			scope,
+			terminal: false,
+		});
+		const sourceId = await persistTranscriptSource(content, configDir);
+		const pending = {
+			continuation: { sourceId, terminal: false },
+			endpoint: "https://opaline.so/rpc",
+			transcriptRevision: plan.manifest,
+			upload: buildUploadFor(bundle, plan, content),
+		};
+		await writePendingRepositoryEvidence(pending, configDir);
+		return pending;
+	}
+
+	async function remaining(configDir: string) {
+		return (await readPendingRepositoryEvidence(configDir)).map(
+			(item) => item.upload.input.operationId,
+		);
+	}
+
+	test("keeps a longer pending checkpoint when a shorter capture is accepted later", async () => {
+		const configDir = await mkdtemp(join(tmpdir(), "opaline-supersede-"));
+		try {
+			const longer = await spool(configDir, transcript(3));
+			const shorter = await spool(configDir, transcript(1));
+			expect(Buffer.byteLength(transcript(3))).toBeGreaterThan(
+				Buffer.byteLength(transcript(1)),
+			);
+
+			expect(await supersedePendingRepositoryEvidence(shorter, configDir)).toBe(
+				0,
+			);
+			expect(await remaining(configDir)).toContain(
+				longer.upload.input.operationId,
+			);
+			expect(
+				await stat(
+					join(
+						configDir,
+						"repository-evidence-sources",
+						`${longer.continuation.sourceId}.jsonl`,
+					),
+				),
+			).toBeDefined();
+		} finally {
+			await rm(configDir, { force: true, recursive: true });
+		}
+	});
+
+	test("retires a pending checkpoint whose transcript is a prefix of the accepted one", async () => {
+		const configDir = await mkdtemp(join(tmpdir(), "opaline-supersede-"));
+		try {
+			const older = await spool(configDir, transcript(1));
+			const accepted = await spool(configDir, transcript(3));
+
+			expect(
+				await supersedePendingRepositoryEvidence(accepted, configDir),
+			).toBe(1);
+			expect(await remaining(configDir)).not.toContain(
+				older.upload.input.operationId,
+			);
+		} finally {
+			await rm(configDir, { force: true, recursive: true });
+		}
+	});
+
+	test("keeps a pending checkpoint with a different transcript or context snapshot", async () => {
+		const configDir = await mkdtemp(join(tmpdir(), "opaline-supersede-"));
+		try {
+			const diverged = await spool(
+				configDir,
+				`${JSON.stringify({ ordinal: 0, text: "other" })}\n`,
+			);
+			const otherContext = await spool(
+				configDir,
+				transcript(1),
+				// Another instruction snapshot: one more context object.
+				{
+					...makeBundle(),
+					blobs: [
+						{
+							algorithm: "sha256",
+							byteLength: 18,
+							content: "Other instructions",
+							encoding: "utf-8",
+							id: `sha256:${createHash("sha256").update("Other instructions").digest("hex")}`,
+						},
+					],
+				},
+			);
+			const accepted = await spool(configDir, transcript(3));
+
+			expect(
+				await supersedePendingRepositoryEvidence(accepted, configDir),
+			).toBe(0);
+			expect(await remaining(configDir)).toEqual(
+				expect.arrayContaining([
+					diverged.upload.input.operationId,
+					otherContext.upload.input.operationId,
+				]),
+			);
+		} finally {
+			await rm(configDir, { force: true, recursive: true });
+		}
+	});
+});
 
 describe("repository evidence delivery", () => {
 	test.each([
