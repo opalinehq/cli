@@ -58,6 +58,8 @@ export interface UploadResult {
 	analysisLinkMissing?: boolean;
 	/** The server refused the analysis id (unknown, not visible, log off). */
 	analysisRejected?: boolean;
+	/** The server needs a workspace choice (`opaline set-org` or --org). */
+	needsOrganization?: boolean;
 }
 
 export const DEFAULT_ENDPOINT = `${PRODUCTION_API_BASE}/rpc`;

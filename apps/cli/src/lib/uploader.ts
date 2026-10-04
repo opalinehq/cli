@@ -514,6 +514,12 @@ async function uploadSessionMeasured(
 			}
 			const analysisRejection = getAnalysisInitRejection(request, error);
 			if (analysisRejection) return analysisRejection;
+			const organizationFailure = getOrganizationChoiceFailure(
+				error instanceof R2IngestInitError ? error.causeValue : error,
+				request,
+				1,
+			);
+			if (organizationFailure) return organizationFailure;
 			if (isR2InitUnsupported(error)) {
 				await forgetR2UploadCapability(endpointUrl, authType, config.token);
 			} else {
@@ -636,6 +642,12 @@ async function uploadSessionMeasured(
 				usageChecksum: response.usageChecksum,
 			};
 		} catch (error) {
+			const organizationFailure = getOrganizationChoiceFailure(
+				error,
+				request,
+				attempt,
+			);
+			if (organizationFailure) return organizationFailure;
 			if (
 				error instanceof ORPCError &&
 				error.status === 400 &&
@@ -887,6 +899,32 @@ function getAnalysisLinkFailure(
 // A rejected analysis id (404 not found or not visible, 412 analysis log off)
 // must reach the caller. Servers that link analyses always support R2 init, so
 // such an init 404 is never treated as "R2 unsupported" for these uploads.
+/**
+ * The server could not pick a workspace for an upload without one (the
+ * account belongs to several and none was chosen). That is fixable by the
+ * user, so the upload stays retryable with the remedy.
+ */
+function getOrganizationChoiceFailure(
+	error: unknown,
+	request: UploadSessionRequest,
+	attempts: number,
+): UploadResult | null {
+	if (
+		!(error instanceof ORPCError) ||
+		error.status !== 400 ||
+		!/Choose an organization/iu.test(error.message)
+	)
+		return null;
+	const projectPath = getRequestMetadata(request).projectPath;
+	return {
+		success: false,
+		error: `Opaline could not choose a workspace for this session: your account belongs to more than one. Run \`opaline set-org\` in ${projectPath} (or pass --org), then \`opaline upload --retry\`.`,
+		attempts,
+		needsOrganization: true,
+		retryable: true,
+	};
+}
+
 function getAnalysisInitRejection(
 	request: UploadSessionRequest,
 	error: unknown,

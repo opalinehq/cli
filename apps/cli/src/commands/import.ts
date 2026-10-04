@@ -30,7 +30,6 @@ import {
 } from "../lib/failed-uploads.js";
 import { getGitInfo } from "../lib/git-info.js";
 import { reconcilePendingUploads } from "../lib/pending-upload-reconcile.js";
-import { getProjectOrgId } from "../lib/project-config.js";
 import { retryPendingSessionEvidence } from "../lib/session-evidence.js";
 import { resolveSession } from "../lib/session-resolver.js";
 import {
@@ -39,6 +38,7 @@ import {
 	type SessionTag,
 } from "../lib/types.js";
 import { allowsInsecureEndpoint } from "../lib/upload-endpoint.js";
+import { resolveUploadOrganizationId } from "../lib/upload-organization.js";
 import { formatRedactionSummary, uploadSession } from "../lib/uploader.js";
 import { runAnalysisImport } from "./import-analysis.js";
 
@@ -92,8 +92,12 @@ async function runSingleUpload(
 	if (displayName) write(`Repository: ${displayName}`);
 	if (gitInfo.branch) write(`Branch: ${gitInfo.branch}`);
 
-	const organizationId =
-		flags.org ?? (await getProjectOrgId(sessionInfo.projectPath));
+	const organizationId = await resolveUploadOrganizationId({
+		credentials,
+		explicit: flags.org,
+		projectPath: sessionInfo.projectPath,
+		recorded: undefined,
+	});
 	if (organizationId) write(`Organization: ${organizationId}`);
 
 	write("Building upload request...");
@@ -198,6 +202,17 @@ async function runSingleUpload(
 			write(redactionSummary);
 		}
 	} else {
+		// A missing workspace choice is fixable: keep it for --retry.
+		if (result.needsOrganization)
+			await recordFailedUpload({
+				sessionId: request.metadata.sessionId,
+				transcriptPath: request.transcriptPath,
+				projectPath: sessionInfo.projectPath,
+				source: sessionInfo.source,
+				organizationId,
+				error: result.error ?? "Choose a workspace with `opaline set-org`.",
+				status: "retryable",
+			});
 		return new Error(`Upload failed: ${result.error}`);
 	}
 }
@@ -358,9 +373,12 @@ async function runRetryUpload(
 			// Analysis uploads go to the analysis's workspace, never an org.
 			const organizationId =
 				item.analysisId === undefined
-					? (flags.org ??
-						item.failure.organizationId ??
-						(await getProjectOrgId(item.failure.projectPath)))
+					? await resolveUploadOrganizationId({
+							credentials,
+							explicit: flags.org,
+							projectPath: item.failure.projectPath,
+							recorded: item.failure.organizationId,
+						})
 					: undefined;
 
 			const request = await adapter.buildUploadRequest(sessionFile, {

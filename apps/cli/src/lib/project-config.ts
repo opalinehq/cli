@@ -16,6 +16,8 @@ interface ProjectEntry {
 
 interface ProjectsConfig {
 	projects: Record<string, ProjectEntry>;
+	/** The workspace last chosen with `opaline set-org`, for unmapped folders. */
+	defaultOrganizationId?: string;
 }
 
 function getProjectsConfigPath(): string {
@@ -93,5 +95,11 @@ export async function setProjectOrgId(
 	const key = await getProjectKey(cwd);
 	const config = loadProjectsConfig();
 	config.projects[key] = { organizationId };
+	config.defaultOrganizationId = organizationId;
 	saveProjectsConfig(config);
+}
+
+export function getDefaultProjectOrgId(): string | undefined {
+	const value = loadProjectsConfig().defaultOrganizationId;
+	return typeof value === "string" && value.length > 0 ? value : undefined;
 }

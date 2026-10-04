@@ -1134,10 +1134,13 @@ describe("capability-gated R2 upload flow", () => {
 			config,
 		);
 
-		expect(result.success).toBe(false);
-		expect(result.error).toContain(
-			"Choose an organization with --org or opaline set-org",
-		);
+		// Not a size rejection: the workspace choice is reported, retryable.
+		expect(result).toMatchObject({
+			success: false,
+			needsOrganization: true,
+			retryable: true,
+		});
+		expect(result.error).toContain("opaline set-org");
 		expect(result.error).not.toContain("does not accept sessions this large");
 	}, 60_000);
 
