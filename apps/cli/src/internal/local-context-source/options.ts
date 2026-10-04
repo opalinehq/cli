@@ -127,6 +127,21 @@ function validateAdditionalRootIds(
 				`Invalid context root scope: ${JSON.stringify(root.scope)}`,
 			);
 		}
+		for (const include of root.include ?? []) {
+			const segments = include.path.split("/");
+			if (
+				include.path.length === 0 ||
+				include.path.startsWith("/") ||
+				segments.some(
+					(segment) => segment === ".." || segment === "." || segment === "",
+				) ||
+				!["instruction", "metadata", "tree"].includes(include.role)
+			) {
+				throw new Error(
+					`Invalid include ${JSON.stringify(include.path)} for context root ${JSON.stringify(root.id)}.`,
+				);
+			}
+		}
 		ids.add(root.id);
 	}
 }

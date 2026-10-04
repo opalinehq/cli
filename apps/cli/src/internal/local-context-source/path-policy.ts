@@ -198,6 +198,23 @@ export function classifyContextPath(
 	if (segments.includes("hooks") && isAgentConfigPath(name, segments)) {
 		categories.add("hook-config");
 	}
+	// User-level agent configuration roots (~/.claude, $CODEX_HOME): their
+	// settings define hooks and MCP servers.
+	if (rootScope === "agent-config" && segments.length === 1) {
+		if (/^settings(?:\.[^.]+)?\.json$/u.test(name)) {
+			categories.add("agent-config");
+			categories.add("hook-config");
+		}
+		if (name === "hooks.json") {
+			categories.add("agent-config");
+			categories.add("hook-config");
+		}
+		if (name === "config.toml") {
+			categories.add("agent-config");
+			categories.add("hook-config");
+			categories.add("mcp-config");
+		}
+	}
 	if (SOURCE_EXTENSIONS.has(extension)) categories.add("source");
 	if (isTestPath(name, segments)) categories.add("test");
 	if (CONFIG_EXTENSIONS.has(extension) || isConfigName(name)) {
@@ -234,6 +251,7 @@ export function getParentPath(relativePath: string): string | null {
 function isInstructionPath(name: string, lowerPath: string): boolean {
 	return (
 		name === "agents.md" ||
+		name === "agents.override.md" ||
 		name === "claude.md" ||
 		name === "gemini.md" ||
 		name === "instructions.md" ||

@@ -262,7 +262,8 @@ function classifyFacetKinds(
 	const segments = normalized.split("/");
 	const categories = entry?.categories ?? classifyContextPath(path, []);
 	const kinds = new Set<ContextIndexFacetKind>();
-	if (name === "agents.md") kinds.add("agents-instructions");
+	if (name === "agents.md" || name === "agents.override.md")
+		kinds.add("agents-instructions");
 	if (name === "claude.md") kinds.add("claude-instructions");
 	if (categories.includes("plan-candidate") || segments.includes("plans")) {
 		kinds.add("plans");

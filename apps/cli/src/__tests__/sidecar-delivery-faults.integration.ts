@@ -366,6 +366,73 @@ describe("sidecar delivery under faults", () => {
 		}
 	});
 
+	test("carries user and plugin context and secret-free agent configuration end to end", async () => {
+		const stub = startEvidenceProtocolStub();
+		try {
+			const workspace = await createWorkspace(stub, ["alpha"]);
+			const secret = "sk-live-0123456789abcdefghijklmn";
+			const userFiles: Record<string, string> = {
+				".claude/CLAUDE.md":
+					"# User\nAlways run the linters. See @~/notes/style.md\n",
+				"notes/style.md": "House style\n",
+				".claude/settings.json": JSON.stringify({
+					env: { SERVICE_TOKEN: secret },
+					hooks: {
+						SessionEnd: [
+							{ hooks: [{ type: "command", command: "opaline hooks" }] },
+						],
+					},
+				}),
+				".codex/AGENTS.md": "Codex user instructions\n",
+				".codex/config.toml": [
+					"[mcp_servers.remote]",
+					'url = "https://mcp.example"',
+					`http_headers = { Authorization = "Bearer ${secret}" }`,
+					"",
+				].join("\n"),
+				"repositories/CLAUDE.md": "Instructions for every repository here\n",
+			};
+			for (const [path, content] of Object.entries(userFiles)) {
+				await mkdir(dirname(join(workspace.home, path)), { recursive: true });
+				await writeFile(join(workspace.home, path), content);
+			}
+			expect(
+				(await runHook(workspace, "codex", "alpha", "user-context")).exitCode,
+			).toBe(0);
+			const capture = only(stub);
+			expectCompleteCapture(capture, workspace, "alpha");
+			const userFile = (rootId: string, path: string) => {
+				const entry = capture.manifest.localContext.entries.find(
+					(candidate) => candidate.rootId === rootId && candidate.path === path,
+				);
+				assert(entry?.content?.blobId, `${rootId}:${path} was not captured`);
+				const bytes = capture.objects.get(entry.content.blobId);
+				assert(bytes);
+				return new TextDecoder().decode(bytes);
+			};
+			expect(userFile("claude-user-home", "CLAUDE.md")).toBe(
+				userFiles[".claude/CLAUDE.md"],
+			);
+			expect(userFile("home-instructions", "notes/style.md")).toBe(
+				"House style\n",
+			);
+			expect(userFile("home-instructions", "repositories/CLAUDE.md")).toBe(
+				userFiles["repositories/CLAUDE.md"],
+			);
+			expect(userFile("codex-user-home", "AGENTS.md")).toBe(
+				"Codex user instructions\n",
+			);
+			const manifest = JSON.stringify(capture.manifest);
+			expect(manifest).toContain('"userConfiguration"');
+			expect(manifest).toContain("https://mcp.example");
+			for (const bytes of capture.objects.values())
+				expect(new TextDecoder().decode(bytes)).not.toContain(secret);
+			await expectNothingDropped(workspace, stub);
+		} finally {
+			stub.stop();
+		}
+	});
+
 	test("a 40 MiB transcript (over the old 32 MiB budget) is captured and delivered whole", async () => {
 		const stub = startEvidenceProtocolStub();
 		try {

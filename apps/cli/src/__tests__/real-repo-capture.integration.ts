@@ -8,10 +8,12 @@ import {
 	readFile,
 	realpath,
 	rm,
+	stat,
 	writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { basename, delimiter, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { basename, delimiter, join, relative } from "node:path";
+import { parse as parseToml } from "smol-toml";
 import { getConfigDir } from "../lib/local-state.js";
 import { readPendingRepositoryEvidence } from "../lib/repository-evidence-pending.js";
 import { captureAndUploadSessionEvidence } from "../lib/session-evidence.js";
@@ -81,6 +83,7 @@ describe("real repository sidecar capture", () => {
 					JSON.stringify(credentials),
 				);
 				const sessionId = randomUUID();
+				const observedPluginSkill = await findInstalledClaudePluginSkill();
 				const content = `${[
 					{
 						type: "session_meta",
@@ -98,6 +101,21 @@ describe("real repository sidecar capture", () => {
 							type: "message",
 						},
 					},
+					...(observedPluginSkill === null
+						? []
+						: [
+								{
+									timestamp: new Date().toISOString(),
+									type: "response_item",
+									payload: {
+										type: "function_call",
+										name: "Skill",
+										arguments: JSON.stringify({
+											skill: observedPluginSkill.name,
+										}),
+									},
+								},
+							]),
 				]
 					.map((line) => JSON.stringify(line))
 					.join("\n")}\n`;
@@ -183,6 +201,68 @@ describe("real repository sidecar capture", () => {
 								result.stored === "content" && result.path === "CLAUDE.md",
 						),
 				).toBe(true);
+				// Every file captured outside the repository (user and parent
+				// instructions, their imports, observed plugin skills) is stored
+				// byte for byte as on disk.
+				const userFiles: string[] = [];
+				for (const entry of localContext.entries) {
+					if (entry.rootId === "repository" || entry.kind !== "file") continue;
+					if (entry.content?.status !== "available" || !entry.content.blobId)
+						continue;
+					const root = localContext.roots.find(
+						(candidate) => candidate.id === entry.rootId,
+					);
+					assert(root);
+					const onDisk = await readFile(join(root.absolutePath, entry.path));
+					// Empty files have no evidence object (objects are non-empty by
+					// protocol); their blob ID is the empty content's hash.
+					if (onDisk.byteLength === 0) {
+						expect(entry.content.blobId).toBe(`sha256:${sha256(onDisk)}`);
+						userFiles.push(`${entry.rootId}:${entry.path} (0 B, empty)`);
+						continue;
+					}
+					const stored = capture.objects.get(entry.content.blobId);
+					assert(stored, `${entry.rootId}:${entry.path} was not delivered`);
+					expect(entry.content.secretFilter?.redactedBytes ?? 0).toBe(0);
+					expect(sha256(stored)).toBe(sha256(onDisk));
+					userFiles.push(
+						`${entry.rootId}:${entry.path} (${onDisk.byteLength} B, sha256 match)`,
+					);
+				}
+				if (await isFile(join(homedir(), ".claude", "CLAUDE.md")))
+					expect(
+						userFiles.some((file) =>
+							file.startsWith("claude-user-home:CLAUDE.md "),
+						),
+					).toBe(true);
+				if (await isFile(join(codexHome(), "AGENTS.md")))
+					expect(
+						userFiles.some((file) =>
+							file.startsWith("codex-user-home:AGENTS.md "),
+						),
+					).toBe(true);
+				if (observedPluginSkill !== null)
+					expect(
+						userFiles.some((file) =>
+							file.startsWith(`claude-plugins:${observedPluginSkill.path} `),
+						),
+					).toBe(true);
+				// No configured credential reaches any delivered object. Only the
+				// number of checked values is reported.
+				const configuredCredentials = await readConfiguredCredentials();
+				const delivered = [...capture.objects.values()].map((bytes) =>
+					new TextDecoder().decode(bytes),
+				);
+				// Report only the setting's name, never its value.
+				expect(
+					configuredCredentials
+						.filter((credential) =>
+							delivered.some((text) => text.includes(credential.value)),
+						)
+						.map((credential) => credential.name),
+				).toEqual([]);
+				const userConfiguration = localContext.userConfiguration;
+				assert(userConfiguration);
 				const gitWorktrees = execFileSync(
 					"git",
 					["-C", repositoryPath, "worktree", "list", "--porcelain"],
@@ -214,6 +294,22 @@ describe("real repository sidecar capture", () => {
 					objects: capture.input.objects.length,
 					entries: localContext.entries.length,
 					instructions: instructionResults,
+					userFiles,
+					observedPluginSkill: observedPluginSkill?.name ?? null,
+					userConfiguration: {
+						claudeSettings: userConfiguration.claude.settings.status,
+						claudeHooks: userConfiguration.claude.hooks.length,
+						claudeEnabledPlugins: Object.keys(
+							userConfiguration.claude.enabledPlugins,
+						).length,
+						claudeInstalledPlugins:
+							userConfiguration.claude.installedPlugins.length,
+						codexConfig: userConfiguration.codex.config.status,
+						codexMcpServers: userConfiguration.codex.mcpServers.length,
+						codexHooks: userConfiguration.codex.hooks.length,
+						codexPlugins: Object.keys(userConfiguration.codex.plugins).length,
+					},
+					credentialsChecked: configuredCredentials.length,
 					warnings,
 				};
 				console.log(`REAL_REPO_CAPTURE ${JSON.stringify(summary)}`);
@@ -245,6 +341,94 @@ describe("real repository sidecar capture", () => {
 		},
 	);
 });
+
+/** A skill of a user-scoped Claude Code plugin, observed as `plugin:skill`. */
+async function findInstalledClaudePluginSkill(): Promise<{
+	readonly name: string;
+	readonly path: string;
+} | null> {
+	const cache = join(homedir(), ".claude", "plugins", "cache");
+	const installed = await readFile(
+		join(homedir(), ".claude", "plugins", "installed_plugins.json"),
+		"utf8",
+	).catch(() => null);
+	if (installed === null) return null;
+	const plugins: Record<
+		string,
+		readonly { readonly scope?: string; readonly installPath?: string }[]
+	> = JSON.parse(installed).plugins ?? {};
+	for (const [name, installations] of Object.entries(plugins))
+		for (const installation of installations) {
+			if (installation.scope !== "user" || !installation.installPath) continue;
+			const skillsDirectory = join(installation.installPath, "skills");
+			const skills = await readdir(skillsDirectory).catch(() => [] as string[]);
+			for (const skill of skills.sort())
+				if (await isFile(join(skillsDirectory, skill, "SKILL.md")))
+					return {
+						name: `${name.split("@")[0]}:${skill}`,
+						path: `${relative(cache, installation.installPath)}/skills/${skill}/SKILL.md`,
+					};
+		}
+	return null;
+}
+
+/**
+ * Credentials configured on this machine: every MCP HTTP header value, and
+ * environment values whose names denote a credential (paths and versions in
+ * other environment variables legitimately appear in manifests).
+ */
+async function readConfiguredCredentials(): Promise<
+	readonly { readonly name: string; readonly value: string }[]
+> {
+	const credentials: { name: string; value: string }[] = [];
+	const credentialName = /token|secret|passw|auth|key|cookie|credential/iu;
+	const collect = (
+		prefix: string,
+		value: unknown,
+		onlyCredentialNames: boolean,
+	) => {
+		if (typeof value !== "object" || value === null) return;
+		for (const [name, entry] of Object.entries(value))
+			if (
+				typeof entry === "string" &&
+				entry.length >= 8 &&
+				(!onlyCredentialNames || credentialName.test(name))
+			)
+				credentials.push({ name: `${prefix}.${name}`, value: entry });
+	};
+	const toml = await readFile(join(codexHome(), "config.toml"), "utf8").catch(
+		() => null,
+	);
+	if (toml !== null) {
+		const servers = parseToml(toml).mcp_servers;
+		if (typeof servers === "object" && servers !== null)
+			for (const [server, configuration] of Object.entries(servers))
+				if (typeof configuration === "object" && configuration !== null)
+					for (const [key, value] of Object.entries(configuration)) {
+						if (key === "http_headers")
+							collect(`mcp_servers.${server}.http_headers`, value, false);
+						if (key === "env")
+							collect(`mcp_servers.${server}.env`, value, true);
+					}
+	}
+	const settings = await readFile(
+		join(homedir(), ".claude", "settings.json"),
+		"utf8",
+	).catch(() => null);
+	if (settings !== null) collect("claude.env", JSON.parse(settings).env, true);
+	return credentials;
+}
+
+function codexHome(): string {
+	const configured = process.env.CODEX_HOME?.trim();
+	return configured ? configured : join(homedir(), ".codex");
+}
+
+async function isFile(path: string): Promise<boolean> {
+	return stat(path)
+		.then((details) => details.isFile())
+		.catch(() => false);
+}
 
 function sha256(value: Uint8Array): string {
 	return createHash("sha256").update(value).digest("hex");

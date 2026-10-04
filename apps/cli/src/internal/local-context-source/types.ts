@@ -17,6 +17,18 @@ export interface AdditionalContextRoot {
 	readonly absolutePath: string;
 	readonly origin: Exclude<ContextRootOrigin, "repository">;
 	readonly scope: Exclude<ContextRootScope, "repository">;
+	/**
+	 * Collect only these root-relative paths instead of walking the whole
+	 * root (home directories hold far more than agent context). Missing paths
+	 * are absent. `instruction` files go to the instruction pool, `metadata`
+	 * files are inventoried and hashed only, `tree` directories are walked.
+	 */
+	readonly include?: readonly ContextRootInclude[];
+}
+
+export interface ContextRootInclude {
+	readonly path: string;
+	readonly role: "instruction" | "metadata" | "tree";
 }
 
 export interface LocalContextCollectionLimits {
@@ -584,12 +596,65 @@ export interface LocalContextManifest {
 	readonly contextIndex: ContextIndex;
 	readonly git: GitSnapshot;
 	readonly coverage: AggregateCoverage;
+	/** Secret-filtered user-level agent configuration (hooks, MCP, plugins). */
+	readonly userConfiguration?: UserAgentConfiguration;
 	readonly transport: {
 		readonly secretFilterApplied: true;
 		readonly secretFilterVersion: number;
 		readonly requiresAdditionalReview: true;
 		readonly rawContentIncluded: false;
 	};
+}
+
+export interface UserAgentHook {
+	readonly event: string;
+	readonly matcher: string | null;
+	readonly type: string | null;
+	readonly command: string | null;
+	readonly timeoutSeconds: number | null;
+	readonly async: boolean | null;
+}
+
+export interface UserAgentMcpServer {
+	readonly name: string;
+	readonly transport: "stdio" | "http" | "unknown";
+	readonly command: string | null;
+	readonly args: readonly string[];
+	readonly url: string | null;
+	readonly enabled: boolean | null;
+	readonly envKeys: readonly string[];
+	readonly headerKeys: readonly string[];
+	readonly bearerTokenEnvVar: string | null;
+}
+
+export interface UserAgentConfigurationSource {
+	readonly path: string;
+	readonly status: "parsed" | "absent" | "unreadable";
+}
+
+export interface UserAgentConfiguration {
+	readonly claude: {
+		readonly settings: UserAgentConfigurationSource;
+		readonly hooks: readonly UserAgentHook[];
+		readonly enabledPlugins: Readonly<Record<string, boolean>>;
+		readonly permissions: {
+			readonly defaultMode: string | null;
+			readonly allow: readonly string[];
+			readonly deny: readonly string[];
+			readonly ask: readonly string[];
+			readonly additionalDirectories: readonly string[];
+		};
+		readonly installedPlugins: readonly string[];
+	};
+	readonly codex: {
+		readonly config: UserAgentConfigurationSource;
+		readonly hooksFile: UserAgentConfigurationSource;
+		readonly mcpServers: readonly UserAgentMcpServer[];
+		readonly notify: readonly string[];
+		readonly hooks: readonly UserAgentHook[];
+		readonly plugins: Readonly<Record<string, boolean>>;
+	};
+	readonly truncated: boolean;
 }
 
 export interface LocalContextBundle {

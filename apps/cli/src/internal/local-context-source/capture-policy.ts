@@ -19,6 +19,9 @@ export const SESSION_INSTRUCTION_MAX_IMPORT_DEPTH = 5;
 export const SESSION_DIFF_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
 
 export const INSTRUCTION_IMPORT_EVIDENCE_REASON = "instruction-import";
+// Explicitly included files of user-level roots (see ContextRootInclude).
+export const INSTRUCTION_INCLUDE_EVIDENCE_REASON = "instruction-include";
+export const METADATA_INCLUDE_EVIDENCE_REASON = "metadata-include";
 
 export function getSessionContentPriority(
 	rootId: string,
@@ -63,10 +66,13 @@ export function isSessionInstructionContent(
 	categories: readonly ContextFileCategory[],
 	evidenceReason: string | null,
 ): boolean {
-	if (rootId !== "repository") return false;
-	if (evidenceReason === INSTRUCTION_IMPORT_EVIDENCE_REASON) {
+	if (
+		evidenceReason === INSTRUCTION_IMPORT_EVIDENCE_REASON ||
+		evidenceReason === INSTRUCTION_INCLUDE_EVIDENCE_REASON
+	) {
 		return !isSessionContentPolicyExcluded(path, categories);
 	}
+	if (rootId !== "repository") return false;
 	return getSessionContentPriority(rootId, path, categories, new Set()) <= 0;
 }
 

@@ -9,7 +9,6 @@ import type { RepositoryEvidenceInitInput } from "../../contracts/index.js";
 import { buildRepositoryEvidenceUpload } from "../../lib/repository-evidence-upload.js";
 import { planTranscriptRevision } from "../../lib/transcript-revision.js";
 import { buildContextIndex } from "./context-index.js";
-import { findInstructionImports } from "./filesystem-collector.js";
 import {
 	type AdditionalContextRoot,
 	type ContextEntry,
@@ -22,6 +21,7 @@ import {
 	type LocalContextCollectionLimits,
 	type LocalContextSourceEnv,
 } from "./index.js";
+import { findInstructionImports } from "./instruction-imports.js";
 
 setDefaultTimeout(30_000);
 

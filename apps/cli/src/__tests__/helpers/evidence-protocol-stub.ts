@@ -6,6 +6,7 @@ import {
 	type RepositoryEvidenceInitInput,
 	RepositoryEvidenceInitInputSchema,
 } from "../../contracts/index.js";
+import type { UserAgentConfiguration } from "../../internal/local-context-source/index.js";
 import { type IngestStub, startIngestStub } from "./ingest-stub.js";
 
 /**
@@ -73,6 +74,7 @@ export interface CommittedManifest {
 			readonly limitsReached: readonly string[];
 			readonly truncated?: unknown;
 		};
+		readonly userConfiguration?: UserAgentConfiguration;
 	};
 	readonly contextIndex: {
 		readonly facets: readonly {

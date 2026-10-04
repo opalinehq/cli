@@ -1,18 +1,21 @@
 import { createHash } from "node:crypto";
-import { basename, dirname, posix, relative, resolve, sep } from "node:path";
+import { basename, dirname, relative, resolve, sep } from "node:path";
 import type { BlobStore } from "./blob-store.js";
 import { addSanitizedTextBlob } from "./blob-store.js";
 import {
 	getInstructionRank,
 	getSessionContentPriority,
 	INSTRUCTION_IMPORT_EVIDENCE_REASON,
+	INSTRUCTION_INCLUDE_EVIDENCE_REASON,
 	isSessionInstructionContent,
+	METADATA_INCLUDE_EVIDENCE_REASON,
 	SESSION_INSTRUCTION_MAX_IMPORT_DEPTH,
 } from "./capture-policy.js";
 import {
 	type GitCollectionResult,
 	getGitFileProvenance,
 } from "./git-collector.js";
+import { findInstructionImports } from "./instruction-imports.js";
 import {
 	classifyContextPath,
 	findSkillDirectories,
@@ -25,6 +28,7 @@ import type {
 	ContextEntry,
 	ContextFileCategory,
 	ContextRegularFileEntry,
+	ContextRootInclude,
 	ContextRootManifest,
 	CoverageError,
 	ExcludedPath,
@@ -46,7 +50,6 @@ const DISCOVERY_LIMITS: ReadonlySet<string> = new Set([
 	"maxEntriesPerRoot",
 	"maxTotalEntries",
 ]);
-const MAX_INSTRUCTION_IMPORTS_PER_FILE = 64;
 
 type ContentPool = "general" | "instruction";
 
@@ -67,6 +70,7 @@ interface RootSpec {
 	readonly absolutePath: string;
 	readonly origin: ContextRootManifest["origin"];
 	readonly scope: ContextRootManifest["scope"];
+	readonly include?: readonly ContextRootInclude[];
 }
 
 interface DiscoveredEntry {
@@ -214,7 +218,14 @@ export async function collectFileSystemContext(
 			(walk.walk?.discovered ?? []).map((entry) => entry.path),
 		),
 	}));
-	const observedSkills = new Set(options.observedSkillNames ?? []);
+	// Plugin skills are observed as `plugin:skill`; their definitions live in
+	// a directory named after the skill alone.
+	const observedSkills = new Set(
+		(options.observedSkillNames ?? []).flatMap((name) => {
+			const separator = name.lastIndexOf(":");
+			return separator < 0 ? [name] : [name, name.slice(separator + 1)];
+		}),
+	);
 	const files: PendingFile[] = [];
 	for (const [rootOrder, result] of collectedRoots.entries()) {
 		for (const entry of result.discovered) {
@@ -320,8 +331,11 @@ export async function collectFileSystemContext(
 			const item = queue[index];
 			if (item === undefined) break;
 			const text = await processFile(item.file, "instruction");
+			// Imports are followed inside the repository; user-level roots list
+			// the files their instructions import explicitly.
 			if (
 				text === undefined ||
+				item.file.entry.rootId !== "repository" ||
 				item.depth >= SESSION_INSTRUCTION_MAX_IMPORT_DEPTH
 			)
 				continue;
@@ -434,14 +448,23 @@ async function discoverRoot(
 	};
 	await walkDirectories(
 		walk,
-		[
-			{
-				absolutePath: root.absolutePath,
-				relativePath: "",
-				depth: 0,
-				ignored: false,
-			},
-		],
+		root.include === undefined
+			? [
+					{
+						absolutePath: root.absolutePath,
+						relativePath: "",
+						depth: 0,
+						ignored: false,
+					},
+				]
+			: await discoverIncludes(
+					walk,
+					root.include,
+					options,
+					fileSystem,
+					aggregate,
+					errors,
+				),
 		options,
 		fileSystem,
 		git,
@@ -458,6 +481,79 @@ async function discoverRoot(
 		coverage,
 	);
 	return { root, status: null, coverage, walk };
+}
+
+/**
+ * Adds the explicitly included files of a root and returns the included
+ * directories for the regular walk. Missing paths are simply absent.
+ */
+async function discoverIncludes(
+	walk: RootWalk,
+	includes: readonly ContextRootInclude[],
+	options: LocalContextCollectionOptions,
+	fileSystem: LocalContextFileSystem,
+	aggregate: MutableAggregate,
+	errors: CoverageError[],
+): Promise<PendingDirectory[]> {
+	const { root, coverage, discovered } = walk;
+	const directories: PendingDirectory[] = [];
+	const seen = new Set<string>();
+	for (const include of [...includes].sort((left, right) =>
+		compareStrings(left.path, right.path),
+	)) {
+		if (seen.has(include.path)) continue;
+		seen.add(include.path);
+		const absolutePath = resolve(root.absolutePath, include.path);
+		if (!isContainedPath(root.absolutePath, absolutePath)) continue;
+		let stat: FileSystemStat;
+		try {
+			stat = await fileSystem.lstat(absolutePath);
+		} catch (error) {
+			const normalized = normalizeError(error);
+			if (normalized.code !== "ENOENT" && normalized.code !== "ENOTDIR")
+				pushFileSystemError(
+					errors,
+					root.id,
+					include.path,
+					"lstat",
+					error,
+					options,
+				);
+			continue;
+		}
+		if (
+			coverage.discoveredEntries >= options.limits.maxEntriesPerRoot ||
+			aggregate.totalEntries >= options.limits.maxTotalEntries
+		) {
+			coverage.limitsReached.add(
+				coverage.discoveredEntries >= options.limits.maxEntriesPerRoot
+					? "maxEntriesPerRoot"
+					: "maxTotalEntries",
+			);
+			break;
+		}
+		discovered.push({
+			rootId: root.id,
+			absolutePath,
+			path: include.path,
+			stat,
+			evidenceReason:
+				stat.kind === "file" && include.role === "instruction"
+					? INSTRUCTION_INCLUDE_EVIDENCE_REASON
+					: stat.kind === "file" && include.role === "metadata"
+						? METADATA_INCLUDE_EVIDENCE_REASON
+						: null,
+		});
+		countDiscoveredEntry(stat, coverage, aggregate);
+		if (stat.kind === "directory" && include.role === "tree")
+			directories.push({
+				absolutePath,
+				relativePath: include.path,
+				depth: include.path.split("/").length,
+				ignored: false,
+			});
+	}
+	return directories;
 }
 
 async function resolveRoot(
@@ -933,12 +1029,17 @@ async function buildRegularFileEntry(
 	if (
 		options.capturePolicy === "session-evidence" &&
 		pool === "general" &&
-		getSessionContentPriority(
-			root.id,
-			entry.path,
-			categories,
-			observedSkills,
-		) >= 4
+		(entry.evidenceReason === METADATA_INCLUDE_EVIDENCE_REASON ||
+			// User-level agent settings may hold credentials: only their
+			// instruction files are captured, the rest is hashed (a filtered
+			// summary of hooks, MCP servers and plugins is added separately).
+			root.scope === "agent-config" ||
+			getSessionContentPriority(
+				root.id,
+				entry.path,
+				categories,
+				observedSkills,
+			) >= 4)
 	) {
 		coverage.omittedContentFiles += 1;
 		aggregate.omittedBytes += entry.stat.size;
@@ -1427,42 +1528,6 @@ function normalizeError(error: unknown): {
 
 function getFileKey(entry: DiscoveredEntry): string {
 	return `${entry.rootId}\0${entry.path}`;
-}
-
-/**
- * Repository-relative targets of Claude Code `@path` imports. Code spans and
- * fenced blocks are ignored, as in Claude Code. Only relative paths inside the
- * repository resolve; callers keep only targets that exist in the inventory.
- */
-export function findInstructionImports(
-	text: string,
-	fromPath: string,
-): readonly string[] {
-	const prose = text
-		.replace(/^(```|~~~)[^\n]*\n[\s\S]*?^\1[^\n]*$/gmu, "")
-		.replace(/`[^`\n]*`/gu, "");
-	const targets = new Set<string>();
-	for (const match of prose.matchAll(/(?:^|\s)@([^\s`'"<>()[\]{}]+)/gu)) {
-		const raw = match[1];
-		if (raw === undefined || raw.startsWith("/") || raw.startsWith("~"))
-			continue;
-		for (const candidate of [raw, raw.replace(/[.,;:!?]+$/u, "")]) {
-			if (candidate.length === 0) continue;
-			const resolved = posix.normalize(
-				posix.join(posix.dirname(fromPath), candidate),
-			);
-			if (
-				resolved === "." ||
-				resolved === ".." ||
-				resolved.startsWith("../") ||
-				posix.isAbsolute(resolved)
-			)
-				continue;
-			targets.add(resolved);
-		}
-		if (targets.size >= MAX_INSTRUCTION_IMPORTS_PER_FILE) break;
-	}
-	return [...targets];
 }
 
 function compareEntries(left: ContextEntry, right: ContextEntry): number {
