@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/opalinehq/cli/compare/opaline-cli@0.12.0...opaline-cli@0.12.1) (2026-10-04)
+
+
+### Bug Fixes
+
+* **cli:** upload later subagents and every analysis of a linked chat ([#501](https://github.com/opalinehq/cli/issues/501)) ([2ca4da7](https://github.com/opalinehq/cli/commit/2ca4da76699c261d0a881fd9b76ce8f4df7a202f))
+
 ## [0.12.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.11.0...opaline-cli@0.12.0) (2026-10-04)
 
 
