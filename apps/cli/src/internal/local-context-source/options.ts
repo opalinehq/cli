@@ -1,4 +1,10 @@
 import { isAbsolute } from "node:path";
+import {
+	SESSION_DIFF_MAX_TOTAL_BYTES,
+	SESSION_INSTRUCTION_MAX_FILE_BYTES,
+	SESSION_INSTRUCTION_MAX_FILES,
+	SESSION_INSTRUCTION_MAX_TOTAL_BYTES,
+} from "./capture-policy.js";
 import type {
 	LocalContextCollectionLimits,
 	LocalContextCollectionOptions,
@@ -34,6 +40,10 @@ export const DEFAULT_LOCAL_CONTEXT_COLLECTION_LIMITS: LocalContextCollectionLimi
 		gitCommandTimeoutMs: 15_000,
 		maxCommits: 100,
 		maxCoverageErrors: 1000,
+		maxInstructionFiles: SESSION_INSTRUCTION_MAX_FILES,
+		maxInstructionContentBytesPerFile: SESSION_INSTRUCTION_MAX_FILE_BYTES,
+		maxInstructionContentBytes: SESSION_INSTRUCTION_MAX_TOTAL_BYTES,
+		maxDiffContentBytes: SESSION_DIFF_MAX_TOTAL_BYTES,
 	};
 
 export function getDefaultLocalContextCollectionOptions(): LocalContextCollectionOptions {
@@ -51,6 +61,18 @@ export function validateLocalContextCollectionOptions(
 ): void {
 	validateLimits(options.limits);
 	validateAdditionalRootIds(options);
+	const workingDirectory = options.workingDirectory;
+	if (
+		workingDirectory !== undefined &&
+		(workingDirectory.startsWith("/") ||
+			workingDirectory === ".." ||
+			workingDirectory.startsWith("../") ||
+			workingDirectory.includes("/../"))
+	) {
+		throw new Error(
+			`Invalid working directory: ${JSON.stringify(workingDirectory)}`,
+		);
+	}
 	for (const prefix of options.excludedPathPrefixes) {
 		if (
 			prefix.length === 0 ||

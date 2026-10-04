@@ -511,15 +511,7 @@ function buildCoverage(
 				["agents-instructions", "claude-instructions"].includes(facet.kind),
 			),
 		),
-		coverageFromFacets(
-			"available-skills",
-			[],
-			bundle.manifest.roots.some(
-				(root) => root.scope === "skills" && root.status !== "collected",
-			)
-				? "One or more skill roots were unavailable or truncated"
-				: null,
-		),
+		coverage("available-skills", getSkillInventoryGap(bundle)),
 		coverageFromFacets(
 			"package-configuration",
 			facets.filter((facet) => facet.kind === "package-context"),
@@ -533,6 +525,29 @@ function buildCoverage(
 		),
 		buildTranscriptCoverage(transcriptDelivery),
 	];
+}
+
+/**
+ * Skills are discovered in the skill roots and in the repository. A missing
+ * skill root holds no skills, so only an unreadable root, a discovery walk that
+ * stopped early or skill definitions dropped by the manifest bound leave the
+ * inventory incomplete.
+ */
+function getSkillInventoryGap(bundle: LocalContextBundle): string | null {
+	const roots = bundle.manifest.roots.filter(
+		(root) => root.scope === "skills" || root.scope === "repository",
+	);
+	const unreadable = roots.filter((root) => root.status === "inaccessible");
+	if (unreadable.length > 0)
+		return `Skill roots could not be read: ${unreadable.map((root) => root.id).join(", ")}`;
+	const truncated = roots.filter((root) => root.status === "limit-reached");
+	if (truncated.length > 0)
+		return `Skill discovery stopped at a capture limit in: ${truncated.map((root) => root.id).join(", ")}`;
+	const omitted =
+		bundle.manifest.coverage.truncated?.omittedSkillDefinitions ?? 0;
+	if (omitted > 0)
+		return `${omitted} skill definition(s) were omitted by the manifest bound`;
+	return null;
 }
 
 function buildGitStateCoverage(bundle: LocalContextBundle): CoverageItem {
@@ -666,15 +681,13 @@ function getGitErrorCommand(error: string): string {
 function coverageFromFacets(
 	area: RepositoryEvidenceCoverageArea,
 	facets: readonly LocalContextBundle["manifest"]["contextIndex"]["facets"][number][],
-	overrideReason: string | null = null,
 ) {
 	const incomplete = facets.find((facet) => facet.coverage !== "complete");
 	return coverage(
 		area,
-		overrideReason ??
-			(incomplete
-				? `${incomplete.kind} coverage is ${incomplete.coverage}`
-				: null),
+		incomplete
+			? `${incomplete.kind} coverage is ${incomplete.coverage} in ${incomplete.rootId}`
+			: null,
 	);
 }
 

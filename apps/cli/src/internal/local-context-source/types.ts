@@ -35,6 +35,12 @@ export interface LocalContextCollectionLimits {
 	readonly gitCommandTimeoutMs: number;
 	readonly maxCommits: number;
 	readonly maxCoverageErrors: number;
+	// Session-evidence pools. Instruction files and patches are budgeted
+	// separately from other content so they are never crowded out.
+	readonly maxInstructionFiles: number;
+	readonly maxInstructionContentBytesPerFile: number;
+	readonly maxInstructionContentBytes: number;
+	readonly maxDiffContentBytes: number;
 }
 
 export interface LocalContextCollectionOptions {
@@ -44,6 +50,11 @@ export interface LocalContextCollectionOptions {
 	readonly capturePolicy: "delta" | "session-evidence";
 	readonly parentCapture: ParentCaptureReference | null;
 	readonly observedSkillNames?: readonly string[];
+	/**
+	 * Repository-relative working directory of the session. Instruction files
+	 * that apply to it are captured before other nested instruction files.
+	 */
+	readonly workingDirectory?: string;
 }
 
 export interface ParentCaptureReference {
@@ -513,6 +524,7 @@ export interface AggregateCoverage {
 		readonly omittedBlobs: number;
 		readonly omittedEntries: number;
 		readonly omittedMetadata?: number;
+		readonly omittedSkillDefinitions?: number;
 		readonly reason: "capture-limit";
 	};
 	readonly discoveredEntries: number;

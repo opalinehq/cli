@@ -1,8 +1,14 @@
 import { createHash } from "node:crypto";
-import { basename, dirname, relative, resolve, sep } from "node:path";
+import { basename, dirname, posix, relative, resolve, sep } from "node:path";
 import type { BlobStore } from "./blob-store.js";
 import { addSanitizedTextBlob } from "./blob-store.js";
-import { getSessionContentPriority } from "./capture-policy.js";
+import {
+	getInstructionRank,
+	getSessionContentPriority,
+	INSTRUCTION_IMPORT_EVIDENCE_REASON,
+	isSessionInstructionContent,
+	SESSION_INSTRUCTION_MAX_IMPORT_DEPTH,
+} from "./capture-policy.js";
 import {
 	type GitCollectionResult,
 	getGitFileProvenance,
@@ -33,6 +39,23 @@ import type {
 } from "./types.js";
 
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+// Only these limits leave a root's inventory incomplete. Content and hash caps
+// are recorded per entry and cut only the facets those entries belong to.
+const DISCOVERY_LIMITS: ReadonlySet<string> = new Set([
+	"maxDepthPerRoot",
+	"maxEntriesPerRoot",
+	"maxTotalEntries",
+]);
+const MAX_INSTRUCTION_IMPORTS_PER_FILE = 64;
+
+type ContentPool = "general" | "instruction";
+
+interface PendingFile {
+	readonly result: Awaited<ReturnType<typeof discoverRoot>>;
+	readonly entry: DiscoveredEntry;
+	readonly categories: readonly ContextFileCategory[];
+	readonly rootOrder: number;
+}
 
 interface RootSpec {
 	readonly id: string;
@@ -66,6 +89,7 @@ interface MutableRootCoverage {
 	otherCount: number;
 	contentFiles: number;
 	contentBytes: number;
+	generalContentBytes: number;
 	hashedFiles: number;
 	hashedBytes: number;
 	omittedContentFiles: number;
@@ -77,6 +101,7 @@ interface MutableAggregate {
 	totalEnumeratedEntries: number;
 	totalEntries: number;
 	contentBudgetBytes: number;
+	instructionBudgetBytes: number;
 	hashBudgetBytes: number;
 	inventoryBytes: number;
 	materializedBytes: number;
@@ -105,6 +130,7 @@ export async function collectFileSystemContext(
 	fileSystem: LocalContextFileSystem,
 	git: GitCollectionResult,
 	blobStore: BlobStore,
+	instructionBlobStore: BlobStore | null = null,
 ): Promise<FileSystemCollectionResult> {
 	const rootSpecs: readonly RootSpec[] = [
 		{
@@ -125,6 +151,7 @@ export async function collectFileSystemContext(
 		totalEnumeratedEntries: 0,
 		totalEntries: 0,
 		contentBudgetBytes: 0,
+		instructionBudgetBytes: 0,
 		hashBudgetBytes: 0,
 		inventoryBytes: 0,
 		materializedBytes: 0,
@@ -148,7 +175,7 @@ export async function collectFileSystemContext(
 		);
 	}
 	const observedSkills = new Set(options.observedSkillNames ?? []);
-	const files = [];
+	const files: PendingFile[] = [];
 	for (const [rootOrder, result] of collectedRoots.entries()) {
 		for (const entry of result.discovered) {
 			const categories = classifyContextPath(
@@ -173,20 +200,21 @@ export async function collectFileSystemContext(
 			}
 		}
 	}
+	const sessionPriority = (file: PendingFile) =>
+		getSessionContentPriority(
+			file.entry.rootId,
+			file.entry.path,
+			file.categories,
+			observedSkills,
+		);
+	const instructionRank = (file: PendingFile) =>
+		sessionPriority(file) <= 0
+			? getInstructionRank(file.entry.path, options.workingDirectory)
+			: 0;
 	files.sort((left, right) =>
 		options.capturePolicy === "session-evidence"
-			? getSessionContentPriority(
-					left.entry.rootId,
-					left.entry.path,
-					left.categories,
-					observedSkills,
-				) -
-					getSessionContentPriority(
-						right.entry.rootId,
-						right.entry.path,
-						right.categories,
-						observedSkills,
-					) ||
+			? sessionPriority(left) - sessionPriority(right) ||
+				instructionRank(left) - instructionRank(right) ||
 				compareStrings(
 					`${left.entry.rootId}\0${left.entry.path}`,
 					`${right.entry.rootId}\0${right.entry.path}`,
@@ -196,7 +224,15 @@ export async function collectFileSystemContext(
 					getContentPriority(right.categories) ||
 				compareStrings(left.entry.path, right.entry.path),
 	);
-	for (const file of files) {
+	const instructionStore =
+		options.capturePolicy === "session-evidence" ? instructionBlobStore : null;
+	const processed = new Set<string>();
+	const processFile = async (
+		file: PendingFile,
+		pool: ContentPool,
+	): Promise<string | undefined> => {
+		processed.add(getFileKey(file.entry));
+		let text: string | undefined;
 		entries.push(
 			await buildRegularFileEntry(
 				file.result.root,
@@ -206,18 +242,87 @@ export async function collectFileSystemContext(
 				options,
 				fileSystem,
 				git,
-				blobStore,
+				pool === "instruction" && instructionStore !== null
+					? instructionStore
+					: blobStore,
+				pool,
 				aggregate,
 				file.result.coverage,
 				errors,
+				(captured) => {
+					text = captured;
+				},
 			),
 		);
+		return text;
+	};
+	if (instructionStore !== null) {
+		// Instruction files first, then the repository files they import
+		// (breadth-first, bounded depth), all from the instruction pool.
+		const repositoryFiles = new Map(
+			files
+				.filter((file) => file.entry.rootId === "repository")
+				.map((file) => [file.entry.path, file]),
+		);
+		const queue: { readonly file: PendingFile; readonly depth: number }[] =
+			files
+				.filter((file) =>
+					isSessionInstructionContent(
+						file.entry.rootId,
+						file.entry.path,
+						file.categories,
+						file.entry.evidenceReason,
+					),
+				)
+				.map((file) => ({ file, depth: 0 }));
+		const queued = new Set(queue.map((item) => getFileKey(item.file.entry)));
+		for (let index = 0; index < queue.length; index += 1) {
+			const item = queue[index];
+			if (item === undefined) break;
+			const text = await processFile(item.file, "instruction");
+			if (
+				text === undefined ||
+				item.depth >= SESSION_INSTRUCTION_MAX_IMPORT_DEPTH
+			)
+				continue;
+			for (const target of findInstructionImports(text, item.file.entry.path)) {
+				const imported = repositoryFiles.get(target);
+				if (imported === undefined) continue;
+				const key = getFileKey(imported.entry);
+				if (queued.has(key) || processed.has(key)) continue;
+				const candidate: PendingFile = {
+					...imported,
+					entry: {
+						...imported.entry,
+						evidenceReason: INSTRUCTION_IMPORT_EVIDENCE_REASON,
+					},
+				};
+				if (
+					isHighRiskContentPath(candidate.entry.path) ||
+					!isSessionInstructionContent(
+						candidate.entry.rootId,
+						candidate.entry.path,
+						candidate.categories,
+						candidate.entry.evidenceReason,
+					)
+				)
+					continue;
+				queued.add(key);
+				queue.push({ file: candidate, depth: item.depth + 1 });
+			}
+		}
+	}
+	for (const file of files) {
+		if (processed.has(getFileKey(file.entry))) continue;
+		await processFile(file, "general");
 	}
 	const roots = collectedRoots.map((result) =>
 		buildRootManifest(
 			result.root,
 			result.status ??
-				(result.coverage.limitsReached.size > 0
+				([...result.coverage.limitsReached].some((limit) =>
+					DISCOVERY_LIMITS.has(limit),
+				)
 					? "limit-reached"
 					: "collected"),
 			result.coverage,
@@ -333,6 +438,8 @@ async function resolveRoot(
 		return { status: "available", path: canonical };
 	} catch (error) {
 		const normalized = normalizeError(error);
+		// A missing root is an absent source, not a capture error.
+		if (normalized.code === "ENOENT") return { status: "missing" };
 		pushCoverageError(
 			errors,
 			{
@@ -344,9 +451,7 @@ async function resolveRoot(
 			},
 			options,
 		);
-		return {
-			status: normalized.code === "ENOENT" ? "missing" : "inaccessible",
-		};
+		return { status: "inaccessible" };
 	}
 }
 
@@ -671,9 +776,11 @@ async function buildRegularFileEntry(
 	fileSystem: LocalContextFileSystem,
 	git: GitCollectionResult,
 	blobStore: BlobStore,
+	pool: ContentPool,
 	aggregate: MutableAggregate,
 	coverage: MutableRootCoverage,
 	errors: CoverageError[],
+	onText: (text: string) => void,
 ): Promise<ContextRegularFileEntry> {
 	const base = buildEntryBase(root, entry, categories, git);
 	if (isHighRiskContentPath(entry.path)) {
@@ -728,6 +835,7 @@ async function buildRegularFileEntry(
 
 	if (
 		options.capturePolicy === "session-evidence" &&
+		pool === "general" &&
 		getSessionContentPriority(
 			root.id,
 			entry.path,
@@ -753,12 +861,10 @@ async function buildRegularFileEntry(
 		};
 	}
 
-	const contentLimitReason = getContentLimitReason(
-		entry.stat.size,
-		coverage,
-		aggregate,
-		options,
-	);
+	const contentLimitReason =
+		pool === "instruction"
+			? getInstructionLimitReason(entry.stat.size, coverage, aggregate, options)
+			: getContentLimitReason(entry.stat.size, coverage, aggregate, options);
 	if (contentLimitReason !== null) {
 		coverage.omittedContentFiles += 1;
 		aggregate.omittedBytes += entry.stat.size;
@@ -781,7 +887,9 @@ async function buildRegularFileEntry(
 	try {
 		const read = await fileSystem.readFileBounded(
 			entry.absolutePath,
-			options.limits.maxContentBytesPerFile,
+			pool === "instruction"
+				? options.limits.maxInstructionContentBytesPerFile
+				: options.limits.maxContentBytesPerFile,
 		);
 		if (!read.complete) {
 			coverage.omittedContentFiles += 1;
@@ -834,9 +942,15 @@ async function buildRegularFileEntry(
 		);
 		if (sanitized.status === "failure") {
 			if (sanitized.reason === "blob-count-cap")
-				coverage.limitsReached.add("maxBlobs");
+				coverage.limitsReached.add(
+					pool === "instruction" ? "maxInstructionFiles" : "maxBlobs",
+				);
 			if (sanitized.reason === "total-content-cap")
-				coverage.limitsReached.add("maxTotalContentBytes");
+				coverage.limitsReached.add(
+					pool === "instruction"
+						? "maxInstructionContentBytes"
+						: "maxTotalContentBytes",
+				);
 			coverage.omittedContentFiles += 1;
 			aggregate.omittedBytes += entry.stat.size;
 			return {
@@ -866,8 +980,14 @@ async function buildRegularFileEntry(
 		coverage.contentBytes += sanitized.storedByteLength;
 		coverage.hashedFiles += 1;
 		coverage.hashedBytes += sanitized.storedByteLength;
-		aggregate.contentBudgetBytes += read.bytes.byteLength;
+		if (pool === "instruction") {
+			aggregate.instructionBudgetBytes += read.bytes.byteLength;
+		} else {
+			coverage.generalContentBytes += sanitized.storedByteLength;
+			aggregate.contentBudgetBytes += read.bytes.byteLength;
+		}
 		aggregate.hashBudgetBytes += sanitized.storedByteLength;
+		onText(text);
 		if (sanitized.reused) {
 			aggregate.reusedBytes += sanitized.storedByteLength;
 		} else {
@@ -990,9 +1110,30 @@ function getContentLimitReason(
 		coverage.limitsReached.add("maxTotalContentBytes");
 		return "total-content-cap";
 	}
-	if (coverage.contentBytes + size > options.limits.maxContentBytesPerRoot) {
+	if (
+		coverage.generalContentBytes + size >
+		options.limits.maxContentBytesPerRoot
+	) {
 		coverage.limitsReached.add("maxContentBytesPerRoot");
 		return "root-content-cap";
+	}
+	return null;
+}
+
+function getInstructionLimitReason(
+	size: number,
+	coverage: MutableRootCoverage,
+	aggregate: MutableAggregate,
+	options: LocalContextCollectionOptions,
+): Extract<FileContent, { status: "omitted" }>["reason"] | null {
+	if (size > options.limits.maxInstructionContentBytesPerFile)
+		return "file-content-cap";
+	if (
+		aggregate.instructionBudgetBytes + size >
+		options.limits.maxInstructionContentBytes
+	) {
+		coverage.limitsReached.add("maxInstructionContentBytes");
+		return "total-content-cap";
 	}
 	return null;
 }
@@ -1069,6 +1210,7 @@ function createMutableRootCoverage(): MutableRootCoverage {
 		otherCount: 0,
 		contentFiles: 0,
 		contentBytes: 0,
+		generalContentBytes: 0,
 		hashedFiles: 0,
 		hashedBytes: 0,
 		omittedContentFiles: 0,
@@ -1184,6 +1326,46 @@ function normalizeError(error: unknown): {
 		return { code, message: error.message.slice(0, 1000) };
 	}
 	return { code: "ERROR", message: "Unknown filesystem error" };
+}
+
+function getFileKey(entry: DiscoveredEntry): string {
+	return `${entry.rootId}\0${entry.path}`;
+}
+
+/**
+ * Repository-relative targets of Claude Code `@path` imports. Code spans and
+ * fenced blocks are ignored, as in Claude Code. Only relative paths inside the
+ * repository resolve; callers keep only targets that exist in the inventory.
+ */
+export function findInstructionImports(
+	text: string,
+	fromPath: string,
+): readonly string[] {
+	const prose = text
+		.replace(/^(```|~~~)[^\n]*\n[\s\S]*?^\1[^\n]*$/gmu, "")
+		.replace(/`[^`\n]*`/gu, "");
+	const targets = new Set<string>();
+	for (const match of prose.matchAll(/(?:^|\s)@([^\s`'"<>()[\]{}]+)/gu)) {
+		const raw = match[1];
+		if (raw === undefined || raw.startsWith("/") || raw.startsWith("~"))
+			continue;
+		for (const candidate of [raw, raw.replace(/[.,;:!?]+$/u, "")]) {
+			if (candidate.length === 0) continue;
+			const resolved = posix.normalize(
+				posix.join(posix.dirname(fromPath), candidate),
+			);
+			if (
+				resolved === "." ||
+				resolved === ".." ||
+				resolved.startsWith("../") ||
+				posix.isAbsolute(resolved)
+			)
+				continue;
+			targets.add(resolved);
+		}
+		if (targets.size >= MAX_INSTRUCTION_IMPORTS_PER_FILE) break;
+	}
+	return [...targets];
 }
 
 function compareEntries(left: ContextEntry, right: ContextEntry): number {

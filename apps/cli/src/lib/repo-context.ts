@@ -190,6 +190,10 @@ export async function collectSessionRepositoryContext(input: {
 			additionalRoots,
 			capturePolicy: "session-evidence",
 			observedSkillNames: input.observedSkillNames,
+			workingDirectory: await getRepositoryRelativePath(
+				context.repositoryRoot,
+				input.repositoryPath,
+			),
 			excludedPathPrefixes:
 				configBoundary.excludedPathPrefix === null
 					? defaults.excludedPathPrefixes
@@ -226,6 +230,21 @@ export async function collectSessionRepositoryContext(input: {
 		context.spoolEnv,
 	);
 	return { bundle, candidate, context, stored };
+}
+
+async function getRepositoryRelativePath(
+	repositoryRoot: string,
+	path: string,
+): Promise<string | undefined> {
+	const canonicalPath = await resolveCanonicalPath(path);
+	const relativePath = relative(repositoryRoot, canonicalPath);
+	if (
+		relativePath === ".." ||
+		relativePath.startsWith(`..${sep}`) ||
+		isAbsolute(relativePath)
+	)
+		return undefined;
+	return relativePath.split(sep).join("/");
 }
 
 async function getRepositoryConfigBoundary(

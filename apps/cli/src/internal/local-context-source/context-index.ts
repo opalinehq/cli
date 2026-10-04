@@ -25,20 +25,44 @@ const FACET_KINDS: readonly ContextIndexFacetKind[] = [
 	"package-context",
 ];
 
+// Content omitted because a capacity limit was reached. Metadata-only content
+// is a deliberate policy (skill resources, personal files) and not a cut.
+const CAPACITY_OMISSIONS: ReadonlySet<string> = new Set([
+	"blob-count-cap",
+	"file-content-cap",
+	"root-content-cap",
+	"total-content-cap",
+]);
+
+/**
+ * Builds one facet per root and kind. Coverage is decided per facet: a facet
+ * is truncated only when its own inventory or content was cut (the root's
+ * discovery stopped early, one of its resources was dropped from the manifest,
+ * or a resource's content hit a capacity limit). A missing root holds nothing,
+ * so its facets are complete and absent.
+ */
 export function buildContextIndex(
 	roots: readonly ContextRootManifest[],
 	entries: readonly ContextEntry[],
 	excludedPaths: readonly ExcludedPath[],
 	errors: readonly CoverageError[],
+	droppedEntries: readonly ContextEntry[] = [],
 ): ContextIndex {
 	return {
 		facets: roots.flatMap((root) =>
 			FACET_KINDS.map((kind) =>
-				buildFacet(root, kind, entries, excludedPaths, errors),
+				buildFacet(root, kind, entries, excludedPaths, errors, droppedEntries),
 			),
 		),
 		skills: buildSkillIndex(entries),
 	};
+}
+
+export function getContextFacetKinds(
+	path: string,
+	entry: ContextEntry | undefined = undefined,
+): readonly ContextIndexFacetKind[] {
+	return getFacetKinds(path, entry);
 }
 
 export function assessContextSkillUse(
@@ -58,16 +82,22 @@ function buildFacet(
 	entries: readonly ContextEntry[],
 	excludedPaths: readonly ExcludedPath[],
 	errors: readonly CoverageError[],
+	droppedEntries: readonly ContextEntry[],
 ): ContextIndexFacet {
-	const resources = entries
-		.filter(
-			(entry) =>
-				entry.rootId === root.id &&
-				getFacetKinds(entry.path, entry).includes(kind),
-		)
-		.map(buildResource)
-		.sort(compareResources);
-	const coverage = getFacetCoverage(root, kind, excludedPaths, errors);
+	const facetEntries = entries.filter(
+		(entry) =>
+			entry.rootId === root.id &&
+			getFacetKinds(entry.path, entry).includes(kind),
+	);
+	const resources = facetEntries.map(buildResource).sort(compareResources);
+	const coverage = getFacetCoverage(
+		root,
+		kind,
+		facetEntries,
+		excludedPaths,
+		errors,
+		droppedEntries,
+	);
 	return {
 		kind,
 		rootId: root.id,
@@ -141,10 +171,12 @@ function buildSkillUse(
 function getFacetCoverage(
 	root: ContextRootManifest,
 	kind: ContextIndexFacetKind,
+	facetEntries: readonly ContextEntry[],
 	excludedPaths: readonly ExcludedPath[],
 	errors: readonly CoverageError[],
+	droppedEntries: readonly ContextEntry[],
 ): ContextIndexCoverageStatus {
-	if (root.status === "missing") return "unavailable";
+	if (root.status === "missing") return "complete";
 	if (root.status === "inaccessible") return "denied";
 	if (root.status === "limit-reached") return "truncated";
 	if (
@@ -155,6 +187,21 @@ function getFacetCoverage(
 		)
 	) {
 		return "denied";
+	}
+	if (
+		droppedEntries.some(
+			(entry) =>
+				entry.rootId === root.id &&
+				getFacetKinds(entry.path, entry).includes(kind),
+		) ||
+		facetEntries.some(
+			(entry) =>
+				entry.kind === "file" &&
+				entry.content.status === "omitted" &&
+				CAPACITY_OMISSIONS.has(entry.content.reason),
+		)
+	) {
+		return "truncated";
 	}
 	if (
 		excludedPaths.some(

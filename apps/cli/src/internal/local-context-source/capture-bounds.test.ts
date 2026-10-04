@@ -22,6 +22,11 @@ import { planTranscriptRevision } from "../../lib/transcript-revision.js";
 import { extractObservedSkills } from "../../lib/transcript-skills.js";
 import { buildRepositoryEvidenceIndexRow } from "./__fixtures__/athena-evidence-index.js";
 import { addSanitizedTextBlob, createBlobStore } from "./blob-store.js";
+import {
+	SESSION_CONTEXT_MAX_ENTRIES,
+	SESSION_CONTEXT_MAX_MANIFEST_BYTES,
+	SESSION_CONTEXT_MAX_METADATA_LIST_BYTES,
+} from "./capture-policy.js";
 import { collectLocalContextBundle } from "./collector.js";
 import { filterContextMetadata } from "./metadata-filter.js";
 import { createLocalContextSourceEnv } from "./node-env.js";
@@ -220,9 +225,23 @@ test("bounds a clean canary-shaped capture without uploading skill resources or 
 		);
 	expect(bundle.blobs.length).toBeLessThanOrEqual(256);
 	expect(blobBytes).toBeLessThanOrEqual(2 * 1024 * 1024);
-	expect(bundle.manifest.entries.length).toBeLessThanOrEqual(2000);
-	expect(manifestBytes).toBeLessThan(512 * 1024);
-	expect(wireManifest.bytes.byteLength).toBeLessThan(512 * 1024);
+	expect(bundle.manifest.entries.length).toBeLessThanOrEqual(
+		SESSION_CONTEXT_MAX_ENTRIES,
+	);
+	expect(manifestBytes).toBeLessThanOrEqual(SESSION_CONTEXT_MAX_MANIFEST_BYTES);
+	expect(wireManifest.bytes.byteLength).toBeLessThan(
+		SESSION_CONTEXT_MAX_MANIFEST_BYTES + 256 * 1024,
+	);
+	// Dropping plain inventory to fit the manifest keeps every facet complete,
+	// every skill definition in the index and the roots' status unchanged.
+	expect(bundle.manifest.contextIndex.skills).toHaveLength(120);
+	for (const root of bundle.manifest.roots)
+		expect(root.status).toBe("collected");
+	for (const facet of bundle.manifest.contextIndex.facets)
+		expect(facet.coverage).toBe("complete");
+	expect(
+		upload.input.coverage.filter((item) => item.status !== "complete"),
+	).toEqual([]);
 	expect(
 		RepositoryEvidenceInitInputSchema.safeParse(upload.input).success,
 	).toBe(true);
@@ -231,9 +250,6 @@ test("bounds a clean canary-shaped capture without uploading skill resources or 
 		omittedBlobs: 0,
 		reason: "capture-limit",
 	});
-	expect(bundle.manifest.coverage.limitsReached).toContain(
-		"maxManifestEntries",
-	);
 	expect(bundle.manifest.coverage.limitsReached).toContain("maxManifestBytes");
 	expect(bundle.manifest.coverage.contentFiles).toBe(2);
 	expect(bundle.manifest.contextIndex.skills.length).toBeGreaterThan(0);
@@ -362,7 +378,7 @@ test("generated hash-only and blob-limited resources pass the production Athena 
 		{
 			...defaults,
 			capturePolicy: "session-evidence",
-			limits: { ...defaults.limits, maxBlobs: 1 },
+			limits: { ...defaults.limits, maxInstructionFiles: 1 },
 		},
 		createLocalContextSourceEnv(),
 	);
@@ -393,10 +409,25 @@ test("generated hash-only and blob-limited resources pass the production Athena 
 	expect(
 		row.context_facets.find((facet) => facet[0] === "package-context")?.[4],
 	).toBe("truncated");
+	// Only the facet whose content was cut is truncated; metadata-only content
+	// is policy, so package-context and agents-instructions stay complete.
+	const facetCoverage = Object.fromEntries(
+		row.context_facets
+			.filter((facet) => facet[1] === "repository")
+			.map((facet) => [facet[0], facet[3]]),
+	);
+	expect(facetCoverage).toEqual({
+		"agents-instructions": "complete",
+		"claude-instructions": "truncated",
+		hooks: "complete",
+		mcp: "complete",
+		"package-context": "complete",
+		plans: "complete",
+	});
 	expect(manifest.localContext.coverage.truncated.omittedBlobs).toBe(1);
 });
 
-test("reserves top-level instruction content ahead of 300 nested instruction files", async () => {
+test("captures 309 instruction files whole and reserves top-level ones when the instruction pool is full", async () => {
 	const rootPaths = [
 		"AGENTS.md",
 		"AGENTS.override.md",
@@ -416,11 +447,23 @@ test("reserves top-level instruction content ahead of 300 nested instruction fil
 		]),
 	]);
 	const directory = await createSmallFixture(files);
-	const bundle = await collectLocalContextBundle(
+	const complete = await collectLocalContextBundle(
 		directory,
 		{
 			...getDefaultLocalContextCollectionOptions(),
 			capturePolicy: "session-evidence",
+		},
+		createLocalContextSourceEnv(),
+	);
+	expect(complete.blobs).toHaveLength(309);
+	expect(complete.manifest.coverage.truncated).toBeUndefined();
+	const defaults = getDefaultLocalContextCollectionOptions();
+	const bundle = await collectLocalContextBundle(
+		directory,
+		{
+			...defaults,
+			capturePolicy: "session-evidence",
+			limits: { ...defaults.limits, maxInstructionFiles: 256 },
 		},
 		createLocalContextSourceEnv(),
 	);
@@ -434,7 +477,10 @@ test("reserves top-level instruction content ahead of 300 nested instruction fil
 		).toBe(files[path]);
 	}
 	expect(bundle.blobs).toHaveLength(256);
-	expect(bundle.manifest.coverage.truncated?.omittedBlobs).toBeGreaterThan(0);
+	expect(bundle.manifest.coverage.truncated?.omittedBlobs).toBe(309 - 256);
+	expect(bundle.manifest.coverage.limitsReached).toContain(
+		"maxInstructionFiles",
+	);
 });
 
 test("keeps Claude and Codex agent-definition Markdown but not skill-resource Markdown", async () => {
@@ -801,8 +847,8 @@ function fileEntry(
 	return entry;
 }
 
-test.each([2, 3, 4, 5, 6])(
-	"prioritizes instructions, observed skills across roots, then agent definitions at a %i-blob cap",
+test.each([1, 2, 3, 4])(
+	"captures instructions from their own pool, then observed skills across roots and agent definitions at a %i-blob cap",
 	async (maxBlobs) => {
 		const directory = await createSmallFixture({
 			"repo/AGENTS.md": "Root instructions\n",
@@ -851,9 +897,12 @@ test.each([2, 3, 4, 5, 6])(
 			options,
 			env,
 		);
+		for (const path of ["AGENTS.md", "nested/CLAUDE.md"]) {
+			const entry = fileEntry(bundle, "repository", path);
+			expect(entry.content.status).toBe("available");
+			expect(entry.hash.status).toBe("available");
+		}
 		const priority = [
-			["repository", "AGENTS.md"],
-			["repository", "nested/CLAUDE.md"],
 			["repository", ".claude/skills/repo-skill/SKILL.md"],
 			["skills-z", "zzz-observed/SKILL.md"],
 			["repository", ".claude/agents/reviewer.md"],
@@ -879,7 +928,7 @@ test.each([2, 3, 4, 5, 6])(
 			});
 			expect(entry.hash.status).toBe("available");
 		}
-		expect(bundle.blobs).toHaveLength(Math.min(maxBlobs, priority.length));
+		expect(bundle.blobs).toHaveLength(2 + Math.min(maxBlobs, priority.length));
 		if (maxBlobs < priority.length)
 			expect(bundle.manifest.coverage.truncated).toEqual({
 				omittedBlobs: priority.length - maxBlobs,
@@ -910,7 +959,7 @@ test("counts stored UTF-8 bytes and unique blobs at the byte boundary", () => {
 	expect(store.blobs.size).toBe(2);
 });
 
-test("Git patches use only capacity left after instructions and observed skill definitions", async () => {
+test("Git patches have their own pool and are cut only by their own limit", async () => {
 	const directory = await createSmallFixture({
 		"AGENTS.md": "Original instructions\n",
 		".claude/skills/demo/SKILL.md": "Definition\n",
@@ -938,11 +987,11 @@ test("Git patches use only capacity left after instructions and observed skill d
 			...defaults,
 			capturePolicy: "session-evidence",
 			observedSkillNames: ["demo"],
-			limits: { ...defaults.limits, maxBlobs: 2 },
+			limits: { ...defaults.limits, maxBlobs: 1 },
 		},
 		createLocalContextSourceEnv(),
 	);
-	expect(bundle.blobs).toHaveLength(2);
+	expect(bundle.blobs).toHaveLength(3);
 	expect(fileEntry(bundle, "repository", "AGENTS.md").content.status).toBe(
 		"available",
 	);
@@ -955,40 +1004,56 @@ test("Git patches use only capacity left after instructions and observed skill d
 	).toBe("omitted");
 	if (bundle.manifest.git.status !== "available")
 		throw new Error("Missing Git metadata");
-	expect(
-		bundle.manifest.git.diffs.find((diff) => diff.kind === "working-tree"),
-	).toMatchObject({
-		blobId: null,
-		omissionReason: "blob-count-cap",
-		reconstructable: false,
-	});
-	expect(bundle.manifest.coverage.truncated).toMatchObject({
-		omittedBlobs: 1,
-		reason: "capture-limit",
-	});
-	const complete = await collectLocalContextBundle(
+	const workingDiff = bundle.manifest.git.diffs.find(
+		(diff) => diff.kind === "working-tree",
+	);
+	expect(workingDiff?.blobId).not.toBeNull();
+	expect(bundle.manifest.coverage.truncated).toBeUndefined();
+	const patchLimited = await collectLocalContextBundle(
 		directory,
 		{
 			...defaults,
 			capturePolicy: "session-evidence",
 			observedSkillNames: ["demo"],
+			limits: { ...defaults.limits, maxDiffContentBytes: 8 },
 		},
 		createLocalContextSourceEnv(),
 	);
-	expect(complete.blobs).toHaveLength(3);
-	expect(complete.manifest.coverage.truncated).toBeUndefined();
+	if (patchLimited.manifest.git.status !== "available")
+		throw new Error("Missing Git metadata");
+	expect(
+		patchLimited.manifest.git.diffs.find(
+			(diff) => diff.kind === "working-tree",
+		),
+	).toMatchObject({
+		blobId: null,
+		omissionReason: "total-content-cap",
+		reconstructable: false,
+	});
+	expect(patchLimited.blobs).toHaveLength(2);
+	expect(patchLimited.manifest.coverage.truncated).toMatchObject({
+		omittedBlobs: 1,
+		reason: "capture-limit",
+	});
+	// The patch cut leaves every facet complete.
+	for (const facet of patchLimited.manifest.contextIndex.facets)
+		expect(facet.coverage).toBe("complete");
 });
 
-test("enforces the exact 2 MiB byte boundary before skills and configs and hashes omitted content", async () => {
-	const files = Object.fromEntries(
-		Array.from({ length: 4 }, (_, index) => [
-			`nested-${index}/AGENTS.md`,
+test("enforces the exact 2 MiB general-content boundary after instructions and hashes omitted content", async () => {
+	const files = Object.fromEntries([
+		...Array.from({ length: 4 }, (_, index) => [
+			`.claude/skills/observed-${index}/SKILL.md`,
 			`${index}${"x".repeat(512 * 1024 - 1)}`,
 		]),
-	);
+		...Array.from({ length: 4 }, (_, index) => [
+			`nested-${index}/AGENTS.md`,
+			`${index}${"y".repeat(512 * 1024 - 1)}`,
+		]),
+	]);
 	const directory = await createSmallFixture({
 		...files,
-		".claude/skills/observed/SKILL.md": "Observed definition\n",
+		".claude/agents/reviewer.md": "Agent definition\n",
 		".mcp.json": '{"mcpServers":{}}',
 	});
 	const bundle = await collectLocalContextBundle(
@@ -996,15 +1061,17 @@ test("enforces the exact 2 MiB byte boundary before skills and configs and hashe
 		{
 			...getDefaultLocalContextCollectionOptions(),
 			capturePolicy: "session-evidence",
-			observedSkillNames: ["observed"],
+			observedSkillNames: [0, 1, 2, 3].map((index) => `observed-${index}`),
 		},
 		createLocalContextSourceEnv(),
 	);
-	expect(bundle.blobs).toHaveLength(4);
+	// Four 512 KiB instruction files come from the instruction pool; four
+	// 512 KiB observed skills fill the 2 MiB general pool exactly.
+	expect(bundle.blobs).toHaveLength(8);
 	expect(bundle.blobs.reduce((total, blob) => total + blob.byteLength, 0)).toBe(
-		2 * 1024 * 1024,
+		4 * 1024 * 1024,
 	);
-	for (const path of [".claude/skills/observed/SKILL.md", ".mcp.json"]) {
+	for (const path of [".claude/agents/reviewer.md", ".mcp.json"]) {
 		const entry = fileEntry(bundle, "repository", path);
 		expect(entry.content).toMatchObject({
 			status: "omitted",
@@ -1024,6 +1091,8 @@ test("enforces the exact 2 MiB byte boundary before skills and configs and hashe
 	expect(bundle.manifest.coverage.limitsReached).toContain(
 		"maxTotalContentBytes",
 	);
+	for (const facet of bundle.manifest.contextIndex.facets)
+		expect(facet.coverage).toBe("complete");
 });
 
 test("all skill resources, including configs and instructions, are hash-only and high-risk exclusions are unchanged", async () => {
@@ -1118,11 +1187,29 @@ test("large Git and exclusion inventories cannot escape the manifest byte bound"
 	);
 	expect(
 		Buffer.byteLength(JSON.stringify(bundle.manifest)),
-	).toBeLessThanOrEqual(256 * 1024);
+	).toBeLessThanOrEqual(SESSION_CONTEXT_MAX_MANIFEST_BYTES);
 	expect(bundle.manifest.coverage.truncated?.omittedMetadata).toBeGreaterThan(
 		0,
 	);
-	expect(bundle.manifest.coverage.limitsReached).toContain("maxManifestBytes");
+	// Each overflowing list is trimmed on its own and named; nothing else is
+	// marked truncated.
+	expect(bundle.manifest.coverage.limitsReached).toEqual(
+		expect.arrayContaining([
+			"metadata:excludedPaths",
+			"metadata:git.statusEntries",
+		]),
+	);
+	expect(
+		Buffer.byteLength(JSON.stringify(bundle.manifest.coverage.excludedPaths)),
+	).toBeLessThanOrEqual(SESSION_CONTEXT_MAX_METADATA_LIST_BYTES);
+	expect(bundle.manifest.roots.map((root) => root.status)).toEqual([
+		"collected",
+	]);
+	if (bundle.manifest.git.status !== "available")
+		throw new Error("Missing Git metadata");
+	expect(bundle.manifest.git.truncatedSections).toEqual([]);
+	for (const facet of bundle.manifest.contextIndex.facets)
+		expect(facet.coverage).toBe("complete");
 	expect(fileEntry(bundle, "repository", "AGENTS.md").content.status).toBe(
 		"available",
 	);
