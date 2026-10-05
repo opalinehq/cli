@@ -113,15 +113,7 @@ test("concurrent pause writers preserve the latest requested expiry", async () =
 		const writer = async (pauseSeconds: number) => {
 			const script = `import { ORPCError } from "@orpc/client";
 import { pauseRepositoryEvidenceCapture } from ${JSON.stringify(reader)};
-for (let attempt = 0; ; attempt++) {
-  try {
-    await pauseRepositoryEvidenceCapture(new ORPCError("EVIDENCE_CAPTURE_DISABLED", { status: 403, data: { pauseSeconds: ${pauseSeconds} } }), ${JSON.stringify(directory)}, ${now});
-    break;
-  } catch (error) {
-    if (attempt >= 20) throw error;
-    await Bun.sleep(10);
-  }
-}`;
+await pauseRepositoryEvidenceCapture(new ORPCError("EVIDENCE_CAPTURE_DISABLED", { status: 403, data: { pauseSeconds: ${pauseSeconds} } }), ${JSON.stringify(directory)}, ${now});`;
 			const child = Bun.spawn([process.execPath, "--eval", script], {
 				stdout: "pipe",
 				stderr: "pipe",
@@ -137,6 +129,51 @@ for (let attempt = 0; ; attempt++) {
 		expect(readRepositoryEvidencePauseUntil(directory, now)).toBe(
 			now + 604_800_000,
 		);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a pause writer waits for another config writer and keeps the longer expiry", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "opaline-pause-wait-"));
+	const now = Date.now();
+	const until = now + 604_800_000;
+	try {
+		let pause: Promise<void> | undefined;
+		await withConfigLock(directory, async () => {
+			pause = pauseRepositoryEvidenceCapture(
+				new ORPCError("EVIDENCE_CAPTURE_DISABLED", {
+					status: 403,
+					data: { pauseSeconds: 3_600 },
+				}),
+				directory,
+				now,
+			);
+			await Bun.sleep(200);
+			await writeFile(
+				join(directory, "repository-evidence-pause.json"),
+				JSON.stringify({ until }),
+			);
+		});
+		await pause;
+		expect(readRepositoryEvidencePauseUntil(directory, now)).toBe(until);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a reader keeps an expired marker while another process holds the config lock", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "opaline-pause-expired-"));
+	const marker = join(directory, "repository-evidence-pause.json");
+	const now = Date.now();
+	try {
+		await writeFile(marker, JSON.stringify({ until: now - 1 }));
+		await withConfigLock(directory, async () => {
+			expect(readRepositoryEvidencePauseUntil(directory, now)).toBeUndefined();
+			expect(await readFile(marker, "utf8")).toContain("until");
+		});
+		expect(readRepositoryEvidencePauseUntil(directory, now)).toBeUndefined();
+		expect(await lstat(marker).catch(() => undefined)).toBeUndefined();
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
