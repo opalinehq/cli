@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES } from "../contracts/index.js";
 import {
 	type PendingRepositoryEvidence,
+	readPendingTranscriptSourceIds,
 	removePendingRepositoryEvidence,
 	writePendingRepositoryEvidence,
 } from "./repository-evidence-pending.js";
@@ -13,6 +14,8 @@ import { planTranscriptRevisionFile } from "./transcript-revision.js";
 
 const MAX_SOURCE_BYTES = 512 * 1024 * 1024;
 const ENCODE_WINDOW_CHARS = 256 * 1024;
+const ORPHANED_SOURCE_MIN_AGE_MS = 24 * 60 * 60 * 1000;
+const SOURCE_FILE_NAME = /^([0-9a-f-]{36})\.jsonl$/;
 
 export async function persistTranscriptSource(
 	content: string | { readonly path: string },
@@ -21,10 +24,10 @@ export async function persistTranscriptSource(
 ): Promise<string> {
 	const directory = join(configDir, "repository-evidence-sources");
 	await mkdir(directory, { recursive: true, mode: 0o700 });
-	const names = await readdir(directory);
+	const sources = await removeOrphanedTranscriptSources(directory, configDir);
 	let used = 0;
-	for (const name of names) used += (await stat(join(directory, name))).size;
-	if (names.length >= 200)
+	for (const source of sources) used += source.size;
+	if (sources.length >= 200)
 		throw new Error("Transcript continuation source quota exceeded");
 	const sourceId = randomUUID();
 	const path = transcriptSourcePath(configDir, sourceId);
@@ -46,6 +49,29 @@ export async function persistTranscriptSource(
 		await file.close();
 	}
 	return sourceId;
+}
+
+async function removeOrphanedTranscriptSources(
+	directory: string,
+	configDir: string,
+): Promise<readonly { readonly name: string; readonly size: number }[]> {
+	const cutoff = Date.now() - ORPHANED_SOURCE_MIN_AGE_MS;
+	const sources = [];
+	for (const name of await readdir(directory)) {
+		const { mtimeMs, size } = await stat(join(directory, name));
+		sources.push({ aged: mtimeMs < cutoff, name, size });
+	}
+	if (!sources.some((source) => source.aged)) return sources;
+	const referenced = await readPendingTranscriptSourceIds(configDir);
+	if (!referenced) return sources;
+	const kept = [];
+	for (const source of sources) {
+		const sourceId = SOURCE_FILE_NAME.exec(source.name)?.[1];
+		if (source.aged && sourceId && !referenced.has(sourceId))
+			await rm(join(directory, source.name), { force: true });
+		else kept.push(source);
+	}
+	return kept;
 }
 
 async function* readTranscriptSource(

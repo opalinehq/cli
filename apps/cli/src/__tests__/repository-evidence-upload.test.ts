@@ -8,6 +8,7 @@ import {
 	readFile,
 	rm,
 	stat,
+	utimes,
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -979,6 +980,84 @@ describe("repository evidence upload building", () => {
 			await rm(configDir, { recursive: true, force: true });
 		},
 	);
+
+	test("removes the continuation source of quarantined evidence", async () => {
+		const configDir = await mkdtemp(
+			join(tmpdir(), "opaline-quarantine-source-"),
+		);
+		const content = '{"ordinal":0}\n';
+		const sourceId = await persistTranscriptSource(content, configDir);
+		const plan = await planTranscriptRevision({
+			content: new TextEncoder().encode(content),
+			previous: undefined,
+			scope,
+			terminal: false,
+		});
+		const oldBundle = makeBundle();
+		const bundle = {
+			...oldBundle,
+			manifest: {
+				...oldBundle.manifest,
+				transport: {
+					...oldBundle.manifest.transport,
+					secretFilterVersion: FILTER_VERSION - 1,
+				},
+			},
+		};
+		await writePendingRepositoryEvidence(
+			{
+				continuation: { sourceId, terminal: false },
+				endpoint: "https://opaline.so/rpc",
+				transcriptRevision: plan.manifest,
+				upload: buildUploadFor(bundle, plan, content),
+			},
+			configDir,
+		);
+		const warnings: Error[] = [];
+		expect(
+			await readPendingRepositoryEvidence(configDir, {
+				onWarning: (warning) => warnings.push(warning),
+			}),
+		).toEqual([]);
+		expect(warnings).toHaveLength(1);
+		expect(
+			await readdir(join(configDir, "repository-evidence-sources")),
+		).toEqual([]);
+		await rm(configDir, { recursive: true, force: true });
+	});
+
+	test("removes aged transcript sources that no pending evidence references", async () => {
+		const configDir = await mkdtemp(join(tmpdir(), "opaline-orphan-sources-"));
+		const content = '{"ordinal":0}\n';
+		const referencedId = await persistTranscriptSource(content, configDir);
+		const orphanedId = await persistTranscriptSource(content, configDir);
+		const recentId = await persistTranscriptSource(content, configDir);
+		const plan = await planTranscriptRevision({
+			content: new TextEncoder().encode(content),
+			previous: undefined,
+			scope,
+			terminal: false,
+		});
+		await writePendingRepositoryEvidence(
+			{
+				continuation: { sourceId: referencedId, terminal: false },
+				endpoint: "https://opaline.so/rpc",
+				transcriptRevision: plan.manifest,
+				upload: buildUploadFor(makeBundle(), plan, content),
+			},
+			configDir,
+		);
+		const aged = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+		for (const sourceId of [referencedId, orphanedId])
+			await utimes(transcriptSourcePath(configDir, sourceId), aged, aged);
+		const nextId = await persistTranscriptSource(content, configDir);
+		expect(
+			(await readdir(join(configDir, "repository-evidence-sources"))).sort(),
+		).toEqual(
+			[referencedId, recentId, nextId].map((id) => `${id}.jsonl`).sort(),
+		);
+		await rm(configDir, { recursive: true, force: true });
+	});
 
 	test("retry reports quarantined evidence distinctly and releases its spool capacity", async () => {
 		const fixture = await createCliFixture("codex");
