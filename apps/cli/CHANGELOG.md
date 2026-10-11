@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.1](https://github.com/opalinehq/cli/compare/opaline-cli@0.12.0...opaline-cli@0.12.1) (2026-10-11)
+
+
+### Bug Fixes
+
+* **cli:** attribute sessions started outside a repository to the one they worked in ([#503](https://github.com/opalinehq/cli/issues/503)) ([c291415](https://github.com/opalinehq/cli/commit/c29141528b080ff29a4a5f6096367b9d63166008))
+* **cli:** upload later subagents and every analysis of a linked chat ([#501](https://github.com/opalinehq/cli/issues/501)) ([2ca4da7](https://github.com/opalinehq/cli/commit/2ca4da76699c261d0a881fd9b76ce8f4df7a202f))
+
 ## [0.12.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.11.0...opaline-cli@0.12.0) (2026-10-04)
 
 
