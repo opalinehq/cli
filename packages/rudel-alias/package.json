@@ -1,6 +1,6 @@
 {
 	"name": "rudel",
-	"version": "0.12.0",
+	"version": "0.12.1",
 	"type": "module",
 	"description": "Compatibility alias for the Opaline CLI",
 	"license": "MIT",
@@ -31,6 +31,6 @@
 		"README.md"
 	],
 	"dependencies": {
-		"@opalinehq/cli": "0.12.0"
+		"@opalinehq/cli": "0.12.1"
 	}
 }
