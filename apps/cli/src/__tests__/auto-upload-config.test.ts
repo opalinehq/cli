@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	isRepositoryAutoUploadAllowed,
+	isRepositoryAutoUploadDisabled,
 	loadAutoUploadConfig,
 	updateAutoUploadConfig,
 } from "../lib/auto-upload-config.js";
@@ -214,6 +215,38 @@ test("recovers an empty lock directory left during release", async () => {
 		await save({ version: 1, repositories: {} });
 	});
 	expect(loadAutoUploadConfig()?.repositories).toEqual({});
+});
+
+test("only a repository's own Off setting disables it, not a missing one", async () => {
+	await fixture();
+	expect(isRepositoryAutoUploadDisabled("anything", "codex")).toBe(false);
+	await updateAutoUploadConfig(async (_existing, save) => {
+		await save({
+			version: 1,
+			repositories: {
+				on: { name: "On", paths: [], enabled: true },
+				off: { name: "Off", paths: [], enabled: false },
+				legacy: { name: "Legacy", paths: [], enabled: false },
+				claudeOnly: {
+					name: "Claude only",
+					paths: [],
+					enabled: true,
+					enabledSources: ["claude_code"],
+				},
+			},
+		});
+	});
+	expect(isRepositoryAutoUploadDisabled("on", "codex")).toBe(false);
+	expect(isRepositoryAutoUploadDisabled("off", "codex")).toBe(true);
+	expect(isRepositoryAutoUploadDisabled("unknown", "codex")).toBe(false);
+	expect(isRepositoryAutoUploadDisabled("unknown", "codex", ["legacy"])).toBe(
+		true,
+	);
+	expect(isRepositoryAutoUploadDisabled("on", "codex", ["legacy"])).toBe(false);
+	expect(isRepositoryAutoUploadDisabled("claudeOnly", "claude_code")).toBe(
+		false,
+	);
+	expect(isRepositoryAutoUploadDisabled("claudeOnly", "codex")).toBe(true);
 });
 
 async function fixture(): Promise<string> {

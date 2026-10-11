@@ -12,7 +12,10 @@ import {
 	runMarkedAnalysisHook,
 } from "../../../lib/analysis-hook.js";
 import { getApiBaseOverride } from "../../../lib/api-target.js";
-import { isRepositoryAutoUploadAllowed } from "../../../lib/auto-upload-config.js";
+import {
+	isRepositoryAutoUploadAllowed,
+	isRepositoryAutoUploadDisabled,
+} from "../../../lib/auto-upload-config.js";
 import { loadCredentials } from "../../../lib/credentials.js";
 import { removeFailedUpload } from "../../../lib/failed-uploads.js";
 import { getGitInfo } from "../../../lib/git-info.js";
@@ -27,6 +30,10 @@ import {
 	resolveUploadRepositoryIdentity,
 } from "../../../lib/repository-discovery.js";
 import { captureAndUploadSessionEvidence } from "../../../lib/session-evidence.js";
+import {
+	inferSessionRepository,
+	withSessionRepository,
+} from "../../../lib/session-repository.js";
 import { allowsInsecureEndpointFromEnv } from "../../../lib/upload-endpoint.js";
 import {
 	formatRedactionSummary,
@@ -124,11 +131,32 @@ async function runTurnComplete(
 
 		const organizationId = await getProjectOrgId(input.cwd);
 
-		const request = await codexAdapter.buildUploadRequest(sessionFile, {
+		const builtRequest = await codexAdapter.buildUploadRequest(sessionFile, {
 			gitInfo,
 			organizationId,
 			uploadMode: "hook",
 		});
+		const inferred = await inferSessionRepository(builtRequest);
+		if (
+			inferred &&
+			isRepositoryAutoUploadDisabled(
+				inferred.repository.repoKey,
+				codexAdapter.source,
+				[inferred.legacyKey],
+			)
+		) {
+			logger.info(
+				"Skipping session {sessionId}: it worked in {repository}, where automatic upload is disabled",
+				{
+					repository: inferred.repository.repoLabel,
+					sessionId: input.threadId,
+				},
+			);
+			return;
+		}
+		const request = inferred
+			? withSessionRepository(builtRequest, inferred.gitInfo)
+			: builtRequest;
 		const evidenceUpload = organizationId
 			? captureAndUploadSessionEvidence({
 					credentials,
