@@ -15,6 +15,7 @@ import { createApiClient } from "./api-client.js";
 import { type BatchUploadSummary, batchUpload } from "./batch-upload.js";
 import { getGitInfo } from "./git-info.js";
 import { getProjectOrgId } from "./project-config.js";
+import { withInferredSessionRepository } from "./session-repository.js";
 import type { UploadRepository } from "./upload-manager-repositories.js";
 import {
 	recordUploadBytes,
@@ -219,13 +220,12 @@ export async function uploadRepositorySessions(
 					config.maxRawSourceBytes,
 				);
 				if (!result) {
-					const request = await getAdapter(item.source).buildUploadRequest(
-						item,
-						{
+					const request = await withInferredSessionRepository(
+						await getAdapter(item.source).buildUploadRequest(item, {
 							organizationId: item.organizationId,
 							gitInfo: info,
 							uploadMode: "manual",
-						},
+						}),
 					);
 					const metadata = request.metadata;
 					failureMetadata = {

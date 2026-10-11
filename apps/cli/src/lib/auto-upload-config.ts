@@ -102,6 +102,31 @@ export function isRepositoryAutoUploadAllowed(
 		: legacyKeys.some((key) => allowed(config.repositories[key]));
 }
 
+/**
+ * Whether the user turned automatic upload off for a repository. Unlike
+ * `isRepositoryAutoUploadAllowed`, a repository without a setting is not off:
+ * this checks a repository a session worked in, not the folder it started in,
+ * whose own setting already decided the upload.
+ */
+export function isRepositoryAutoUploadDisabled(
+	repoKey: string,
+	source: Source,
+	legacyKeys: readonly string[] = [],
+	configDir = getConfigDir(),
+): boolean {
+	const config = loadAutoUploadConfig(configDir);
+	if (config === null) return false;
+	const entry =
+		config.repositories[repoKey] ??
+		legacyKeys
+			.map((key) => config.repositories[key])
+			.find((setting) => setting !== undefined);
+	return (
+		entry !== undefined &&
+		!(entry.enabled === true && entry.enabledSources?.includes(source) === true)
+	);
+}
+
 async function writeAutoUploadConfig(
 	config: AutoUploadConfig,
 	configDir = getConfigDir(),

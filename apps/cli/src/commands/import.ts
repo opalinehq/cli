@@ -31,6 +31,7 @@ import {
 import { getGitInfo } from "../lib/git-info.js";
 import { reconcilePendingUploads } from "../lib/pending-upload-reconcile.js";
 import { retryPendingSessionEvidence } from "../lib/session-evidence.js";
+import { withInferredSessionRepository } from "../lib/session-repository.js";
 import { resolveSession } from "../lib/session-resolver.js";
 import {
 	DEFAULT_ENDPOINT,
@@ -85,12 +86,6 @@ async function runSingleUpload(
 	write(`Found session at: ${sessionInfo.transcriptPath}`);
 
 	const gitInfo = await getGitInfo(sessionInfo.projectPath);
-	const displayName =
-		gitInfo.gitRemote ||
-		gitInfo.packageName ||
-		basename(sessionInfo.projectPath);
-	if (displayName) write(`Repository: ${displayName}`);
-	if (gitInfo.branch) write(`Branch: ${gitInfo.branch}`);
 
 	const organizationId = await resolveUploadOrganizationId({
 		credentials,
@@ -111,14 +106,13 @@ async function runSingleUpload(
 
 	let request: FileBackedUploadRequest;
 	try {
-		request = await getAdapter(sessionInfo.source).buildUploadRequest(
-			sessionFile,
-			{
+		request = await withInferredSessionRepository(
+			await getAdapter(sessionInfo.source).buildUploadRequest(sessionFile, {
 				tag: flags.tag,
 				gitInfo,
 				organizationId,
 				uploadMode: "manual",
-			},
+			}),
 		);
 	} catch (error) {
 		if (error instanceof MissingTranscriptTimestampError) {
@@ -128,6 +122,13 @@ async function runSingleUpload(
 		}
 		throw error;
 	}
+	const displayName =
+		request.metadata.gitRemote ||
+		request.metadata.packageName ||
+		basename(sessionInfo.projectPath);
+	if (displayName) write(`Repository: ${displayName}`);
+	if (request.metadata.gitBranch)
+		write(`Branch: ${request.metadata.gitBranch}`);
 
 	const transcriptBytes = (await stat(request.transcriptPath)).size;
 	write(`Transcript: ${transcriptBytes} bytes`);
@@ -381,12 +382,14 @@ async function runRetryUpload(
 						})
 					: undefined;
 
-			const request = await adapter.buildUploadRequest(sessionFile, {
-				tag: flags.tag,
-				gitInfo,
-				organizationId,
-				uploadMode: "retry",
-			});
+			const request = await withInferredSessionRepository(
+				await adapter.buildUploadRequest(sessionFile, {
+					tag: flags.tag,
+					gitInfo,
+					organizationId,
+					uploadMode: "retry",
+				}),
+			);
 			if (flags.forceReplace) request.metadata.force_replace = true;
 			if (item.analysisId !== undefined)
 				request.metadata.analysisId = item.analysisId;
