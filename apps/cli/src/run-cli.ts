@@ -70,9 +70,7 @@ export async function runCli(
 }
 
 function isLiveFollowCommand(args: readonly string[]): boolean {
-	return (
-		args[0] === "hooks" && args[1] === "claude" && args[2] === "live-follow"
-	);
+	return args[0] === "hooks" && args[1] === "live-follow";
 }
 
 function getTopLevelCommandName(args: readonly string[]) {

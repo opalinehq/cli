@@ -1,17 +1,5 @@
-import { execFile } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
-import {
-	lstat,
-	open,
-	readdir,
-	readFile,
-	realpath,
-	rename,
-	rm,
-	stat,
-	writeFile,
-} from "node:fs/promises";
+import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { getLogger } from "@logtape/logtape";
 import { ORPCError } from "@orpc/client";
@@ -31,19 +19,18 @@ import {
 	SESSION_OWNERSHIP_CONFLICT_CODE,
 } from "../contracts/index.js";
 import {
-	claudeCodeAdapter,
 	isContainedPath,
 	SUBAGENT_FILENAME_PATTERN,
 } from "../internal/agent-adapters/index.js";
 import {
 	getRedactionBudgetAnomaly,
-	MAX_REDACTION_RATIO,
 	type RedactionCounts,
 } from "../internal/secret-filter/index.js";
 import { createRpcClient } from "./api-client.js";
 import { getApiBaseOverride } from "./api-target.js";
 import { isRepositoryAutoUploadAllowed } from "./auto-upload-config.js";
-import { loadCredentials } from "./credentials.js";
+import { CodexRolloutIndex } from "./codex-live-rollouts.js";
+import { type Credentials, loadCredentials } from "./credentials.js";
 import {
 	DEFAULT_FILE_LEASE_OPTIONS,
 	type FileLease,
@@ -51,7 +38,7 @@ import {
 	tryAcquireFileLease,
 } from "./file-lease.js";
 import { getGitInfo } from "./git-info.js";
-import type { LiveSessionFollowerTarget } from "./live-session-launch.js";
+import { getLiveSessionFollowerLeasePath } from "./live-session-launch.js";
 import {
 	createLineReadBuffer,
 	type LiveSessionLine,
@@ -61,11 +48,19 @@ import {
 	readTail,
 } from "./live-session-lines.js";
 import {
-	getLiveSessionsDirectory,
 	isLiveSessionPaused,
 	pauseLiveSessions,
 } from "./live-session-pause.js";
+import {
+	getLiveSessionKey,
+	type LiveSessionSource,
+	listLiveSessionRegistrations,
+	removeAllLiveSessionRegistrations,
+	removeLiveSessionRegistration,
+	type StoredLiveSessionRegistration,
+} from "./live-session-registry.js";
 import { getConfigDir } from "./local-state.js";
+import { readProcessStartIdentities } from "./process-identity.js";
 import {
 	getLegacyRepositoryKeys,
 	resolveUploadRepositoryIdentity,
@@ -77,26 +72,42 @@ import {
 import { allowsInsecureEndpointFromEnv } from "./upload-endpoint.js";
 
 const MIB = 1024 * 1024;
-const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/u;
-const MAX_STREAMS = 512;
-/** Stop reading new lines while this much is waiting to be sent. */
-const READ_PAUSE_PENDING_BYTES = 4 * MIB;
-/** Hard ceiling for lines held in memory; beyond it the follower stops. */
-const MAX_PENDING_BYTES = 16 * MIB;
-/** Redaction ratio is judged only after this much input. */
+const MAX_SESSIONS = 64;
+const MAX_STREAMS_PER_SESSION = 512;
+/**
+ * Lines read ahead of sending, across all sessions. Reading pauses at this
+ * budget; the transcript files are the buffer.
+ */
+const READ_AHEAD_BYTES = 2 * MIB;
+/** Redaction ratio is judged only after this much input of a session. */
 const REDACTION_RATIO_MIN_INPUT_BYTES = 256 * 1024;
 const MAX_IGNORED_SUBAGENT_ENTRIES = 4_096;
 const MAX_OUT_OF_SYNC_RETRIES = 3;
+/** Ends the follower and forgets every registration. */
+const GLOBAL_STOP_REASONS = new Set([
+	"api-key-required",
+	"disabled",
+	"endpoint-refused",
+	"invalid-response",
+	"not-authenticated",
+	"paused",
+	"unauthorized",
+	"unsupported",
+]);
 
 export interface LiveSessionFollowerTiming {
 	readonly tickMs: number;
 	readonly debounceMs: number;
 	readonly sendThresholdBytes: number;
-	readonly startTimeCheckMs: number;
+	/** How often process start identities are compared (PID reuse guard). */
+	readonly identityCheckMs: number;
+	/** Credentials, capability, pauses and repository settings. */
 	readonly settingsCheckMs: number;
+	/** Exit after this long without registered sessions. */
+	readonly idleExitMs: number;
 	readonly leaseWaitMs: number;
 	readonly transcriptWaitMs: number;
-	readonly maxRuntimeMs: number;
+	readonly maxSessionMs: number;
 	readonly finalReadDelayMs: number;
 	readonly finalFlushMs: number;
 	readonly backoffInitialMs: number;
@@ -104,17 +115,28 @@ export interface LiveSessionFollowerTiming {
 	readonly rateLimitBackoffMs: number;
 	readonly capabilityTimeoutMs: number;
 	readonly requestTimeoutMs: number;
+	/** A hook-parent agent process that exits this soon was not the agent. */
+	readonly orphanGraceMs: number;
+	/** Such a session ends after its transcript is idle this long. */
+	readonly orphanIdleMs: number;
+	/** A Codex session without a known `codex` process ends after this idle time. */
+	readonly codexOrphanIdleMs: number;
+	/** A Codex session of a running `codex` process ends after this idle time. */
+	readonly codexIdleMs: number;
+	/** A registration whose agent is already gone is only flushed when this recent. */
+	readonly staleRegistrationMs: number;
 }
 
 export const DEFAULT_LIVE_SESSION_FOLLOWER_TIMING: LiveSessionFollowerTiming = {
 	tickMs: 1_000,
 	debounceMs: 1_500,
 	sendThresholdBytes: MIB,
-	startTimeCheckMs: 30_000,
+	identityCheckMs: 30_000,
 	settingsCheckMs: 60_000,
-	leaseWaitMs: 30_000,
+	idleExitMs: 60_000,
+	leaseWaitMs: 2_000,
 	transcriptWaitMs: 10 * 60_000,
-	maxRuntimeMs: 7 * 24 * 60 * 60_000,
+	maxSessionMs: 7 * 24 * 60 * 60_000,
 	finalReadDelayMs: 300,
 	finalFlushMs: 60_000,
 	backoffInitialMs: 1_000,
@@ -122,19 +144,24 @@ export const DEFAULT_LIVE_SESSION_FOLLOWER_TIMING: LiveSessionFollowerTiming = {
 	rateLimitBackoffMs: 60_000,
 	capabilityTimeoutMs: 10_000,
 	requestTimeoutMs: 30_000,
+	orphanGraceMs: 5_000,
+	orphanIdleMs: 10 * 60_000,
+	codexOrphanIdleMs: 30 * 60_000,
+	codexIdleMs: 6 * 60 * 60_000,
+	staleRegistrationMs: 10 * 60_000,
 };
 
-export interface LiveSessionFollowerOptions extends LiveSessionFollowerTarget {
+export interface LiveSessionFollowerOptions {
 	readonly configDir?: string;
 	readonly timing?: Partial<LiveSessionFollowerTiming>;
 }
 
 export interface LiveSessionFollowerResult {
 	readonly reason: string;
+	readonly sessions: number;
 	readonly requests: number;
 	readonly linesSent: number;
 	readonly bytesSent: number;
-	readonly streams: number;
 }
 
 interface Stream {
@@ -153,11 +180,51 @@ interface Stream {
 	firstPendingAt: number | undefined;
 	needsReset: boolean;
 	outOfSync: number;
+	/** A server position still to be found in the file (an earlier read failed). */
+	locate: StreamCursor | undefined;
 }
 
 interface StreamCursor {
 	readonly committedLines: number;
 	readonly lastLineSha256: string | null;
+}
+
+interface Ending {
+	readonly reason: string;
+	/** Monotonic time from which the final read may start. */
+	readonly readAt: number;
+	readonly deadline: number;
+}
+
+interface Session {
+	readonly key: string;
+	readonly source: LiveSessionSource;
+	readonly sessionId: string;
+	readonly organizationId: string;
+	readonly transcriptPath: string;
+	readonly cwd: string;
+	/** Monotonic creation time. */
+	readonly createdAt: number;
+	registrations: StoredLiveSessionRegistration[];
+	readonly streams: Map<string, Stream>;
+	readonly ignoredEntries: Set<string>;
+	serverStreams: Map<string, StreamCursor> | undefined;
+	serverHadStreams: boolean;
+	repository: { repoKey: string; legacyKeys: string[] } | undefined;
+	gitRemote: string | undefined;
+	gitBranch: string | undefined;
+	subagentDirectory: string | undefined;
+	pendingBytes: number;
+	pendingLines: number;
+	inputBytes: number;
+	redactedBytes: number;
+	readonly redactionCounts: Record<string, number>;
+	/** Wall time of the last new transcript bytes (or of registration). */
+	lastActivityAt: number;
+	ending: Ending | undefined;
+	streamLimitLogged: boolean;
+	orphanLogged: boolean;
+	linesSent: number;
 }
 
 type Client = ContractRouterClient<typeof contract>;
@@ -168,16 +235,23 @@ class StopFollowing extends Error {
 	}
 }
 
+class StopSession extends Error {
+	constructor(readonly reason: string) {
+		super(reason);
+	}
+}
+
 const logger = getLogger(["opaline", "cli", "hook", "live"]);
 
 /**
- * Follows one Claude Code session while its agent process runs and appends
- * new complete transcript lines (main transcript and subagents) to the live
- * session endpoints. Never throws: every failure ends the follower, and the
- * session still arrives through the upload at session end.
+ * The machine-wide live session follower. It follows every registered Claude
+ * Code and Codex session while its agent process runs, appending new complete
+ * transcript lines (main transcript and sub-agents) to the live session
+ * endpoints. Never throws: every failure ends a session or the follower, and
+ * sessions still arrive through their regular uploads.
  */
 export async function runLiveSessionFollower(
-	options: LiveSessionFollowerOptions,
+	options: LiveSessionFollowerOptions = {},
 ): Promise<LiveSessionFollowerResult> {
 	const follower = new LiveSessionFollower(options);
 	let reason: string;
@@ -186,58 +260,46 @@ export async function runLiveSessionFollower(
 	} catch (error) {
 		reason = error instanceof StopFollowing ? error.reason : "failed";
 		if (!(error instanceof StopFollowing))
-			logger.warn("Live session updates for {sessionId} failed: {error}", {
+			logger.warn("Live session follower failed: {error}", {
 				error: describeError(error),
-				sessionId: options.sessionId,
 			});
-	} finally {
-		await follower.dispose();
 	}
-	const result = follower.result(reason);
-	if (!follower.started)
-		logger.debug("Live session updates for {sessionId} not started: {reason}", {
-			reason,
-			sessionId: options.sessionId,
-		});
-	else
-		logger.info(
-			"Live session updates for {sessionId} stopped: {reason} ({requests} requests, {linesSent} lines, {bytesSent} bytes, {streams} streams)",
-			{ ...result, sessionId: options.sessionId },
-		);
-	return result;
+	await follower.dispose(reason);
+	return follower.result(reason);
 }
 
 class LiveSessionFollower {
 	private readonly timing: LiveSessionFollowerTiming;
 	private readonly configDir: string;
-	private readonly startedAtMonotonic = performance.now();
-	private readonly streams = new Map<string, Stream>();
-	private readonly ignoredSubagentEntries = new Set<string>();
-	private readonly redactionCounts: Record<string, number> = {};
+	private readonly sessions = new Map<string, Session>();
 	private readonly readBuffer = createLineReadBuffer();
-	private client: Client | undefined;
+	private readonly codexRollouts = new CodexRolloutIndex();
+	/** Registration file → wall time its agent process was last seen alive. */
+	private readonly lastSeenAlive = new Map<string, number>();
+	/** Agent pid → start identity first observed by the follower. */
+	private readonly observedIdentities = new Map<number, string>();
+	/** Agent pid → start identity at the latest check. */
+	private readonly currentIdentities = new Map<number, string>();
+	/** Registration files being removed (not to be followed again meanwhile). */
+	private readonly removing = new Set<string>();
+	/** Pids whose start identity changed since first observed (reused). */
+	private readonly replacedIdentities = new Set<number>();
 	private lease: FileLease | null = null;
-	private markerPath: string | undefined;
-	private serverStreams: Map<string, StreamCursor> | undefined;
-	private serverHadStreams = false;
-	private agentStartTime: string | undefined;
-	private repository: { repoKey: string; legacyKeys: string[] } | undefined;
-	private gitRemote: string | undefined;
-	private gitBranch: string | undefined;
-	private subagentDirectory: string | undefined;
+	private started = false;
+	private client: Client | undefined;
+	private clientKey: string | undefined;
+	private capabilityConfirmed = false;
 	private pendingBytes = 0;
-	private pendingLines = 0;
-	private inputBytes = 0;
-	private redactedBytes = 0;
 	private backoffUntil = 0;
 	private backoffMs = 0;
-	private streamLimitLogged = false;
+	private sessionLimitLogged = false;
+	private rotation = 0;
 	private requests = 0;
 	private linesSent = 0;
 	private bytesSent = 0;
-	started = false;
+	private sessionsFollowed = 0;
 
-	constructor(private readonly options: LiveSessionFollowerOptions) {
+	constructor(options: LiveSessionFollowerOptions) {
 		this.timing = {
 			...DEFAULT_LIVE_SESSION_FOLLOWER_TIMING,
 			...options.timing,
@@ -251,55 +313,167 @@ class LiveSessionFollower {
 			linesSent: this.linesSent,
 			reason,
 			requests: this.requests,
-			streams: this.streams.size,
+			sessions: this.sessionsFollowed,
 		};
 	}
 
 	async run(): Promise<string> {
-		const preflight = await this.preflight();
-		if (preflight !== undefined) return preflight;
 		this.lease = await this.acquireLease();
-		if (!this.lease) return "already-following";
+		if (!this.lease) return "already-running";
 		this.started = true;
-		logger.info(
-			"Live session updates for {sessionId} started ({source}, agent process {agentPid})",
-			{
-				agentPid: this.options.agentPid,
-				sessionId: this.options.sessionId,
-				source: this.options.source ?? "unknown",
-			},
-		);
-		await this.writeAgentMarker();
-		return await this.follow();
+		logger.info("Live session follower started (process {pid})", {
+			pid: process.pid,
+		});
+		return await this.loop();
 	}
 
-	async dispose(): Promise<void> {
-		await this.removeAgentMarker().catch(() => undefined);
+	async dispose(reason: string): Promise<void> {
+		for (const session of [...this.sessions.values()])
+			this.dropSession(session, reason, false);
+		if (GLOBAL_STOP_REASONS.has(reason))
+			await removeAllLiveSessionRegistrations(this.configDir).catch(
+				() => undefined,
+			);
 		await this.lease?.release().catch(() => undefined);
 		this.lease = null;
+		if (this.started)
+			logger.info(
+				"Live session follower stopped: {reason} ({sessions} sessions, {requests} requests, {linesSent} lines, {bytesSent} bytes)",
+				{ ...this.result(reason) },
+			);
+		else
+			logger.debug("Live session follower not started: {reason}", { reason });
 	}
 
-	// Startup ----------------------------------------------------------------
+	private async acquireLease(): Promise<FileLease | null> {
+		const path = getLiveSessionFollowerLeasePath(this.configDir);
+		const waitUntil = performance.now() + this.timing.leaseWaitMs;
+		while (true) {
+			const lease = await tryAcquireFileLease(path, DEFAULT_FILE_LEASE_OPTIONS);
+			if (lease || performance.now() >= waitUntil) return lease;
+			await sleep(Math.min(250, this.timing.tickMs));
+		}
+	}
 
-	private async preflight(): Promise<string | undefined> {
-		const { options } = this;
-		if (
-			!SESSION_ID_PATTERN.test(options.sessionId) ||
-			options.organizationId.length === 0 ||
-			options.organizationId.length > 200 ||
-			options.cwd.length > 4096 ||
-			!Number.isSafeInteger(options.agentPid) ||
-			options.agentPid <= 1
-		)
-			return "invalid-arguments";
-		if (isLiveSessionPaused(this.configDir, options.organizationId))
-			return "paused";
-		if (!isProcessAlive(options.agentPid)) return "agent-exited";
-		this.agentStartTime = await readProcessStartTime(options.agentPid);
-		if (this.agentStartTime === "") return "agent-exited";
+	// Main loop --------------------------------------------------------------
+
+	private async loop(): Promise<string> {
+		const { timing } = this;
+		let nextTick = 0;
+		let nextSettings = 0;
+		let nextIdentity = 0;
+		let idleSince: number | undefined;
+		while (true) {
+			let now = performance.now();
+			if (now >= nextSettings) {
+				nextSettings = now + timing.settingsCheckMs;
+				const reason = await this.checkSettings();
+				if (reason) return reason;
+			}
+			if (now >= nextTick) {
+				nextTick = now + timing.tickMs;
+				if (!(await this.ownsLease())) return "lease-lost";
+				const checkIdentities = now >= nextIdentity;
+				if (checkIdentities) nextIdentity = now + timing.identityCheckMs;
+				const registered = await this.syncRegistrations(checkIdentities);
+				if (this.sessions.size > 0 || registered) idleSince = undefined;
+				else {
+					idleSince ??= now;
+					if (now - idleSince >= timing.idleExitMs) {
+						if (await this.handOver()) return "idle";
+						idleSince = undefined;
+					}
+				}
+				if (!this.capabilityConfirmed && now >= this.backoffUntil)
+					await this.confirmCapability();
+				if (
+					[...this.sessions.values()].some(
+						(session) => session.source === "codex",
+					)
+				)
+					await this.codexRollouts.refresh().catch(() => undefined);
+				for (const session of this.ordered()) {
+					try {
+						await this.refreshSession(session);
+					} catch (error) {
+						this.handleSessionError(session, error);
+					}
+				}
+			}
+			const backlog = await this.readAll();
+			now = performance.now();
+			let sent = false;
+			if (this.capabilityConfirmed && now >= this.backoffUntil)
+				sent = await this.sendDue(now, backlog);
+			await this.finishEndedSessions();
+			// Catching up: keep reading and sending without waiting.
+			if (sent && performance.now() >= this.backoffUntil && backlog) continue;
+			await sleep(this.nextDelay(nextTick));
+		}
+	}
+
+	private nextDelay(nextTick: number): number {
+		const now = performance.now();
+		let wakeAt = nextTick;
+		for (const session of this.sessions.values()) {
+			const first = oldestPendingAt(session);
+			if (first !== undefined && !session.ending)
+				wakeAt = Math.min(
+					wakeAt,
+					Math.max(first + this.timing.debounceMs, this.backoffUntil),
+				);
+			const ending = session.ending;
+			if (ending && now < ending.readAt)
+				wakeAt = Math.min(wakeAt, ending.readAt);
+			else if (
+				ending &&
+				this.capabilityConfirmed &&
+				(session.pendingLines > 0 || isReadyToFinish(session))
+			)
+				wakeAt = Math.min(wakeAt, this.backoffUntil);
+		}
+		return Math.max(0, Math.min(this.timing.tickMs, wakeAt - now));
+	}
+
+	private ordered(): Session[] {
+		const sessions = [...this.sessions.values()];
+		if (sessions.length === 0) return sessions;
+		const start = this.rotation % sessions.length;
+		return [...sessions.slice(start), ...sessions.slice(0, start)];
+	}
+
+	private async ownsLease(): Promise<boolean> {
+		try {
+			return (await this.lease?.isOwned()) === true;
+		} catch {
+			return true;
+		}
+	}
+
+	/**
+	 * No sessions for a while: release the lease, then look once more for
+	 * registrations a hook wrote while it saw the lease held. Returns true to
+	 * exit.
+	 */
+	private async handOver(): Promise<boolean> {
+		await this.lease?.release().catch(() => undefined);
+		this.lease = null;
+		const registrations = await listLiveSessionRegistrations(this.configDir);
+		if (registrations.length === 0) return true;
+		this.lease = await tryAcquireFileLease(
+			getLiveSessionFollowerLeasePath(this.configDir),
+			DEFAULT_FILE_LEASE_OPTIONS,
+		).catch(() => null);
+		return this.lease === null;
+	}
+
+	// Settings ---------------------------------------------------------------
+
+	private async checkSettings(): Promise<string | undefined> {
 		const credentials = readCredentials(this.configDir);
 		if (!credentials) return "not-authenticated";
 		if (credentials.authType !== "api-key") return "api-key-required";
+		if (isLiveSessionPaused(this.configDir, "")) return "paused";
 		const apiBase = (getApiBaseOverride() ?? credentials.apiBaseUrl).replace(
 			/\/+$/u,
 			"",
@@ -308,296 +482,371 @@ class LiveSessionFollower {
 			allowPlaintext: allowsInsecureEndpointFromEnv(),
 		});
 		if (!endpoint.ok) return "endpoint-refused";
-		const client = createRpcClient({
-			authType: "api-key",
-			rpcUrl: endpoint.url,
-			token: credentials.token,
-		});
-		try {
-			const status = await client.cli.authStatus(undefined, {
-				signal: AbortSignal.timeout(this.timing.capabilityTimeoutMs),
+		const clientKey = `${endpoint.url}\u0000${credentials.token}`;
+		if (clientKey !== this.clientKey) {
+			this.client = createRpcClient({
+				authType: "api-key",
+				rpcUrl: endpoint.url,
+				token: credentials.token,
 			});
-			if (status.capabilities?.liveSessions !== true) return "unsupported";
-		} catch {
-			return "capability-check-failed";
+			this.clientKey = clientKey;
 		}
-		this.client = client;
-		const gitInfo = await getGitInfo(options.cwd);
-		const identity = resolveUploadRepositoryIdentity(options.cwd, gitInfo);
-		this.repository = {
-			legacyKeys: getLegacyRepositoryKeys(options.cwd, gitInfo),
-			repoKey: identity.repoKey,
-		};
-		if (gitInfo.gitRemote && gitInfo.gitRemote.length <= 2048)
-			this.gitRemote = gitInfo.gitRemote;
-		if (gitInfo.branch && gitInfo.branch.length <= 1024)
-			this.gitBranch = gitInfo.branch;
-		return this.settingsStopReason();
-	}
-
-	private async acquireLease(): Promise<FileLease | null> {
-		const path = join(
-			getLiveSessionsDirectory(this.configDir),
-			`${createHash("sha256").update(this.options.sessionId).digest("hex")}.lease`,
-		);
-		// The previous agent process's follower may still be finishing.
-		const waitUntil = performance.now() + this.timing.leaseWaitMs;
-		while (true) {
-			const lease = await tryAcquireFileLease(path, DEFAULT_FILE_LEASE_OPTIONS);
-			if (lease || performance.now() >= waitUntil) return lease;
-			await sleep(this.timing.tickMs);
+		await this.confirmCapability();
+		for (const session of [...this.sessions.values()]) {
+			if (isLiveSessionPaused(this.configDir, session.organizationId))
+				this.dropSession(session, "paused", true);
+			else if (!this.isRepositoryAllowed(session))
+				this.dropSession(session, "repository-disabled", true);
 		}
-	}
-
-	/**
-	 * One agent process runs one session at a time: a later SessionStart in the
-	 * same process (`/clear`, `/resume`) ends this follower's session.
-	 */
-	private async writeAgentMarker(): Promise<void> {
-		const path = join(
-			getLiveSessionsDirectory(this.configDir),
-			`agent-${this.options.agentPid}.json`,
-		);
-		const current = await readAgentMarker(path);
-		if (current && current.startedAt > this.options.startedAt) return;
-		const temporary = `${path}.${randomUUID()}.tmp`;
-		try {
-			await writeFile(
-				temporary,
-				JSON.stringify({
-					sessionId: this.options.sessionId,
-					startedAt: this.options.startedAt,
-				}),
-				{ flag: "wx", mode: 0o600 },
-			);
-			await rename(temporary, path);
-			this.markerPath = path;
-		} catch {
-			await rm(temporary, { force: true }).catch(() => undefined);
-		}
-	}
-
-	private async removeAgentMarker(): Promise<void> {
-		if (!this.markerPath) return;
-		const current = await readAgentMarker(this.markerPath);
-		if (
-			current?.sessionId === this.options.sessionId &&
-			current.startedAt === this.options.startedAt
-		)
-			await rm(this.markerPath, { force: true });
-	}
-
-	private async isReplacedInAgent(): Promise<boolean> {
-		const marker = await readAgentMarker(
-			join(
-				getLiveSessionsDirectory(this.configDir),
-				`agent-${this.options.agentPid}.json`,
-			),
-		);
-		return (
-			marker !== undefined &&
-			marker.sessionId !== this.options.sessionId &&
-			marker.startedAt > this.options.startedAt
-		);
-	}
-
-	private settingsStopReason(): string | undefined {
-		const credentials = readCredentials(this.configDir);
-		if (!credentials) return "not-authenticated";
-		if (credentials.authType !== "api-key") return "api-key-required";
-		const repository = this.repository;
-		if (
-			repository &&
-			!isRepositoryAutoUploadAllowed(
-				repository.repoKey,
-				claudeCodeAdapter.source,
-				repository.legacyKeys,
-				this.configDir,
-			)
-		)
-			return "repository-disabled";
 		return undefined;
 	}
 
-	// Main loop --------------------------------------------------------------
-
-	private async follow(): Promise<string> {
-		const { timing } = this;
-		let nextTickChecks = 0;
-		let nextStartTimeCheck = this.startedAtMonotonic + timing.startTimeCheckMs;
-		let nextSettingsCheck = this.startedAtMonotonic + timing.settingsCheckMs;
-		while (true) {
-			let now = performance.now();
-			if (now - this.startedAtMonotonic >= timing.maxRuntimeMs)
-				return "max-runtime";
-			if (now >= nextTickChecks) {
-				nextTickChecks = now + timing.tickMs;
-				if (!isProcessAlive(this.options.agentPid))
-					return await this.finish("agent-exited");
-				if (now >= nextStartTimeCheck) {
-					nextStartTimeCheck = now + timing.startTimeCheckMs;
-					if (await this.agentProcessWasReplaced())
-						return await this.finish("agent-exited");
-				}
-				if (await this.isReplacedInAgent())
-					return await this.finish("session-replaced");
-				if (now >= nextSettingsCheck) {
-					nextSettingsCheck = now + timing.settingsCheckMs;
-					const reason = this.settingsStopReason();
-					if (reason) return reason;
-				}
-			}
-			now = performance.now();
-			if (!this.serverStreams) {
-				if (now >= this.backoffUntil) await this.loadServerState();
-			} else {
-				await this.discoverStreams();
-				if (
-					!this.streams.has("") &&
-					now - this.startedAtMonotonic >= timing.transcriptWaitMs
-				)
-					return "transcript-missing";
-				const backlog = await this.readStreams(false);
-				this.checkLimits();
-				now = performance.now();
-				if (now >= this.backoffUntil && this.shouldSend(now, backlog)) {
-					await this.sendOnce(false);
-					// Catching up: keep reading and sending without waiting.
-					if (
-						performance.now() >= this.backoffUntil &&
-						(backlog || this.hasFullBatch())
-					)
-						continue;
-				}
-			}
-			await sleep(this.nextDelay(nextTickChecks));
+	/** `cli.authStatus` must advertise `liveSessions`; a network failure retries. */
+	private async confirmCapability(): Promise<void> {
+		const client = this.client;
+		if (!client) return;
+		try {
+			this.requests += 1;
+			const status = await client.cli.authStatus(undefined, {
+				signal: AbortSignal.timeout(this.timing.capabilityTimeoutMs),
+			});
+			if (status.capabilities?.liveSessions !== true)
+				throw new StopFollowing("unsupported");
+			this.capabilityConfirmed = true;
+		} catch (error) {
+			if (error instanceof StopFollowing) throw error;
+			if (
+				error instanceof ORPCError &&
+				(error.status === 401 || error.status === 403)
+			)
+				throw new StopFollowing("unauthorized");
+			if (!this.capabilityConfirmed) this.backOff();
 		}
 	}
 
-	private nextDelay(nextTickChecks: number): number {
-		const now = performance.now();
-		let wakeAt = nextTickChecks;
-		const firstPending = this.oldestPendingAt();
-		if (firstPending !== undefined)
-			wakeAt = Math.min(
-				wakeAt,
-				Math.max(firstPending + this.timing.debounceMs, this.backoffUntil),
-			);
-		return Math.max(0, Math.min(this.timing.tickMs, wakeAt - now));
-	}
-
-	private shouldSend(now: number, backlog: boolean): boolean {
-		if (this.pendingLines === 0 && !this.hasEmptyReset()) return false;
-		if (backlog || this.hasFullBatch()) return true;
-		const firstPending = this.oldestPendingAt();
+	private isRepositoryAllowed(session: Session): boolean {
 		return (
-			firstPending === undefined || now - firstPending >= this.timing.debounceMs
+			!session.repository ||
+			isRepositoryAutoUploadAllowed(
+				session.repository.repoKey,
+				session.source,
+				session.repository.legacyKeys,
+				this.configDir,
+			)
 		);
 	}
 
-	private hasFullBatch(): boolean {
-		return this.pendingBytes >= this.timing.sendThresholdBytes;
+	// Registrations ----------------------------------------------------------
+
+	/**
+	 * Reads registrations, decides which agent processes still run, starts
+	 * following new sessions and starts ending sessions without a live
+	 * registration. Returns whether any registration exists.
+	 */
+	private async syncRegistrations(checkIdentities: boolean): Promise<boolean> {
+		const registrations = (
+			await listLiveSessionRegistrations(this.configDir)
+		).filter((registration) => !this.removing.has(registration.file));
+		const now = Date.now();
+		const pids = [
+			...new Set(
+				registrations
+					.map((registration) => registration.agentPid)
+					.filter((pid): pid is number => pid !== null),
+			),
+		];
+		const alivePids = new Set(pids.filter((pid) => isProcessAlive(pid)));
+		if (checkIdentities) await this.checkIdentities([...alivePids]);
+		const alive = new Map<StoredLiveSessionRegistration, boolean>();
+		for (const registration of registrations)
+			alive.set(
+				registration,
+				this.isRegistrationAlive(registration, alivePids, now),
+			);
+		const superseded = findSupersededRegistrations(registrations, alive);
+		const bySession = new Map<string, StoredLiveSessionRegistration[]>();
+		for (const registration of registrations) {
+			const key = getLiveSessionKey(
+				registration.source,
+				registration.sessionId,
+			);
+			bySession.set(key, [...(bySession.get(key) ?? []), registration]);
+		}
+		for (const [key, group] of bySession) {
+			const live = group.filter(
+				(registration) =>
+					alive.get(registration) === true && !superseded.has(registration),
+			);
+			const session = this.sessions.get(key);
+			if (session) {
+				session.registrations = group;
+				if (live.length > 0) {
+					// Resumed (for example `/resume` after `/clear`) before it ended.
+					if (session.ending) session.ending = undefined;
+				} else if (!session.ending) {
+					this.beginEnding(
+						session,
+						group.some((registration) => superseded.has(registration))
+							? "session-replaced"
+							: "agent-exited",
+					);
+				}
+				continue;
+			}
+			const newest = group.reduce((left, right) =>
+				right.startedAt > left.startedAt ? right : left,
+			);
+			if (
+				live.length === 0 &&
+				now - newest.startedAt > this.timing.staleRegistrationMs
+			) {
+				// Left behind (for example by a reboot): nothing to follow.
+				for (const registration of group)
+					await removeLiveSessionRegistration(registration);
+				continue;
+			}
+			if (isLiveSessionPaused(this.configDir, newest.organizationId)) {
+				for (const registration of group)
+					await removeLiveSessionRegistration(registration);
+				continue;
+			}
+			if (this.sessions.size >= MAX_SESSIONS) {
+				if (!this.sessionLimitLogged) {
+					this.sessionLimitLogged = true;
+					logger.warn("Live session updates follow at most {limit} sessions", {
+						limit: MAX_SESSIONS,
+					});
+				}
+				continue;
+			}
+			const created = await this.createSession(key, newest, group);
+			if (live.length === 0) this.beginEnding(created, "agent-exited");
+		}
+		for (const session of this.sessions.values()) {
+			if (!bySession.has(session.key) && !session.ending)
+				this.beginEnding(session, "unregistered");
+		}
+		for (const file of [...this.lastSeenAlive.keys()])
+			if (!registrations.some((registration) => registration.file === file))
+				this.lastSeenAlive.delete(file);
+		return registrations.length > 0;
 	}
 
-	private hasEmptyReset(): boolean {
-		for (const stream of this.streams.values())
-			if (stream.needsReset && stream.pending.length === 0) return true;
+	private async checkIdentities(pids: number[]): Promise<void> {
+		this.replacedIdentities.clear();
+		for (const known of [...this.observedIdentities.keys()])
+			if (!pids.includes(known)) {
+				this.observedIdentities.delete(known);
+				this.currentIdentities.delete(known);
+			}
+		const identities = await readProcessStartIdentities(pids);
+		for (const pid of pids) {
+			const identity = identities.get(pid);
+			if (identity === undefined) continue;
+			const observed = this.observedIdentities.get(pid);
+			if (observed === undefined) this.observedIdentities.set(pid, identity);
+			else if (observed !== identity) this.replacedIdentities.add(pid);
+			this.currentIdentities.set(pid, identity);
+		}
+	}
+
+	private isRegistrationAlive(
+		registration: StoredLiveSessionRegistration,
+		alivePids: ReadonlySet<number>,
+		now: number,
+	): boolean {
+		const session = this.sessions.get(
+			getLiveSessionKey(registration.source, registration.sessionId),
+		);
+		const lastActivityAt = Math.max(
+			session?.lastActivityAt ?? 0,
+			registration.startedAt,
+		);
+		if (registration.agentPid === null)
+			// Codex without a known `codex` process: follow while the rollout is active.
+			return now - lastActivityAt < this.timing.codexOrphanIdleMs;
+		const pid = registration.agentPid;
+		const current = this.currentIdentities.get(pid);
+		const reused =
+			this.replacedIdentities.has(pid) ||
+			(registration.agentStartIdentity !== null &&
+				current !== undefined &&
+				current !== registration.agentStartIdentity);
+		if (alivePids.has(pid) && !reused) {
+			this.lastSeenAlive.set(registration.file, now);
+			if (
+				registration.source === "codex" &&
+				now - lastActivityAt >= this.timing.codexIdleMs
+			)
+				return false;
+			return true;
+		}
+		// The hook's parent stood in for an unknown agent process; if it ended
+		// right away it was a wrapper, so follow the transcript until it idles.
+		const seen = this.lastSeenAlive.get(registration.file);
+		if (
+			registration.agentPidSource === "parent" &&
+			(seen === undefined ||
+				seen - registration.startedAt < this.timing.orphanGraceMs)
+		) {
+			if (session && !session.orphanLogged) {
+				session.orphanLogged = true;
+				logger.info(
+					"Live session {sessionId}: the agent process is unknown; following until its transcript is idle",
+					{ sessionId: registration.sessionId },
+				);
+			}
+			return now - lastActivityAt < this.timing.orphanIdleMs;
+		}
 		return false;
 	}
 
-	private oldestPendingAt(): number | undefined {
-		let oldest: number | undefined;
-		for (const stream of this.streams.values())
-			if (
-				stream.firstPendingAt !== undefined &&
-				(oldest === undefined || stream.firstPendingAt < oldest)
-			)
-				oldest = stream.firstPendingAt;
-		return oldest;
+	private async createSession(
+		key: string,
+		registration: StoredLiveSessionRegistration,
+		group: StoredLiveSessionRegistration[],
+	): Promise<Session> {
+		const session: Session = {
+			createdAt: performance.now(),
+			cwd: registration.cwd,
+			ending: undefined,
+			gitBranch: undefined,
+			gitRemote: undefined,
+			ignoredEntries: new Set(),
+			inputBytes: 0,
+			key,
+			lastActivityAt: registration.startedAt,
+			linesSent: 0,
+			orphanLogged: false,
+			organizationId: registration.organizationId,
+			pendingBytes: 0,
+			pendingLines: 0,
+			redactedBytes: 0,
+			redactionCounts: {},
+			registrations: group,
+			repository: undefined,
+			serverHadStreams: false,
+			serverStreams: undefined,
+			sessionId: registration.sessionId,
+			source: registration.source,
+			streamLimitLogged: false,
+			streams: new Map(),
+			subagentDirectory: undefined,
+			transcriptPath: registration.transcriptPath,
+		};
+		try {
+			const gitInfo = await getGitInfo(session.cwd);
+			session.repository = {
+				legacyKeys: getLegacyRepositoryKeys(session.cwd, gitInfo),
+				repoKey: resolveUploadRepositoryIdentity(session.cwd, gitInfo).repoKey,
+			};
+			if (gitInfo.gitRemote && gitInfo.gitRemote.length <= 2048)
+				session.gitRemote = gitInfo.gitRemote;
+			if (gitInfo.branch && gitInfo.branch.length <= 1024)
+				session.gitBranch = gitInfo.branch;
+		} catch {
+			// Without Git metadata the session is still followed.
+		}
+		if (session.source === "codex")
+			this.codexRollouts.track(session.transcriptPath);
+		this.sessions.set(key, session);
+		this.sessionsFollowed += 1;
+		logger.info("Live session {sessionId} ({source}) followed", {
+			sessionId: session.sessionId,
+			source: session.source,
+		});
+		if (!this.isRepositoryAllowed(session))
+			this.dropSession(session, "repository-disabled", true);
+		return session;
 	}
 
-	private checkLimits(): void {
-		if (this.pendingBytes > MAX_PENDING_BYTES)
-			throw new StopFollowing("pending-limit");
-		if (this.inputBytes < REDACTION_RATIO_MIN_INPUT_BYTES) return;
-		const anomaly = getRedactionBudgetAnomaly(
-			this.redactedBytes,
-			this.inputBytes,
-			this.redactionCounts,
+	private beginEnding(session: Session, reason: string): void {
+		const now = performance.now();
+		session.ending = {
+			deadline: now + this.timing.finalReadDelayMs + this.timing.finalFlushMs,
+			readAt: now + this.timing.finalReadDelayMs,
+			reason,
+		};
+	}
+
+	/**
+	 * Forgets a session. With `forget`, its registrations are removed too, so
+	 * it is not followed again until a hook registers it anew.
+	 */
+	private dropSession(session: Session, reason: string, forget: boolean): void {
+		if (this.sessions.get(session.key) !== session) return;
+		this.sessions.delete(session.key);
+		this.pendingBytes -= session.pendingBytes;
+		logger.info(
+			"Live session {sessionId} ({source}) stopped: {reason} ({lines} lines)",
+			{
+				lines: session.linesSent,
+				reason,
+				sessionId: session.sessionId,
+				source: session.source,
+			},
 		);
-		if (anomaly) {
-			logger.warn(
-				"Live session updates for {sessionId} stopped: known-pattern redaction exceeded {ratio} of the input ({redactedBytes} of {inputBytes} bytes)",
-				{
-					inputBytes: anomaly.inputBytes,
-					ratio: MAX_REDACTION_RATIO,
-					redactedBytes: anomaly.redactedBytes,
-					sessionId: this.options.sessionId,
-				},
-			);
-			throw new StopFollowing("redaction-budget");
+		if (forget)
+			for (const registration of session.registrations) {
+				this.removing.add(registration.file);
+				void removeLiveSessionRegistration(registration)
+					.catch(() => undefined)
+					.finally(() => this.removing.delete(registration.file));
+			}
+	}
+
+	private handleSessionError(session: Session, error: unknown): void {
+		if (error instanceof StopFollowing) throw error;
+		const reason = error instanceof StopSession ? error.reason : "failed";
+		if (!(error instanceof StopSession))
+			logger.warn("Live session {sessionId} failed: {error}", {
+				error: describeError(error),
+				sessionId: session.sessionId,
+			});
+		this.dropSession(session, reason, true);
+	}
+
+	// Per-session work ---------------------------------------------------------
+
+	/** State, stream discovery and per-session limits (once per tick). */
+	private async refreshSession(session: Session): Promise<void> {
+		const now = performance.now();
+		if (now - session.createdAt >= this.timing.maxSessionMs)
+			throw new StopSession("max-runtime");
+		if (!session.serverStreams) {
+			if (!this.capabilityConfirmed || now < this.backoffUntil) return;
+			await this.loadServerState(session);
+			if (!session.serverStreams) return;
 		}
+		await this.discoverStreams(session);
+		if (
+			!session.streams.has("") &&
+			!session.ending &&
+			now - session.createdAt >= this.timing.transcriptWaitMs
+		)
+			throw new StopSession("transcript-missing");
 	}
 
-	private async agentProcessWasReplaced(): Promise<boolean> {
-		if (this.agentStartTime === undefined) return false;
-		const current = await readProcessStartTime(this.options.agentPid);
-		return current !== undefined && current !== this.agentStartTime;
-	}
-
-	/** The agent is gone: send everything, including a final JSON tail, then `ended`. */
-	private async finish(reason: string): Promise<string> {
-		await sleep(this.timing.finalReadDelayMs);
-		const deadline = performance.now() + this.timing.finalFlushMs;
-		while (!this.serverStreams) {
-			if (performance.now() >= deadline) return `${reason}-unflushed`;
-			await this.waitForBackoff(deadline);
-			await this.loadServerState();
-		}
-		await this.discoverStreams();
-		while (true) {
-			const backlog = await this.readStreams(true);
-			this.checkLimits();
-			const more = backlog || this.pendingLines > 0 || this.hasEmptyReset();
-			if (!more && !this.hasSentOrKnown()) return reason;
-			if (performance.now() >= deadline) return `${reason}-unflushed`;
-			await this.waitForBackoff(deadline);
-			if (performance.now() >= deadline) return `${reason}-unflushed`;
-			const finished = await this.sendOnce(!backlog);
-			if (finished) return reason;
-		}
-	}
-
-	private hasSentOrKnown(): boolean {
-		return this.linesSent > 0 || this.serverHadStreams;
-	}
-
-	private async waitForBackoff(deadline: number): Promise<void> {
-		const wait = Math.min(this.backoffUntil, deadline) - performance.now();
-		if (wait > 0) await sleep(wait);
-	}
-
-	// Server state -----------------------------------------------------------
-
-	private target() {
+	private target(session: Session) {
 		return {
-			organizationId: this.options.organizationId,
+			organizationId: session.organizationId,
 			protocol: LIVE_SESSION_PROTOCOL,
-			sessionId: this.options.sessionId,
-			source: "claude_code",
+			sessionId: session.sessionId,
+			source: session.source,
 		} as const;
 	}
 
-	private async loadServerState(): Promise<void> {
-		const client = this.requireClient();
+	private async loadServerState(session: Session): Promise<void> {
+		const client = this.client;
+		if (!client) return;
 		try {
 			this.requests += 1;
 			const state = LiveSessionStateOutputSchema.parse(
-				await client.liveSession.state(this.target(), {
+				await client.liveSession.state(this.target(session), {
 					signal: AbortSignal.timeout(this.timing.requestTimeoutMs),
 				}),
 			);
-			this.serverStreams = new Map(
+			session.serverStreams = new Map(
 				state.streams.map((stream) => [
 					stream.agentId ?? "",
 					{
@@ -606,33 +855,48 @@ class LiveSessionFollower {
 					},
 				]),
 			);
-			this.serverHadStreams = state.streams.some(
+			session.serverHadStreams = state.streams.some(
 				(stream) => stream.committedLines > 0,
 			);
 			this.backoffMs = 0;
 		} catch (error) {
-			await this.handleRequestError(error);
+			await this.handleRequestError(session, error);
 		}
 	}
 
-	private requireClient(): Client {
-		if (!this.client) throw new StopFollowing("not-started");
-		return this.client;
-	}
-
-	// Streams ----------------------------------------------------------------
-
-	private async discoverStreams(): Promise<void> {
-		if (!this.streams.has("")) {
+	private async discoverStreams(session: Session): Promise<void> {
+		if (!session.streams.has("")) {
 			try {
-				const metadata = await stat(this.options.transcriptPath);
+				const metadata = await stat(session.transcriptPath);
 				if (metadata.isFile())
-					await this.addStream(null, this.options.transcriptPath);
+					await this.addStream(session, null, session.transcriptPath);
 			} catch {
-				// Claude Code creates the transcript with the first record.
+				// The agent creates its transcript with the first record.
 			}
 		}
-		const directory = await this.resolveSubagentDirectory();
+		if (session.source === "codex") {
+			for (const child of this.codexRollouts.descendants(session.sessionId)) {
+				if (session.streams.has(child.threadId)) continue;
+				if (session.ignoredEntries.has(child.threadId)) continue;
+				if (!this.hasStreamCapacity(session)) return;
+				if (!/^[A-Za-z0-9_-]{1,200}$/u.test(child.threadId)) {
+					session.ignoredEntries.add(child.threadId);
+					continue;
+				}
+				try {
+					const metadata = await lstat(child.transcriptPath);
+					if (!metadata.isFile()) {
+						session.ignoredEntries.add(child.threadId);
+						continue;
+					}
+					await this.addStream(session, child.threadId, child.transcriptPath);
+				} catch {
+					// Seen again next tick.
+				}
+			}
+			return;
+		}
+		const directory = await this.resolveClaudeSubagentDirectory(session);
 		if (!directory) return;
 		let names: string[];
 		try {
@@ -641,46 +905,50 @@ class LiveSessionFollower {
 			return;
 		}
 		for (const name of names) {
-			const match = SUBAGENT_FILENAME_PATTERN.exec(name);
-			const agentId = match?.[1];
-			if (!agentId || this.streams.has(agentId)) continue;
-			if (this.ignoredSubagentEntries.has(name)) continue;
-			if (this.streams.size >= MAX_STREAMS) {
-				if (!this.streamLimitLogged) {
-					this.streamLimitLogged = true;
-					logger.warn(
-						"Live session updates for {sessionId} follow at most {limit} transcripts",
-						{ limit: MAX_STREAMS, sessionId: this.options.sessionId },
-					);
-				}
-				return;
-			}
+			const agentId = SUBAGENT_FILENAME_PATTERN.exec(name)?.[1];
+			if (!agentId || session.streams.has(agentId)) continue;
+			if (session.ignoredEntries.has(name)) continue;
+			if (!this.hasStreamCapacity(session)) return;
 			const path = join(directory, name);
 			try {
 				const metadata = await lstat(path);
 				const canonical = metadata.isFile() ? await realpath(path) : undefined;
 				if (!canonical || !isContainedPath(directory, canonical)) {
-					if (this.ignoredSubagentEntries.size < MAX_IGNORED_SUBAGENT_ENTRIES)
-						this.ignoredSubagentEntries.add(name);
+					if (session.ignoredEntries.size < MAX_IGNORED_SUBAGENT_ENTRIES)
+						session.ignoredEntries.add(name);
 					continue;
 				}
-				await this.addStream(agentId, canonical);
+				await this.addStream(session, agentId, canonical);
 			} catch {
 				// Removed or replaced while scanning; seen again next tick.
 			}
 		}
 	}
 
+	private hasStreamCapacity(session: Session): boolean {
+		if (session.streams.size < MAX_STREAMS_PER_SESSION) return true;
+		if (!session.streamLimitLogged) {
+			session.streamLimitLogged = true;
+			logger.warn(
+				"Live session {sessionId} follows at most {limit} transcripts",
+				{ limit: MAX_STREAMS_PER_SESSION, sessionId: session.sessionId },
+			);
+		}
+		return false;
+	}
+
 	/** Only the canonical `<transcript dir>/<session id>/subagents` directory. */
-	private async resolveSubagentDirectory(): Promise<string | undefined> {
-		if (this.subagentDirectory) return this.subagentDirectory;
+	private async resolveClaudeSubagentDirectory(
+		session: Session,
+	): Promise<string | undefined> {
+		if (session.subagentDirectory) return session.subagentDirectory;
 		try {
-			const parent = await realpath(dirname(this.options.transcriptPath));
+			const parent = await realpath(dirname(session.transcriptPath));
 			const directory = await realpath(
-				join(parent, this.options.sessionId, "subagents"),
+				join(parent, session.sessionId, "subagents"),
 			);
 			if (isContainedPath(parent, directory)) {
-				this.subagentDirectory = directory;
+				session.subagentDirectory = directory;
 				return directory;
 			}
 		} catch {
@@ -689,13 +957,18 @@ class LiveSessionFollower {
 		return undefined;
 	}
 
-	private async addStream(agentId: string | null, path: string): Promise<void> {
+	private async addStream(
+		session: Session,
+		agentId: string | null,
+		path: string,
+	): Promise<void> {
 		const stream: Stream = {
 			agentId,
 			committedLines: 0,
 			committedSha: null,
 			firstPendingAt: undefined,
 			inode: undefined,
+			locate: undefined,
 			needsReset: false,
 			outOfSync: 0,
 			path,
@@ -705,51 +978,51 @@ class LiveSessionFollower {
 			scannedTo: -1,
 			slimmer: createTranscriptSlimmer(),
 		};
-		const known = this.serverStreams?.get(agentId ?? "");
-		if (known && known.committedLines > 0)
-			await this.locate(stream, known.committedLines, known.lastLineSha256);
-		this.streams.set(agentId ?? "", stream);
+		const known = session.serverStreams?.get(agentId ?? "");
+		if (known && known.committedLines > 0) stream.locate = known;
+		session.streams.set(agentId ?? "", stream);
 	}
 
 	/**
 	 * Resumes a stream after the server's last committed line when the local
 	 * file still produces that exact line; otherwise the stream starts over.
+	 * A file that cannot be read now is tried again next time.
 	 */
-	private async locate(
-		stream: Stream,
-		committedLines: number,
-		lastLineSha256: string | null,
-	): Promise<void> {
-		this.dropPending(stream, stream.pending.length);
+	private async locate(session: Session, stream: Stream): Promise<void> {
+		const cursor = stream.locate;
+		if (!cursor) return;
+		this.dropPending(session, stream, stream.pending.length);
 		stream.slimmer = createTranscriptSlimmer();
 		stream.scannedTo = -1;
 		stream.outOfSync = 0;
-		let offset: number | undefined;
-		if (committedLines > 0 && lastLineSha256 !== null) {
-			try {
-				offset = await findLineEnd(
-					stream.path,
-					committedLines - 1,
-					lastLineSha256,
-					stream.slimmer,
-					this.readBuffer,
-				);
-			} catch {
-				offset = undefined;
-			}
+		if (cursor.committedLines === 0 || cursor.lastLineSha256 === null) {
+			stream.locate = undefined;
+			this.resetStream(session, stream);
+			return;
 		}
+		// Codex slimming depends on earlier records of the stream: replay them
+		// (without sending) so later lines match an uninterrupted follower.
+		const offset = await findLineEnd(
+			stream.path,
+			cursor.committedLines - 1,
+			cursor.lastLineSha256,
+			stream.slimmer,
+			this.readBuffer,
+			session.source === "codex",
+		);
+		stream.locate = undefined;
 		if (offset === undefined) {
-			this.resetStream(stream);
+			this.resetStream(session, stream);
 			return;
 		}
 		stream.rawOffset = offset;
-		stream.committedLines = committedLines;
-		stream.committedSha = lastLineSha256;
+		stream.committedLines = cursor.committedLines;
+		stream.committedSha = cursor.lastLineSha256;
 		stream.needsReset = false;
 	}
 
-	private resetStream(stream: Stream): void {
-		this.dropPending(stream, stream.pending.length);
+	private resetStream(session: Session, stream: Stream): void {
+		this.dropPending(session, stream, stream.pending.length);
 		stream.slimmer = createTranscriptSlimmer();
 		stream.rawOffset = 0;
 		stream.scannedTo = -1;
@@ -757,105 +1030,230 @@ class LiveSessionFollower {
 		stream.committedSha = null;
 		stream.needsReset = true;
 		stream.outOfSync = 0;
+		stream.locate = undefined;
 	}
 
-	private dropPending(stream: Stream, count: number): void {
+	private dropPending(session: Session, stream: Stream, count: number): void {
 		if (count <= 0) return;
 		const dropped = stream.pending.splice(0, count);
 		const bytes = dropped.reduce((total, line) => total + line.bytes, 0);
 		stream.pendingBytes -= bytes;
+		session.pendingBytes -= bytes;
+		session.pendingLines -= dropped.length;
 		this.pendingBytes -= bytes;
-		this.pendingLines -= dropped.length;
 		if (stream.pending.length === 0) stream.firstPendingAt = undefined;
 	}
 
+	// Reading ----------------------------------------------------------------
+
 	/**
-	 * Reads new complete lines of every stream. Returns true when reading
-	 * stopped early because enough is waiting to be sent.
+	 * Reads new complete lines, sessions in rotating order so one large
+	 * catch-up cannot starve the others. Returns true when reading stopped at
+	 * the read-ahead budget.
 	 */
-	private async readStreams(final: boolean): Promise<boolean> {
-		for (const stream of this.orderedStreams()) {
-			if (this.pendingBytes >= READ_PAUSE_PENDING_BYTES) return true;
-			let metadata: Stats;
+	private async readAll(): Promise<boolean> {
+		let backlog = false;
+		for (const session of this.ordered()) {
+			if (!session.serverStreams) continue;
+			const final =
+				session.ending !== undefined &&
+				performance.now() >= session.ending.readAt;
 			try {
-				metadata = await stat(stream.path);
-			} catch {
-				continue;
-			}
-			if (
-				metadata.size < stream.rawOffset ||
-				(stream.inode !== undefined && metadata.ino !== stream.inode)
-			) {
-				this.resetStream(stream);
-			}
-			stream.inode = metadata.ino;
-			if (metadata.size === stream.scannedTo && !final) continue;
-			const handle = await open(stream.path, "r");
-			try {
-				const read = await readCompleteLines(
-					handle,
-					stream.rawOffset,
-					metadata.size,
-					(line) => {
-						this.enqueue(stream, line);
-						return this.pendingBytes < READ_PAUSE_PENDING_BYTES;
-					},
-					this.readBuffer,
-				);
-				stream.rawOffset = read.endOffset;
-				stream.scannedTo = read.stopped ? -1 : metadata.size;
-				if (read.stopped) return true;
-				if (final && stream.rawOffset < metadata.size) {
-					const tail = await readTail(handle, stream.rawOffset, metadata.size);
-					if (tail && isJson(tail)) {
-						this.enqueue(stream, { bytes: tail, kind: "line" });
-						stream.rawOffset = metadata.size;
-					}
+				if (await this.readSession(session, final)) {
+					backlog = true;
+					break;
 				}
-			} finally {
-				await handle.close();
+				this.checkRedaction(session);
+			} catch (error) {
+				this.handleSessionError(session, error);
+			}
+		}
+		this.rotation += 1;
+		return backlog;
+	}
+
+	private async readSession(
+		session: Session,
+		final: boolean,
+	): Promise<boolean> {
+		for (const stream of orderedStreams(session)) {
+			if (this.pendingBytes >= READ_AHEAD_BYTES) return true;
+			try {
+				if (stream.locate) await this.locate(session, stream);
+				if (await this.readStream(session, stream, final)) return true;
+			} catch {
+				// Unreadable for now (permissions, removed or replaced): next tick.
+				stream.scannedTo = -1;
 			}
 		}
 		return false;
 	}
 
-	private enqueue(stream: Stream, raw: RawLiveSessionLine): void {
+	private async readStream(
+		session: Session,
+		stream: Stream,
+		final: boolean,
+	): Promise<boolean> {
+		let metadata: Stats = await stat(stream.path);
+		if (
+			metadata.size < stream.rawOffset ||
+			(stream.inode !== undefined && metadata.ino !== stream.inode)
+		)
+			this.resetStream(session, stream);
+		stream.inode = metadata.ino;
+		if (metadata.size === stream.scannedTo && !final) return false;
+		const handle = await open(stream.path, "r");
+		try {
+			metadata = await handle.stat();
+			const before = stream.rawOffset;
+			const read = await readCompleteLines(
+				handle,
+				stream.rawOffset,
+				metadata.size,
+				(line) => {
+					this.enqueue(session, stream, line);
+					return this.pendingBytes < READ_AHEAD_BYTES;
+				},
+				this.readBuffer,
+			);
+			stream.rawOffset = read.endOffset;
+			stream.scannedTo = read.stopped ? -1 : metadata.size;
+			if (read.endOffset > before) session.lastActivityAt = Date.now();
+			if (read.stopped) return true;
+			if (final && stream.rawOffset < metadata.size) {
+				// The agent is gone: a final line without `\n` is sent only when
+				// it is complete JSON.
+				const tail = await readTail(handle, stream.rawOffset, metadata.size);
+				if (tail && isJson(tail)) {
+					this.enqueue(session, stream, { bytes: tail, kind: "line" });
+					stream.rawOffset = metadata.size;
+				}
+			}
+		} finally {
+			await handle.close();
+		}
+		return false;
+	}
+
+	private enqueue(
+		session: Session,
+		stream: Stream,
+		raw: RawLiveSessionLine,
+	): void {
 		const line = processLiveSessionLine(raw, stream.slimmer);
-		this.inputBytes += line.inputBytes;
-		this.redactedBytes += line.redactedBytes;
-		addCounts(this.redactionCounts, line.redactions);
+		session.inputBytes += line.inputBytes;
+		session.redactedBytes += line.redactedBytes;
+		addCounts(session.redactionCounts, line.redactions);
 		stream.pending.push({
 			bytes: line.bytes,
 			sha256: line.sha256,
 			text: line.text,
 		});
 		stream.pendingBytes += line.bytes;
+		session.pendingBytes += line.bytes;
+		session.pendingLines += 1;
 		this.pendingBytes += line.bytes;
-		this.pendingLines += 1;
 		stream.firstPendingAt ??= performance.now();
 	}
 
-	private orderedStreams(): Stream[] {
-		const main = this.streams.get("");
-		const subagents = [...this.streams.values()]
-			.filter((stream) => stream.agentId !== null)
-			.sort((left, right) =>
-				(left.agentId ?? "") < (right.agentId ?? "") ? -1 : 1,
-			);
-		return main ? [main, ...subagents] : subagents;
+	private checkRedaction(session: Session): void {
+		if (session.inputBytes < REDACTION_RATIO_MIN_INPUT_BYTES) return;
+		const anomaly = getRedactionBudgetAnomaly(
+			session.redactedBytes,
+			session.inputBytes,
+			session.redactionCounts,
+		);
+		if (!anomaly) return;
+		logger.warn(
+			"Live session {sessionId}: known-pattern redaction exceeded the safety ratio ({redactedBytes} of {inputBytes} bytes)",
+			{
+				inputBytes: anomaly.inputBytes,
+				redactedBytes: anomaly.redactedBytes,
+				sessionId: session.sessionId,
+			},
+		);
+		throw new StopSession("redaction-budget");
 	}
 
 	// Sending ----------------------------------------------------------------
 
+	/** One append for each session that is due. Returns whether any was sent. */
+	private async sendDue(now: number, backlog: boolean): Promise<boolean> {
+		let sent = false;
+		for (const session of this.ordered()) {
+			if (now < this.backoffUntil) break;
+			if (!session.serverStreams || session.ending) continue;
+			if (!this.isDue(session, now, backlog)) continue;
+			try {
+				await this.sendOnce(session, false);
+				sent = true;
+			} catch (error) {
+				this.handleSessionError(session, error);
+			}
+		}
+		return sent;
+	}
+
+	private isDue(session: Session, now: number, backlog: boolean): boolean {
+		if (session.pendingLines === 0 && !hasEmptyReset(session)) return false;
+		if (backlog || session.pendingBytes >= this.timing.sendThresholdBytes)
+			return true;
+		const first = oldestPendingAt(session);
+		return first === undefined || now - first >= this.timing.debounceMs;
+	}
+
 	/**
-	 * Sends one append with as many pending lines as the request limits allow.
-	 * Returns true when `ended` was requested and everything was committed.
+	 * Ending sessions: after the final read, send everything and `ended`, then
+	 * forget the session and its registrations.
 	 */
-	private async sendOnce(endedIfComplete: boolean): Promise<boolean> {
+	private async finishEndedSessions(): Promise<void> {
+		for (const session of this.ordered()) {
+			const ending = session.ending;
+			if (!ending) continue;
+			const now = performance.now();
+			if (now >= ending.deadline) {
+				this.dropSession(session, `${ending.reason}-unflushed`, true);
+				continue;
+			}
+			if (now < ending.readAt || !session.serverStreams) continue;
+			if (!this.capabilityConfirmed || now < this.backoffUntil) continue;
+			try {
+				const ready = isReadyToFinish(session);
+				const more = session.pendingLines > 0 || hasEmptyReset(session);
+				if (!ready && !more) continue;
+				if (
+					ready &&
+					!more &&
+					session.linesSent === 0 &&
+					!session.serverHadStreams
+				) {
+					this.dropSession(session, ending.reason, true);
+					continue;
+				}
+				if (await this.sendOnce(session, ready))
+					this.dropSession(session, ending.reason, true);
+			} catch (error) {
+				this.handleSessionError(session, error);
+			}
+		}
+	}
+
+	/**
+	 * Sends one append with as many pending lines of this session as the
+	 * request limits allow. Returns true when `ended` was requested and
+	 * everything was committed.
+	 */
+	private async sendOnce(
+		session: Session,
+		endedIfComplete: boolean,
+	): Promise<boolean> {
+		const client = this.client;
+		if (!client) return false;
 		const batch: { stream: Stream; lines: LiveSessionLine[] }[] = [];
 		let batchBytes = 0;
-		for (const stream of this.orderedStreams()) {
+		for (const stream of orderedStreams(session)) {
 			if (batch.length >= LIVE_SESSION_MAX_STREAMS_PER_REQUEST) break;
+			if (stream.locate) continue;
 			if (stream.pending.length === 0 && !stream.needsReset) continue;
 			const lines: LiveSessionLine[] = [];
 			for (const line of stream.pending) {
@@ -870,19 +1268,17 @@ class LiveSessionFollower {
 		}
 		const complete =
 			endedIfComplete &&
-			batch.every(
-				({ lines, stream }) => lines.length === stream.pending.length,
-			) &&
-			[...this.streams.values()].every(
-				(stream) =>
-					(stream.pending.length === 0 && !stream.needsReset) ||
-					batch.some((item) => item.stream === stream),
-			);
+			[...session.streams.values()].every((stream) => {
+				const item = batch.find((entry) => entry.stream === stream);
+				return item
+					? item.lines.length === stream.pending.length
+					: stream.pending.length === 0 && !stream.needsReset;
+			});
 		const input: LiveSessionAppendInput = {
-			...this.target(),
-			projectPath: this.options.cwd,
-			...(this.gitRemote ? { gitRemote: this.gitRemote } : {}),
-			...(this.gitBranch ? { gitBranch: this.gitBranch } : {}),
+			...this.target(session),
+			projectPath: session.cwd,
+			...(session.gitRemote ? { gitRemote: session.gitRemote } : {}),
+			...(session.gitBranch ? { gitBranch: session.gitBranch } : {}),
 			...(complete ? { ended: true } : {}),
 			streams: batch.map(({ lines, stream }) => ({
 				agentId: stream.agentId,
@@ -896,12 +1292,12 @@ class LiveSessionFollower {
 		try {
 			this.requests += 1;
 			output = LiveSessionAppendOutputSchema.parse(
-				await this.requireClient().liveSession.append(input, {
+				await client.liveSession.append(input, {
 					signal: AbortSignal.timeout(this.timing.requestTimeoutMs),
 				}),
 			);
 		} catch (error) {
-			await this.handleRequestError(error);
+			await this.handleRequestError(session, error);
 			return false;
 		}
 		this.backoffMs = 0;
@@ -919,43 +1315,44 @@ class LiveSessionFollower {
 				result.committedLines === expectedLines &&
 				result.lastLineSha256 === expectedSha
 			) {
-				this.dropPending(stream, lines.length);
+				const bytes = lines.reduce((total, line) => total + line.bytes, 0);
+				this.dropPending(session, stream, lines.length);
 				stream.committedLines = expectedLines;
 				stream.committedSha = expectedSha;
 				stream.needsReset = false;
 				stream.outOfSync = 0;
+				session.linesSent += lines.length;
 				this.linesSent += lines.length;
-				this.bytesSent += lines.reduce((total, line) => total + line.bytes, 0);
+				this.bytesSent += bytes;
 				continue;
 			}
 			committedAll = false;
-			if (result) {
-				await this.reconcile(
+			if (result)
+				this.reconcile(
+					session,
 					stream,
 					result.committedLines,
 					result.lastLineSha256,
 				);
-			} else {
-				// A response without this stream: start it over.
-				this.resetStream(stream);
-			}
+			else this.resetStream(session, stream);
 		}
 		return complete && committedAll;
 	}
 
 	/**
-	 * The server's committed state differs from what this follower expected:
-	 * adopt it when it is a prefix of the lines sent (a retried chunk whose
-	 * response was lost), otherwise look it up in the local file.
+	 * The server's committed state differs from what was expected: adopt it
+	 * when it is a prefix of the lines sent (a retried chunk whose response
+	 * was lost), otherwise find it in the local file.
 	 */
-	private async reconcile(
+	private reconcile(
+		session: Session,
 		stream: Stream,
 		committedLines: number,
 		lastLineSha256: string | null,
-	): Promise<void> {
+	): void {
 		stream.outOfSync += 1;
 		if (stream.outOfSync > MAX_OUT_OF_SYNC_RETRIES) {
-			this.resetStream(stream);
+			this.resetStream(session, stream);
 			return;
 		}
 		const base = stream.committedLines;
@@ -964,36 +1361,46 @@ class LiveSessionFollower {
 			const sha =
 				ahead === 0 ? stream.committedSha : stream.pending[ahead - 1]?.sha256;
 			if ((committedLines === 0 ? null : sha) === lastLineSha256) {
-				this.dropPending(stream, ahead);
+				this.dropPending(session, stream, ahead);
 				stream.committedLines = committedLines;
 				stream.committedSha = lastLineSha256;
 				stream.needsReset = false;
 				return;
 			}
 		}
-		await this.locate(stream, committedLines, lastLineSha256);
+		this.dropPending(session, stream, stream.pending.length);
+		stream.locate = { committedLines, lastLineSha256 };
+		stream.scannedTo = -1;
 	}
 
-	private async handleRequestError(error: unknown): Promise<void> {
+	private async handleRequestError(
+		session: Session,
+		error: unknown,
+	): Promise<void> {
 		if (error instanceof ORPCError) {
 			if (error.code === LIVE_SESSIONS_DISABLED_CODE) {
 				const data = error.data as
 					| { pauseSeconds?: unknown; scope?: unknown }
 					| undefined;
+				const scope = data?.scope === "workspace" ? "workspace" : "global";
 				await pauseLiveSessions(
 					this.configDir,
-					this.options.organizationId,
-					data?.scope === "workspace" ? "workspace" : "global",
+					session.organizationId,
+					scope,
 					typeof data?.pauseSeconds === "number" ? data.pauseSeconds : 3_600,
 				).catch((pauseError: unknown) =>
 					logger.warn("Could not record the live session pause: {error}", {
 						error: describeError(pauseError),
 					}),
 				);
-				throw new StopFollowing("disabled");
+				if (scope === "global") throw new StopFollowing("disabled");
+				for (const other of [...this.sessions.values()])
+					if (other.organizationId === session.organizationId)
+						this.dropSession(other, "paused", true);
+				throw new StopSession("paused");
 			}
 			if (error.code === SESSION_OWNERSHIP_CONFLICT_CODE)
-				throw new StopFollowing("ownership-conflict");
+				throw new StopSession("ownership-conflict");
 			if (error.status === 401 || error.status === 403)
 				throw new StopFollowing("unauthorized");
 			if (error.status === 429) {
@@ -1001,19 +1408,20 @@ class LiveSessionFollower {
 				return;
 			}
 			if (error.status < 500 && error.status !== 408) {
-				logger.warn(
-					"Live session updates for {sessionId} were rejected ({status} {code})",
-					{
-						code: error.code,
-						sessionId: this.options.sessionId,
-						status: error.status,
-					},
-				);
-				throw new StopFollowing(`rejected-${error.status}`);
+				logger.warn("Live session {sessionId} was rejected ({status} {code})", {
+					code: error.code,
+					sessionId: session.sessionId,
+					status: error.status,
+				});
+				throw new StopSession(`rejected-${error.status}`);
 			}
 		} else if (error instanceof ZodError) {
 			throw new StopFollowing("invalid-response");
 		}
+		this.backOff();
+	}
+
+	private backOff(): void {
 		this.backoffMs =
 			this.backoffMs === 0
 				? this.timing.backoffInitialMs
@@ -1023,9 +1431,79 @@ class LiveSessionFollower {
 }
 
 /**
+ * Claude Code runs one session per process at a time: a later registration
+ * from the same process (`/clear`, `/resume`) supersedes earlier ones of
+ * other sessions. Codex processes run many threads at once.
+ */
+function findSupersededRegistrations(
+	registrations: readonly StoredLiveSessionRegistration[],
+	alive: ReadonlyMap<StoredLiveSessionRegistration, boolean>,
+): Set<StoredLiveSessionRegistration> {
+	const newestByPid = new Map<number, StoredLiveSessionRegistration>();
+	for (const registration of registrations) {
+		if (registration.source !== "claude_code" || registration.agentPid === null)
+			continue;
+		if (alive.get(registration) !== true) continue;
+		const newest = newestByPid.get(registration.agentPid);
+		if (!newest || registration.startedAt > newest.startedAt)
+			newestByPid.set(registration.agentPid, registration);
+	}
+	const superseded = new Set<StoredLiveSessionRegistration>();
+	for (const registration of registrations) {
+		if (registration.source !== "claude_code" || registration.agentPid === null)
+			continue;
+		const newest = newestByPid.get(registration.agentPid);
+		if (newest && newest.sessionId !== registration.sessionId)
+			superseded.add(registration);
+	}
+	return superseded;
+}
+
+function orderedStreams(session: Session): Stream[] {
+	const main = session.streams.get("");
+	const others = [...session.streams.values()]
+		.filter((stream) => stream.agentId !== null)
+		.sort((left, right) =>
+			(left.agentId ?? "") < (right.agentId ?? "") ? -1 : 1,
+		);
+	return main ? [main, ...others] : others;
+}
+
+function oldestPendingAt(session: Session): number | undefined {
+	let oldest: number | undefined;
+	for (const stream of session.streams.values())
+		if (
+			stream.firstPendingAt !== undefined &&
+			(oldest === undefined || stream.firstPendingAt < oldest)
+		)
+			oldest = stream.firstPendingAt;
+	return oldest;
+}
+
+/** Ending, past its final read, and every stream read to its end. */
+function isReadyToFinish(session: Session): boolean {
+	return (
+		session.ending !== undefined &&
+		performance.now() >= session.ending.readAt &&
+		session.serverStreams !== undefined &&
+		[...session.streams.values()].every(
+			(stream) => stream.scannedTo !== -1 && stream.locate === undefined,
+		)
+	);
+}
+
+function hasEmptyReset(session: Session): boolean {
+	for (const stream of session.streams.values())
+		if (stream.needsReset && stream.pending.length === 0) return true;
+	return false;
+}
+
+/**
  * Byte offset just after line `lineIndex` when that line, through the live
  * pipeline, hashes to `sha256`; undefined when the file has fewer complete
- * lines or a different line there.
+ * lines or a different line there. With `replay`, earlier lines also go
+ * through the pipeline so `slimmer` holds the state of an uninterrupted
+ * stream. Read errors are thrown (the caller retries later).
  */
 async function findLineEnd(
 	path: string,
@@ -1033,6 +1511,7 @@ async function findLineEnd(
 	sha256: string,
 	slimmer: TranscriptSlimmer,
 	buffer: Buffer,
+	replay: boolean,
 ): Promise<number | undefined> {
 	const handle = await open(path, "r");
 	try {
@@ -1045,6 +1524,7 @@ async function findLineEnd(
 			size,
 			(line) => {
 				if (index < lineIndex) {
+					if (replay) processLiveSessionLine(line, slimmer);
 					index += 1;
 					return true;
 				}
@@ -1059,55 +1539,7 @@ async function findLineEnd(
 	}
 }
 
-/**
- * The process start time from `ps` (POSIX), to tell a reused PID apart.
- * "" when no such process exists, undefined when it cannot be determined.
- */
-function readProcessStartTime(pid: number): Promise<string | undefined> {
-	if (process.platform === "win32") return Promise.resolve(undefined);
-	return new Promise((resolve) => {
-		execFile(
-			"ps",
-			["-o", "lstart=", "-p", String(pid)],
-			{
-				env: { ...process.env, LC_ALL: "C" },
-				timeout: 5_000,
-				windowsHide: true,
-			},
-			(error, stdout) => {
-				if (error)
-					resolve(
-						typeof error.code === "number" && error.code === 1 && !stdout.trim()
-							? ""
-							: undefined,
-					);
-				else resolve(stdout.trim());
-			},
-		);
-	});
-}
-
-async function readAgentMarker(
-	path: string,
-): Promise<{ sessionId: string; startedAt: number } | undefined> {
-	try {
-		const value: unknown = JSON.parse(await readFile(path, "utf8"));
-		if (
-			typeof value === "object" &&
-			value !== null &&
-			"sessionId" in value &&
-			typeof value.sessionId === "string" &&
-			"startedAt" in value &&
-			typeof value.startedAt === "number"
-		)
-			return { sessionId: value.sessionId, startedAt: value.startedAt };
-	} catch {
-		// Missing or being replaced.
-	}
-	return undefined;
-}
-
-function readCredentials(configDir: string) {
+function readCredentials(configDir: string): Credentials | null {
 	try {
 		const credentials = loadCredentials("read-only", configDir);
 		return credentials?.user ? credentials : null;

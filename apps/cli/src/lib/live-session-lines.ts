@@ -13,7 +13,7 @@ import type { TranscriptSlimmer } from "./transcript-slim.js";
  * line may be much larger than what is finally sent, but a background
  * process must keep a hard memory bound.
  */
-export const LIVE_SESSION_MAX_RAW_LINE_BYTES = 32 * 1024 * 1024;
+export const LIVE_SESSION_MAX_RAW_LINE_BYTES = 8 * 1024 * 1024;
 const READ_CHUNK_BYTES = 1024 * 1024;
 const NEWLINE = 0x0a;
 

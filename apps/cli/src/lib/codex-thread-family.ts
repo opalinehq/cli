@@ -196,7 +196,9 @@ async function findDescendants(
 	return descendants;
 }
 
-async function readCodexThread(path: string): Promise<CodexThread | null> {
+export async function readCodexThread(
+	path: string,
+): Promise<CodexThread | null> {
 	const first = await readJsonlFirstLine(path);
 	if (!isRecord(first) || first.type !== "session_meta") return null;
 	const payload = first.payload;

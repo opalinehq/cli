@@ -25,6 +25,8 @@ export interface FileLeaseOptions {
 
 export interface FileLease {
 	readonly release: () => Promise<void>;
+	/** Whether this lease still owns the lock (it may have been recovered as stale). */
+	readonly isOwned: () => Promise<boolean>;
 }
 
 export const DEFAULT_FILE_LEASE_OPTIONS: FileLeaseOptions = {
@@ -63,6 +65,7 @@ export async function tryAcquireFileLease(
 		}, options.heartbeatMs);
 		heartbeat.unref();
 		return {
+			isOwned: async () => (await readIfPresent(ownerPath)) === ownerToken,
 			release: async () => {
 				clearInterval(heartbeat);
 				if ((await readIfPresent(ownerPath)) === ownerToken)

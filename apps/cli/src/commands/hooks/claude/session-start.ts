@@ -10,7 +10,10 @@ import { findHookAnalysisMarkers } from "../../../lib/analysis-hook.js";
 import { isRepositoryAutoUploadAllowed } from "../../../lib/auto-upload-config.js";
 import { loadCredentials } from "../../../lib/credentials.js";
 import { getGitInfo } from "../../../lib/git-info.js";
-import { scheduleLiveSessionFollower } from "../../../lib/live-session-launch.js";
+import {
+	resolveClaudeAgentProcess,
+	scheduleLiveSessionFollower,
+} from "../../../lib/live-session-launch.js";
 import { getProjectOrgId } from "../../../lib/project-config.js";
 import {
 	getLegacyRepositoryKeys,
@@ -86,18 +89,20 @@ async function runSessionStart(): Promise<undefined> {
 		}
 		// Live updates are independent of repository evidence: its pause must
 		// not stop them, and they must not delay or change the capture below.
-		scheduleLiveSessionFollower({
+		await scheduleLiveSessionFollower({
 			credentials,
 			cwd: input.cwd,
-			onInfo: (message) => logger.info("{message}", { message }),
-			onWarning: (warning) => logger.warn("{warning}", { warning }),
-			organizationId,
-			sessionId: input.session_id,
-			source:
+			hookSource:
 				typeof input.source === "string" &&
 				/^[a-z_-]{1,32}$/u.test(input.source)
 					? input.source
 					: undefined,
+			onInfo: (message) => logger.info("{message}", { message }),
+			onWarning: (warning) => logger.warn("{warning}", { warning }),
+			organizationId,
+			resolveAgent: resolveClaudeAgentProcess,
+			sessionId: input.session_id,
+			source: "claude_code",
 			transcriptPath: input.transcript_path,
 		});
 		if (readRepositoryEvidencePauseUntil() !== undefined) return;

@@ -29,7 +29,7 @@ export const LiveSessionAgentIdSchema = z
 
 export const LiveSessionTargetSchema = z.object({
 	protocol: z.literal(LIVE_SESSION_PROTOCOL),
-	source: z.literal("claude_code"),
+	source: z.enum(["claude_code", "codex"]),
 	organizationId: z.string().min(1).max(200),
 	sessionId: z.string().regex(/^[A-Za-z0-9_-]{1,200}$/),
 });

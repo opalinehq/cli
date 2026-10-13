@@ -24,6 +24,7 @@ import {
 	reconcilePendingUploadsInHook,
 	reportHookUploadFailure,
 } from "../../../lib/hook-upload-failure.js";
+import { scheduleCodexLiveSession } from "../../../lib/live-session-launch.js";
 import { getProjectOrgId } from "../../../lib/project-config.js";
 import {
 	getLegacyRepositoryKeys,
@@ -159,6 +160,17 @@ async function runTurnComplete(
 		const request = inferred
 			? withSessionRepository(builtRequest, inferred.gitInfo)
 			: builtRequest;
+		// Live updates of this thread from now on; runs alongside the upload.
+		const liveRegistration = organizationId
+			? scheduleCodexLiveSession({
+					credentials,
+					cwd: input.cwd,
+					onWarning: (warning) => logger.warn("{warning}", { warning }),
+					organizationId,
+					threadId: input.threadId,
+					transcriptPath,
+				})
+			: Promise.resolve();
 		const evidenceUpload = organizationId
 			? captureAndUploadSessionEvidence({
 					credentials,
@@ -199,7 +211,7 @@ async function runTurnComplete(
 			authType: credentials.authType,
 			r2StatusMaxPolls: HOOK_R2_STATUS_MAX_POLLS,
 		});
-		await Promise.all([evidenceUpload, reconciliation]);
+		await Promise.all([evidenceUpload, reconciliation, liveRegistration]);
 
 		if (result.success) {
 			const redactionSummary = formatRedactionSummary(
