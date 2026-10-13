@@ -268,7 +268,15 @@ interface InspectedCapture {
 
 export class RepositorySpoolQuotaError extends Error {}
 
-export class RepositorySpoolCapacityError extends RepositorySpoolQuotaError {}
+export class RepositorySpoolCapacityError extends RepositorySpoolQuotaError {
+	constructor(
+		message: string,
+		/** Bytes and captures the rejected write needed to store. */
+		readonly demand: RetirementDemand | null = null,
+	) {
+		super(message);
+	}
+}
 
 export class RepositorySpoolCorruptionError extends Error {}
 
@@ -446,7 +454,11 @@ export async function removeRepositorySpoolCapture(
 		},
 	);
 	try {
-		const plan = await planBindingRetirement(paths, env, new Set());
+		const plan = planBindingRetirement(
+			await scanBindingForRetirement(paths, env),
+			new Set(),
+			false,
+		);
 		const retired = plan.captures.filter(
 			(capture) => capture.record?.captureId === captureId,
 		);
@@ -735,6 +747,7 @@ async function planWithRetirement(
 				...candidate.referencedBlobIds,
 				...candidate.blobs.map((blob) => blob.id),
 			]),
+			error.demand,
 		);
 		try {
 			return await planRepositoryBundleWith(
@@ -762,6 +775,26 @@ interface RetirementCapture {
 	readonly record: StoredCaptureRecord | null;
 }
 
+/** What a rejected write needs to fit: retirement frees at least this much. */
+interface RetirementDemand {
+	readonly bytes: number;
+	readonly captures: number;
+}
+
+/**
+ * Once a write only fits by retiring other bindings' accepted heads, they are
+ * retired until usage drops to this share of the limits, so the next writes
+ * do not each rescan every binding just to evict one more head.
+ */
+const HEAD_RETIREMENT_TARGET_RATIO = 0.9;
+
+interface BindingRetirementScan {
+	readonly captures: readonly RetirementCapture[];
+	readonly headIds: ReadonlySet<string>;
+	readonly paths: SpoolPaths;
+	readonly retirableIds: ReadonlySet<string>;
+}
+
 interface BindingRetirementPlan {
 	readonly captures: readonly RetirementCapture[];
 	readonly keepBlobIds: ReadonlySet<string>;
@@ -774,6 +807,7 @@ async function retireAcceptedCapturesLocked(
 	currentPaths: SpoolPaths,
 	env: RepositorySpoolEnv,
 	keepBlobIds: ReadonlySet<string>,
+	demand: RetirementDemand | null = null,
 ): Promise<RepositorySpoolRetirementResult> {
 	const before = await ensureCleanAccountingLocked(env);
 	const bindingPaths = new Map<string, SpoolPaths>([
@@ -791,16 +825,15 @@ async function retireAcceptedCapturesLocked(
 			root: currentPaths.root,
 		});
 	}
-	const plans: BindingRetirementPlan[] = [];
+	const scans: BindingRetirementScan[] = [];
 	for (const paths of bindingPaths.values()) {
-		plans.push(
-			await planBindingRetirement(
-				paths,
-				env,
-				paths.binding === currentPaths.binding ? keepBlobIds : new Set(),
-			),
-		);
+		scans.push(await scanBindingForRetirement(paths, env));
 	}
+	const keepFor = (paths: SpoolPaths) =>
+		paths.binding === currentPaths.binding ? keepBlobIds : new Set<string>();
+	const plans = scans.map((scan) =>
+		planBindingRetirement(scan, keepFor(scan.paths), false),
+	);
 	const unsentCaptures = plans.reduce(
 		(total, plan) => total + plan.unsent.length,
 		0,
@@ -810,28 +843,61 @@ async function retireAcceptedCapturesLocked(
 			total + plan.unsent.reduce((sum, capture) => sum + capture.bytes, 0),
 		0,
 	);
-	const retiredCaptures = plans.reduce(
-		(total, plan) => total + plan.retired.length,
-		0,
-	);
-	if (retiredCaptures === 0) {
-		return {
-			freedBytes: 0,
-			retiredBlobs: 0,
-			retiredCaptures: 0,
-			unsentBytes,
-			unsentCaptures,
-		};
-	}
 
 	await writeSpoolAccounting({ ...before, state: "dirty" }, env);
 	let freedBytes = 0;
 	let retiredBlobs = 0;
-	for (const plan of plans) {
+	let retiredCaptures = 0;
+	const retiredPaths = new Set<string>();
+	const apply = async (plan: BindingRetirementPlan) => {
 		const applied = await applyBindingRetirement(plan);
 		freedBytes += applied.freedBytes;
 		retiredBlobs += applied.retiredBlobs;
+		retiredCaptures += plan.retired.length;
+		for (const capture of plan.retired) retiredPaths.add(capture.path);
+	};
+	// Retired captures and blobs no remaining capture references, in every
+	// binding, even one with nothing to retire.
+	for (const plan of plans) await apply(plan);
+
+	// Every binding keeps its newest accepted capture as the incremental parent
+	// of its next capture. A worktree that is never captured again (removed,
+	// finished) holds its head forever, so once those heads fill the spool no
+	// write fits. They were delivered already: retire the heads of the least
+	// recently captured other bindings. Their next capture, if any, is then a
+	// full one. The writing binding's head and every capture awaiting delivery,
+	// with its parent, are kept.
+	const fits = (ratio: number) =>
+		demand !== null &&
+		before.usedBytes - freedBytes + demand.bytes <=
+			env.maxStoredBytes * ratio &&
+		before.captureCount - retiredCaptures + demand.captures <=
+			env.maxCaptures * ratio;
+	if (demand !== null && !fits(1)) {
+		const headPlans = scans
+			.filter((scan) => scan.paths.binding !== currentPaths.binding)
+			.map((scan) =>
+				planBindingRetirement(
+					{
+						...scan,
+						captures: scan.captures.filter(
+							(capture) => !retiredPaths.has(capture.path),
+						),
+					},
+					keepFor(scan.paths),
+					true,
+				),
+			)
+			.filter((plan) => plan.retired.length > 0)
+			.sort((left, right) =>
+				getLatestCapturedAt(left).localeCompare(getLatestCapturedAt(right)),
+			);
+		for (const plan of headPlans) {
+			if (fits(HEAD_RETIREMENT_TARGET_RATIO)) break;
+			await apply(plan);
+		}
 	}
+
 	await writeSpoolAccounting(
 		{
 			...before,
@@ -851,17 +917,26 @@ async function retireAcceptedCapturesLocked(
 	};
 }
 
-async function planBindingRetirement(
+function getLatestCapturedAt(plan: BindingRetirementPlan): string {
+	let latest = "";
+	for (const capture of plan.captures) {
+		const capturedAt = capture.record?.capturedAt ?? "";
+		if (capturedAt > latest) latest = capturedAt;
+	}
+	return latest;
+}
+
+async function scanBindingForRetirement(
 	paths: SpoolPaths,
 	env: RepositorySpoolEnv,
-	keepBlobIds: ReadonlySet<string>,
-): Promise<BindingRetirementPlan> {
+): Promise<BindingRetirementScan> {
 	const names = await readNamesIfDirectory(paths.captures);
-	const acceptedMarkers = new Set(
-		names.filter((name) => name.endsWith(ACCEPTED_MARKER_SUFFIX)),
-	);
-	const abandonedMarkers = new Set(
-		names.filter((name) => name.endsWith(ABANDONED_MARKER_SUFFIX)),
+	const markers = new Set(
+		names.filter(
+			(name) =>
+				name.endsWith(ACCEPTED_MARKER_SUFFIX) ||
+				name.endsWith(ABANDONED_MARKER_SUFFIX),
+		),
 	);
 	const captures: RetirementCapture[] = [];
 	for (const name of names.filter((item) =>
@@ -875,21 +950,43 @@ async function planBindingRetirement(
 			record: await readStoredCapture(path),
 		});
 	}
-	const heads = new Set<string>();
+	const retirableIds = new Set<string>();
+	for (const capture of captures) {
+		const captureId = capture.record?.captureId;
+		if (
+			captureId !== undefined &&
+			(markers.has(getAcceptedMarkerName(captureId)) ||
+				markers.has(getAbandonedMarkerName(captureId)))
+		) {
+			retirableIds.add(captureId);
+		}
+	}
+	const headIds = new Set<string>();
 	for (const artifactKind of ["local-context", "github"] as const) {
 		const head = await readAcceptedRepositoryCapture(
 			getAcceptedCapturePath(paths, artifactKind),
 		);
-		if (head) heads.add(head.captureId);
+		if (head) headIds.add(head.captureId);
 	}
-	const isRetirable = (captureId: string) =>
-		acceptedMarkers.has(getAcceptedMarkerName(captureId)) ||
-		abandonedMarkers.has(getAbandonedMarkerName(captureId));
+	return { captures, headIds, paths, retirableIds };
+}
+
+/**
+ * Retires accepted or abandoned captures nothing still needs: never one
+ * awaiting delivery, nor the parent such a capture builds on. The accepted
+ * heads are kept too unless `retireAcceptedHeads` is set.
+ */
+function planBindingRetirement(
+	scan: BindingRetirementScan,
+	keepBlobIds: ReadonlySet<string>,
+	retireAcceptedHeads: boolean,
+): BindingRetirementPlan {
+	const { captures, headIds, paths, retirableIds } = scan;
 	const unsent = captures.filter(
 		(capture) =>
-			capture.record === null || !isRetirable(capture.record.captureId),
+			capture.record === null || !retirableIds.has(capture.record.captureId),
 	);
-	const protectedIds = new Set(heads);
+	const protectedIds = new Set(retireAcceptedHeads ? [] : headIds);
 	for (const capture of unsent) {
 		if (capture.record?.parentCaptureId) {
 			protectedIds.add(capture.record.parentCaptureId);
@@ -898,16 +995,20 @@ async function planBindingRetirement(
 	const retired = captures.filter(
 		(capture) =>
 			capture.record !== null &&
-			isRetirable(capture.record.captureId) &&
+			retirableIds.has(capture.record.captureId) &&
 			!protectedIds.has(capture.record.captureId),
 	);
 	return { captures, keepBlobIds, paths, retired, unsent };
 }
 
+/**
+ * Removes the planned captures and every blob no remaining capture of the
+ * binding references, also when nothing is retired: blobs a crashed or
+ * failed write left behind are reclaimed the same way.
+ */
 async function applyBindingRetirement(
 	plan: BindingRetirementPlan,
 ): Promise<{ readonly freedBytes: number; readonly retiredBlobs: number }> {
-	if (plan.retired.length === 0) return { freedBytes: 0, retiredBlobs: 0 };
 	const { paths } = plan;
 	const retiredPaths = new Set(plan.retired.map((capture) => capture.path));
 	let freedBytes = 0;
@@ -1602,11 +1703,13 @@ function assertWithinQuota(
 	if (quota.usedBytes + newBytes > env.maxStoredBytes) {
 		throw new RepositorySpoolCapacityError(
 			`Repository spool needs ${newBytes} new bytes but only ${quota.remainingBytes} bytes remain. Accepted or abandoned captures are retired automatically when space runs out; captures awaiting delivery are never deleted.`,
+			{ bytes: newBytes, captures: newCaptures },
 		);
 	}
 	if (quota.captureCount + newCaptures > env.maxCaptures) {
 		throw new RepositorySpoolCapacityError(
 			`Repository spool capture limit (${env.maxCaptures}) reached. Accepted or abandoned captures are retired automatically when space runs out; captures awaiting delivery are never deleted.`,
+			{ bytes: newBytes, captures: newCaptures },
 		);
 	}
 }
