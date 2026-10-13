@@ -38,7 +38,7 @@ import {
 	removeRepositorySpoolCapture,
 } from "./repo-spool.js";
 import {
-	getLegacyRepositoryKey,
+	getLegacyRepositoryKeys,
 	resolveUploadRepositoryIdentity,
 } from "./repository-discovery.js";
 import {
@@ -266,7 +266,7 @@ export async function captureAndUploadSessionEvidence(input: {
 		const currentPending: PendingRepositoryEvidence = {
 			repositorySelection: {
 				repoKey: repository.repoKey,
-				legacyKeys: [getLegacyRepositoryKey(request.projectPath, gitInfo)],
+				legacyKeys: getLegacyRepositoryKeys(request.projectPath, gitInfo),
 				source: request.source,
 			},
 			continuation: { sourceId, terminal: input.terminalTranscript },

@@ -8,7 +8,7 @@ import type { FileBackedUploadRequest } from "../internal/agent-adapters/index.j
 import { exec } from "./exec.js";
 import { type GitInfo, getGitInfo, getGitRemoteUrl } from "./git-info.js";
 import {
-	getLegacyRepositoryKey,
+	getLegacyRepositoryKeys,
 	resolveUploadRepositoryIdentity,
 } from "./repository-discovery.js";
 
@@ -38,7 +38,7 @@ export interface SessionPathSignal {
 
 export interface InferredSessionRepository {
 	readonly gitInfo: GitInfo;
-	readonly legacyKey: string;
+	readonly legacyKeys: readonly string[];
 	readonly repository: RepoIdentity;
 }
 
@@ -65,7 +65,7 @@ export async function inferSessionRepository(
 	if (!gitInfo.gitRemote) return null;
 	return {
 		gitInfo,
-		legacyKey: getLegacyRepositoryKey(root, gitInfo),
+		legacyKeys: getLegacyRepositoryKeys(root, gitInfo),
 		repository: resolveUploadRepositoryIdentity(root, gitInfo),
 	};
 }

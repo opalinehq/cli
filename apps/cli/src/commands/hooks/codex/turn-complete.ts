@@ -26,7 +26,7 @@ import {
 } from "../../../lib/hook-upload-failure.js";
 import { getProjectOrgId } from "../../../lib/project-config.js";
 import {
-	getLegacyRepositoryKey,
+	getLegacyRepositoryKeys,
 	resolveUploadRepositoryIdentity,
 } from "../../../lib/repository-discovery.js";
 import { captureAndUploadSessionEvidence } from "../../../lib/session-evidence.js";
@@ -93,9 +93,11 @@ async function runTurnComplete(
 		const gitInfo = await getGitInfo(input.cwd);
 		const repository = resolveUploadRepositoryIdentity(input.cwd, gitInfo);
 		if (
-			!isRepositoryAutoUploadAllowed(repository.repoKey, codexAdapter.source, [
-				getLegacyRepositoryKey(input.cwd, gitInfo),
-			])
+			!isRepositoryAutoUploadAllowed(
+				repository.repoKey,
+				codexAdapter.source,
+				getLegacyRepositoryKeys(input.cwd, gitInfo),
+			)
 		) {
 			logger.info(
 				"Skipping session {sessionId}: automatic upload is disabled for {repository}",
@@ -142,7 +144,7 @@ async function runTurnComplete(
 			isRepositoryAutoUploadDisabled(
 				inferred.repository.repoKey,
 				codexAdapter.source,
-				[inferred.legacyKey],
+				inferred.legacyKeys,
 			)
 		) {
 			logger.info(

@@ -7,7 +7,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { exec } from "./exec.js";
-import { normalizeRemoteUrl } from "./git-info.js";
+import { getLegacyRemoteUrl, normalizeRemoteUrl } from "./git-info.js";
 import { getConfigDir } from "./local-state.js";
 
 interface ProjectEntry {
@@ -42,7 +42,13 @@ function saveProjectsConfig(config: ProjectsConfig): void {
 	chmodSync(path, 0o600);
 }
 
-async function getProjectKey(cwd: string): Promise<string> {
+interface ProjectKeys {
+	key: string;
+	/** Keys older releases saved the same project under. */
+	legacyKeys: string[];
+}
+
+async function getProjectKeys(cwd: string): Promise<ProjectKeys> {
 	// Prefer git remote URL (portable across clones)
 	try {
 		const result = await exec("git", [
@@ -55,7 +61,11 @@ async function getProjectKey(cwd: string): Promise<string> {
 		if (result.exitCode === 0) {
 			const url = result.stdout.trim();
 			if (url.length > 0) {
-				return normalizeRemoteUrl(url);
+				const legacyKey = getLegacyRemoteUrl(url);
+				return {
+					key: normalizeRemoteUrl(url),
+					legacyKeys: legacyKey ? [legacyKey] : [],
+				};
 			}
 		}
 	} catch {
@@ -71,30 +81,33 @@ async function getProjectKey(cwd: string): Promise<string> {
 			"--show-toplevel",
 		]);
 		if (result.exitCode === 0) {
-			return result.stdout.trim();
+			return { key: result.stdout.trim(), legacyKeys: [] };
 		}
 	} catch {
 		// Not a git repo
 	}
 
-	return cwd;
+	return { key: cwd, legacyKeys: [] };
 }
 
 export async function getProjectOrgId(
 	cwd: string,
 ): Promise<string | undefined> {
-	const key = await getProjectKey(cwd);
+	const { key, legacyKeys } = await getProjectKeys(cwd);
 	const config = loadProjectsConfig();
-	return config.projects[key]?.organizationId;
+	return [key, ...legacyKeys]
+		.map((candidate) => config.projects[candidate]?.organizationId)
+		.find((organizationId) => organizationId !== undefined);
 }
 
 export async function setProjectOrgId(
 	cwd: string,
 	organizationId: string,
 ): Promise<void> {
-	const key = await getProjectKey(cwd);
+	const { key, legacyKeys } = await getProjectKeys(cwd);
 	const config = loadProjectsConfig();
 	config.projects[key] = { organizationId };
+	for (const legacyKey of legacyKeys) delete config.projects[legacyKey];
 	config.defaultOrganizationId = organizationId;
 	saveProjectsConfig(config);
 }
