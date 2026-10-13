@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.13.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.12.3...opaline-cli@0.13.0) (2026-10-13)
+
+
+### Features
+
+* **cli:** stream live Claude Code and Codex sessions ([#506](https://github.com/opalinehq/cli/issues/506)) ([3e19888](https://github.com/opalinehq/cli/commit/3e1988884d451319c2f4e26a828f6e1ffd9f0656))
+
+
+### Bug Fixes
+
+* **secret-filter:** redact AWS secret keys, OpenAI keys, JWTs and connection-string passwords ([#509](https://github.com/opalinehq/cli/issues/509)) ([7bd42c4](https://github.com/opalinehq/cli/commit/7bd42c4424d5c1269f2a06e03a4a368d35713fed))
+
 ## [0.12.3](https://github.com/opalinehq/cli/compare/opaline-cli@0.12.2...opaline-cli@0.12.3) (2026-10-13)
 
 
