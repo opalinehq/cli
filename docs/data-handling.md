@@ -10,6 +10,8 @@ Enable uploads only for projects and environments where that data may be sent to
 
 Choose repositories in the CLI, review your selection, and confirm. Automatic uploads are enabled for the selected repositories. Turning a repository OFF stops future uploads; it does not delete sessions already uploaded, and hooks already uploading may finish.
 
+For Claude Code, the transcript is also sent while the session runs (live updates): a background process started by the session-start hook sends each new complete line of the main and sub-agent transcripts within a few seconds. It uses the same repository allowlist, workspace binding and credentials as session uploads, needs an ingest API key, and checks the repository setting every minute, so turning a repository OFF stops live updates within a minute. It stops when Claude Code exits, after seven days, or when the server pauses live updates; a server pause is stored in `live-sessions/paused.json` under the CLI's config directory until it expires. Set `OPALINE_LIVE_SESSIONS=0` to turn live updates off on one machine. The full upload at session end is unchanged and remains the complete record.
+
 ## Known-secret filtering
 
 Before upload, the CLI applies deterministic filtering for known secret patterns to both the main transcript and sub-agent transcripts.
@@ -18,11 +20,15 @@ Before upload, the CLI applies deterministic filtering for known secret patterns
 
 Safety limits stop an upload when filtering cannot preserve transcript integrity, cannot converge, or redacts an unexpectedly large portion of the payload. They cannot prove that the remaining transcript is free of secrets. Treat filtering as an additional safeguard, not a substitute for keeping sensitive data out of sessions.
 
+Live updates filter each transcript line on its own before it leaves the machine, then slim it like an upload (inline images become a marker). Filtering lines one at a time gives the same result as filtering the whole file. A line that cannot be filtered safely, or is larger than 1 MiB after slimming, is replaced by a marker naming only the reason and its size. Live updates stop if redaction exceeds the same safety ratio after the first 256 KiB. The server filters every live line again before storing it.
+
 ## Upload transport
 
 When the authenticated server advertises direct R2 ingest support, the CLI stages filtered transcript objects in private temporary files and sends them as bounded multipart uploads.
 
 Servers without that capability continue to receive the filtered legacy ingest request. Large file-backed requests fail locally rather than being materialized without a safe bound.
+
+Live updates send complete transcript lines in small JSON requests (at most 1.5 MiB of lines each) to the same API, with the same endpoint checks as uploads. They keep at most 16 MiB of unsent lines in memory, back off when the server is unavailable or busy, and stop when the server rejects them.
 
 The CLI defaults to `https://opaline.so`. Insecure login and upload overrides are documented in the [configuration reference](usage.md#configuration); they transmit credentials or transcripts without transport encryption.
 

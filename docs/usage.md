@@ -49,6 +49,8 @@ Run `npx opaline@latest` again to change your selections. Turning a repository O
 
 Opaline installs the required Claude Code and/or Codex hooks. Claude Code's hook is installed in your user settings, so setup does not depend on your current directory. Hooks run headlessly, check the repository allowlist, filter known secret patterns, and upload sessions. Existing unrelated hooks and settings are preserved.
 
+While a Claude Code session runs, the same hooks also stream its new transcript lines, including sub-agent transcripts, so the session appears in Opaline within seconds. Nothing new is installed: the session-start hook starts a small background process that follows the transcript, sends only complete new lines, and exits when Claude Code exits. The full upload when the session ends is unchanged, so a session still arrives if live updates are unavailable. Live updates run only when the server offers them; the server can pause them, and `OPALINE_LIVE_SESSIONS=0` turns them off on one machine.
+
 Codex notification tools can coexist with automatic uploads. Opaline retains the existing command and arguments, forwards the notification JSON, and uploads independently. Codex Computer Use stays at the front of its notification chain. Turning uploads OFF keeps notifications working.
 
 Custom scripts are preserved; Opaline does not rewrite scripts that invoke older Rudel installations themselves. Setup failures show the complete error and a retry/back action, including the settings file to fix when a Codex configuration is invalid.
@@ -129,6 +131,7 @@ The production API defaults to `https://opaline.so`.
 | `OPALINE_CONFIG_DIR` | Override local state; `RUDEL_CONFIG_DIR` is also accepted. |
 | `OPALINE_ALLOW_INSECURE_API_BASE=1` | Permit plaintext non-loopback login/authentication traffic. |
 | `OPALINE_ALLOW_INSECURE_ENDPOINT=1` | Permit plaintext non-loopback transcript uploads. |
+| `OPALINE_LIVE_SESSIONS=0` | Turn off live updates of running Claude Code sessions on this machine; uploads at session end continue. |
 | `DO_NOT_TRACK=1` or `POSTHOG_ENABLED=false` | Disable CLI usage analytics. |
 
 The insecure overrides transmit credentials or transcripts without transport encryption. Use them only for a trusted self-hosted network. Login and transcript-upload overrides are separate.
