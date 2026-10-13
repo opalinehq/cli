@@ -12,6 +12,8 @@ export interface CompiledSecretRule {
 	readonly definition: SecretRule;
 	readonly matcher: RegExp;
 	readonly allowlistMatchers: readonly RegExp[];
+	/** Matches text that contains one of the rule's keywords. */
+	readonly keywordMatcher?: RegExp;
 }
 
 type SecretRedactor = (ruleId: string, original: string) => string;
@@ -19,7 +21,7 @@ type SecretRedactor = (ruleId: string, original: string) => string;
 const COMPILED_SECRET_RULES = GENERATED_SECRET_RULES.map(compileSecretRule);
 const UTF8_ENCODER = new TextEncoder();
 
-export const FILTER_VERSION = 6;
+export const FILTER_VERSION = 7;
 export const MAX_FILTER_PASSES = 4;
 export const OVERLONG_MATCH_THRESHOLD_BYTES = 8192;
 export const MAX_REDACTION_RATIO = 0.2;
@@ -246,7 +248,19 @@ export function compileSecretRule(rule: SecretRule): CompiledSecretRule {
 		allowlistMatchers: rule.allowlistRegexSources.map(
 			(source) => new RegExp(source, allowlistFlags),
 		),
+		...(rule.keywords && rule.keywords.length > 0
+			? {
+					keywordMatcher: new RegExp(
+						rule.keywords.map(escapeRegExpLiteral).join("|"),
+						"iu",
+					),
+				}
+			: {}),
 	};
+}
+
+function escapeRegExpLiteral(text: string): string {
+	return text.replace(/[\\^$.*+?()[\]{}|/]/gu, "\\$&");
 }
 
 export function applyCompiledSecretRule(
@@ -254,37 +268,86 @@ export function applyCompiledSecretRule(
 	rule: CompiledSecretRule,
 	redactSecret?: SecretRedactor,
 ): SecretFilterResult {
+	const result = applyCompiledSecretRuleToView(
+		text,
+		buildMatchView(text, buildEscapedBreakPattern([rule])),
+		rule,
+		redactSecret,
+	);
+	return {
+		text: result.text,
+		counts: result.counts,
+		redactedBytes: result.redactedBytes,
+	};
+}
+
+interface ViewFilterResult extends SecretFilterResult {
+	/**
+	 * The match view of the filtered text when it follows from the input's
+	 * view (a redaction covers whole escape sequences and its marker has no
+	 * backslash), or undefined when it has to be rebuilt.
+	 */
+	readonly nextView: MatchView | null | undefined;
+}
+
+function applyCompiledSecretRuleToView(
+	text: string,
+	view: MatchView | null,
+	rule: CompiledSecretRule,
+	redactSecret?: SecretRedactor,
+): ViewFilterResult {
+	const matchedText = view?.text ?? text;
+	// Scanning for a literal is several times faster than running the rule.
+	if (rule.keywordMatcher && !rule.keywordMatcher.test(matchedText)) {
+		return { text, counts: {}, redactedBytes: 0, nextView: view };
+	}
+
 	const pieces: string[] = [];
+	// The filtered text's view is this view with the same redactions, as long
+	// as no marker contains a backslash.
+	const viewPieces: string[] = [];
+	const redactions: ViewRedaction[] = [];
+	let viewCursor = 0;
 	let count = 0;
 	let overlongCount = 0;
 	let redactedBytes = 0;
 	let cursor = 0;
 
 	rule.matcher.lastIndex = 0;
-	let match = rule.matcher.exec(text);
+	let match = rule.matcher.exec(matchedText);
 	while (match !== null) {
 		const secret = match[rule.definition.secretGroup];
 		const secretSpan = match.indices?.[rule.definition.secretGroup];
 		if (secret === undefined || secretSpan === undefined) {
 			advanceAfterMatch(rule.matcher, match);
-			match = rule.matcher.exec(text);
+			match = rule.matcher.exec(matchedText);
 			continue;
 		}
 
 		if (isAllowlisted(secret, rule)) {
 			advanceAfterMatch(rule.matcher, match);
-			match = rule.matcher.exec(text);
+			match = rule.matcher.exec(matchedText);
 			continue;
 		}
 
-		const [secretStart, secretEnd] = secretSpan;
-		const secretBytes = getUtf8ByteLength(secret);
-		pieces.push(
-			text.slice(cursor, secretStart),
+		const [viewStart, viewEnd] = secretSpan;
+		const secretStart = toTextOffset(view, viewStart);
+		const secretEnd = toTextOffset(view, viewEnd);
+		const secretBytes = getUtf8ByteLength(text.slice(secretStart, secretEnd));
+		const replacement =
 			redactSecret?.(rule.definition.id, secret) ??
-				`[REDACTED:${rule.definition.id}]`,
-		);
+			`[REDACTED:${rule.definition.id}]`;
+		pieces.push(text.slice(cursor, secretStart), replacement);
 		cursor = secretEnd;
+		viewPieces.push(matchedText.slice(viewCursor, viewStart), replacement);
+		viewCursor = viewEnd;
+		redactions.push({
+			viewStart,
+			viewEnd,
+			textStart: secretStart,
+			textEnd: secretEnd,
+			replacement,
+		});
 		count += 1;
 		redactedBytes += secretBytes;
 
@@ -295,16 +358,22 @@ export function applyCompiledSecretRule(
 		// Resume at the end of the secret group rather than match[0] so a
 		// delimiter consumed by the surrounding regex remains available to later
 		// rules while every byte in the matched secret stays removed.
-		rule.matcher.lastIndex = secretEnd;
-		match = rule.matcher.exec(text);
+		rule.matcher.lastIndex = viewEnd;
+		match = rule.matcher.exec(matchedText);
 	}
 	rule.matcher.lastIndex = 0;
 
 	if (count === 0) {
-		return { text, counts: {}, redactedBytes: 0 };
+		return { text, counts: {}, redactedBytes: 0, nextView: view };
 	}
 
 	pieces.push(text.slice(cursor));
+	viewPieces.push(matchedText.slice(viewCursor));
+	const nextView = redactions.some(({ replacement }) =>
+		replacement.includes("\\"),
+	)
+		? undefined
+		: view && redactView(view, viewPieces.join(""), redactions);
 	const counts: Record<string, number> = {
 		[rule.definition.id]: count,
 	};
@@ -315,6 +384,7 @@ export function applyCompiledSecretRule(
 		text: pieces.join(""),
 		counts,
 		redactedBytes,
+		nextView,
 	};
 }
 
@@ -324,17 +394,202 @@ function applyCompiledSecretRules(
 	redactSecret?: SecretRedactor,
 ): SecretFilterResult {
 	let filteredText = text;
+	const escapedBreakPattern = buildEscapedBreakPattern(rules);
+	let view = buildMatchView(text, escapedBreakPattern);
 	let counts: RedactionCounts = {};
 	let redactedBytes = 0;
 
 	for (const rule of rules) {
-		const result = applyCompiledSecretRule(filteredText, rule, redactSecret);
-		filteredText = result.text;
+		const result = applyCompiledSecretRuleToView(
+			filteredText,
+			view,
+			rule,
+			redactSecret,
+		);
+		if (result.text !== filteredText) {
+			filteredText = result.text;
+			view =
+				result.nextView === undefined
+					? buildMatchView(filteredText, escapedBreakPattern)
+					: result.nextView;
+		}
 		counts = mergeRedactionCounts(counts, result.counts);
 		redactedBytes += result.redactedBytes;
 	}
 
 	return { text: filteredText, counts, redactedBytes };
+}
+
+/**
+ * The text rules match. Transcripts are JSON, so a secret sits next to escape
+ * sequences, and rules are written for decoded text:
+ * - Escaped line breaks and tabs (`\n`, or `\\n` one JSON level deeper)
+ *   become spaces of the same length, so `\b` and `\s` see a line break.
+ *   Outside JSON a backslash may be literal (`repo\npm_...`), so an
+ *   escape letter that begins a rule keyword is left as it is.
+ * - JSON writers may escape any character as `\u00XX` (.NET escapes `+`, Go
+ *   escapes `&`) and `/` as `\/` (PHP); behind any run of backslashes those
+ *   are decoded to the character, and offsets map back to the input.
+ * A match always covers whole escape sequences, so a redaction never leaves
+ * half an escape behind and JSON stays valid.
+ */
+interface MatchView {
+	readonly text: string;
+	/** View offset of each decoded escape, ascending. */
+	readonly viewOffsets: readonly number[];
+	/** Offset of each decoded escape in the input text. */
+	readonly textOffsets: readonly number[];
+	readonly textLengths: readonly number[];
+}
+
+const ESCAPED_PRINTABLE_PATTERN =
+	/\\+(?:u00([2-6][0-9A-Fa-f]|7[0-9A-Ea-e])|\/)/gu;
+
+function buildEscapedBreakPattern(
+	rules: readonly CompiledSecretRule[],
+): RegExp {
+	const keywordTails: Record<string, string[]> = { n: [], r: [], t: [] };
+	for (const rule of rules) {
+		for (const keyword of rule.definition.keywords ?? []) {
+			const tails = keywordTails[keyword.charAt(0)];
+			if (tails && keyword.length > 1) {
+				tails.push(toCaseInsensitiveLiteral(keyword.slice(1)));
+			}
+		}
+	}
+	const letters = Object.entries(keywordTails).map(([letter, tails]) =>
+		tails.length === 0 ? letter : `${letter}(?!${tails.join("|")})`,
+	);
+	return new RegExp(`\\\\+(?:${letters.join("|")})`, "gu");
+}
+
+function toCaseInsensitiveLiteral(text: string): string {
+	return [...text]
+		.map((character) =>
+			/[a-z]/iu.test(character)
+				? `[${character.toLowerCase()}${character.toUpperCase()}]`
+				: escapeRegExpLiteral(character),
+		)
+		.join("");
+}
+
+function buildMatchView(
+	text: string,
+	escapedBreakPattern: RegExp,
+): MatchView | null {
+	if (!text.includes("\\")) {
+		return null;
+	}
+
+	const spaced = text.replace(escapedBreakPattern, (sequence) =>
+		" ".repeat(sequence.length),
+	);
+	const viewOffsets: number[] = [];
+	const textOffsets: number[] = [];
+	const textLengths: number[] = [];
+	if (!spaced.includes("\\u00") && !spaced.includes("\\/")) {
+		return { text: spaced, viewOffsets, textOffsets, textLengths };
+	}
+
+	const pieces: string[] = [];
+	let cursor = 0;
+	let viewLength = 0;
+	for (const decoded of spaced.matchAll(ESCAPED_PRINTABLE_PATTERN)) {
+		const hex = decoded[1];
+		pieces.push(spaced.slice(cursor, decoded.index));
+		viewLength += decoded.index - cursor;
+		viewOffsets.push(viewLength);
+		textOffsets.push(decoded.index);
+		textLengths.push(decoded[0].length);
+		pieces.push(
+			hex === undefined ? "/" : String.fromCharCode(Number.parseInt(hex, 16)),
+		);
+		viewLength += 1;
+		cursor = decoded.index + decoded[0].length;
+	}
+	pieces.push(spaced.slice(cursor));
+
+	return { text: pieces.join(""), viewOffsets, textOffsets, textLengths };
+}
+
+interface ViewRedaction {
+	readonly viewStart: number;
+	readonly viewEnd: number;
+	readonly textStart: number;
+	readonly textEnd: number;
+	readonly replacement: string;
+}
+
+/**
+ * The view of the redacted text: decoded escapes inside a redaction are gone
+ * and the ones after it move by the length the marker adds or removes.
+ */
+function redactView(
+	view: MatchView,
+	text: string,
+	redactions: readonly ViewRedaction[],
+): MatchView {
+	const viewOffsets: number[] = [];
+	const textOffsets: number[] = [];
+	const textLengths: number[] = [];
+	let viewShift = 0;
+	let textShift = 0;
+	let redactionIndex = 0;
+	for (let index = 0; index < view.viewOffsets.length; index += 1) {
+		const viewOffset = view.viewOffsets[index] ?? 0;
+		let redaction = redactions[redactionIndex];
+		while (redaction && redaction.viewEnd <= viewOffset) {
+			viewShift +=
+				redaction.replacement.length -
+				(redaction.viewEnd - redaction.viewStart);
+			textShift +=
+				redaction.replacement.length -
+				(redaction.textEnd - redaction.textStart);
+			redactionIndex += 1;
+			redaction = redactions[redactionIndex];
+		}
+		if (redaction && redaction.viewStart <= viewOffset) {
+			continue;
+		}
+		viewOffsets.push(viewOffset + viewShift);
+		textOffsets.push((view.textOffsets[index] ?? 0) + textShift);
+		textLengths.push(view.textLengths[index] ?? 0);
+	}
+	return { text, viewOffsets, textOffsets, textLengths };
+}
+
+function toTextOffset(view: MatchView | null, viewOffset: number): number {
+	if (view === null) {
+		return viewOffset;
+	}
+
+	// The last decoded escape at or before viewOffset.
+	let low = 0;
+	let high = view.viewOffsets.length - 1;
+	let escapeIndex = -1;
+	while (low <= high) {
+		const middle = (low + high) >>> 1;
+		if ((view.viewOffsets[middle] ?? 0) <= viewOffset) {
+			escapeIndex = middle;
+			low = middle + 1;
+		} else {
+			high = middle - 1;
+		}
+	}
+	if (escapeIndex < 0) {
+		return viewOffset;
+	}
+
+	const escapeViewOffset = view.viewOffsets[escapeIndex] ?? 0;
+	const escapeTextOffset = view.textOffsets[escapeIndex] ?? 0;
+	if (escapeViewOffset === viewOffset) {
+		return escapeTextOffset;
+	}
+	return (
+		escapeTextOffset +
+		(view.textLengths[escapeIndex] ?? 0) +
+		(viewOffset - escapeViewOffset - 1)
+	);
 }
 
 function advanceAfterMatch(matcher: RegExp, match: RegExpExecArray): void {

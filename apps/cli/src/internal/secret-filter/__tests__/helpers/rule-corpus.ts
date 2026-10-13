@@ -14,6 +14,10 @@ export interface CanonicalSecretCase {
 
 export const OPENAI_CANARY = `sk-${"CANARY".padEnd(20, "A")}T3BlbkFJ${"CANARY".padEnd(20, "B")}`;
 export const AWS_CANARY = "AKIACANARY234567ABCD";
+export const JWT_CANARY = `eyJ${"CANARY".padEnd(20, "A")}.eyJ${"CANARY".padEnd(30, "B")}.${"CANARY".padEnd(43, "C")}`;
+/** Mixed-case base64, the shape of an AWS secret access key. */
+export const AWS_SECRET_CANARY = "CANARY/".padEnd(40, "Ab1+");
+export const PEM_TAIL_CANARY = `${"CANARY".padEnd(64, "A")}\n-----END PRIVATE KEY-----`;
 
 /**
  * One realistic positive per rule (Stripe twice: secret and restricted keys).
@@ -65,6 +69,11 @@ export const CANONICAL_SECRETS: readonly CanonicalSecretCase[] = [
 		ruleId: "gitlab-pat",
 		secret: `glpat-${"CANARY".padEnd(20, "A")}`,
 		input: `token=glpat-${"CANARY".padEnd(20, "A")}`,
+	},
+	{
+		ruleId: "jwt",
+		secret: JWT_CANARY,
+		input: `ID_TOKEN=${JWT_CANARY}`,
 	},
 	{
 		ruleId: "npm-access-token",
@@ -128,6 +137,42 @@ export const CANONICAL_SECRETS: readonly CanonicalSecretCase[] = [
 ];
 
 /**
+ * One realistic positive per rule that needs context around the secret: a
+ * name, an access key id, a URL authority, a header, or the start of a string
+ * or line. The secret alone is not redacted, so these stay out of the
+ * pairwise canary combinations.
+ */
+export const CONTEXTUAL_SECRETS: readonly CanonicalSecretCase[] = [
+	{
+		ruleId: "aws-secret-access-key-pair",
+		secret: AWS_SECRET_CANARY,
+		// The marker an older filter left for the id: the server must still
+		// catch the secret next to it.
+		input: `[REDACTED:aws-access-key-id],${AWS_SECRET_CANARY}`,
+	},
+	{
+		ruleId: "aws-secret-access-key",
+		secret: AWS_SECRET_CANARY,
+		input: `export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_CANARY}`,
+	},
+	{
+		ruleId: "private-key-fragment",
+		secret: PEM_TAIL_CANARY,
+		input: `tail:\n${PEM_TAIL_CANARY}`,
+	},
+	{
+		ruleId: "connection-string-password",
+		secret: "CANARY-db-pass-1",
+		input: "psql postgres://app:CANARY-db-pass-1@db.example.dev:5432/app",
+	},
+	{
+		ruleId: "authorization-header",
+		secret: "CANARY".padEnd(32, "A"),
+		input: `Authorization: Bearer ${"CANARY".padEnd(32, "A")}`,
+	},
+];
+
+/**
  * Byte-identical inputs the filter must never rewrite. Shared by the core
  * behavior tests, fixpoint checks, and output fingerprint.
  */
@@ -143,6 +188,16 @@ export const PRESERVED_CORPUS: readonly (readonly [string, string])[] = [
 	["lowercase sendgrid prefix", `sg.${"a".repeat(66)}`],
 	["aws example allowlist", "AKIAIOSFODNN7EXAMPLE"],
 	["bracket soup", "arr[0][1][REDACTED][2]"],
+	["masked key", "OPENAI_API_KEY=sk-proj-...abcd"],
+	["unsigned jwt", "eyJhbGciOiJub25lIn0.eyJzdWIiOiIxMjM0In0."],
+	["aws secret variable", "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY"],
+	[
+		"connection string defaults",
+		"postgres://postgres:postgres@localhost:5432/app",
+	],
+	["connection string template", "mysql://app:$DB_PASSWORD@db:3306/app"],
+	["authorization variable", 'curl -H "Authorization: Bearer $TOKEN"'],
+	["pem prose", "-----END PRIVATE KEY----- closes the block"],
 	["prose", "The quick brown fox jumps over the lazy dog."],
 	["empty", ""],
 ];
@@ -267,11 +322,11 @@ export function buildRedactedExpectation(
 }
 
 /**
- * Gitleaks' trailing delimiter group, exactly as it ends seven generated rule
- * sources at runtime. Derived (not hardcoded per rule) so a ruleset regen that
+ * The escape-aware form of Gitleaks' trailing delimiter group, exactly as it
+ * ends four generated rule sources at runtime. Derived (not hardcoded per rule) so a ruleset regen that
  * adds or removes the anchor moves rules in and out of the gap set here.
  */
-export const TRAILING_DELIMITER_GROUP_SOURCE = String.raw`(?:[\x60'"\s;]|\\[nr]|$)`;
+export const TRAILING_DELIMITER_GROUP_SOURCE = String.raw`(?:[\x60'"\s;]|\\|$)`;
 
 export const DELIMITER_ANCHORED_RULE_IDS: readonly string[] =
 	GENERATED_SECRET_RULES.filter((rule) =>
@@ -280,15 +335,11 @@ export const DELIMITER_ANCHORED_RULE_IDS: readonly string[] =
 
 /**
  * Whether the text that follows a secret satisfies the trailing delimiter
- * group: backtick, quote, whitespace, semicolon, a literal \n or \r escape
- * sequence, or end of input.
+ * group: backtick, quote, whitespace, semicolon, a backslash (any JSON
+ * escape), or end of input.
  */
 export function isSupportedTrailingText(afterSecret: string): boolean {
-	return (
-		afterSecret === "" ||
-		/^[\x60'"\s;]/u.test(afterSecret) ||
-		/^\\[nr]/u.test(afterSecret)
-	);
+	return afterSecret === "" || /^[\x60'"\s;\\]/u.test(afterSecret);
 }
 
 export type CorpusOutcome = "redacted" | "delimiter-anchor-gap";
@@ -320,7 +371,8 @@ export type NearMissMutationKind =
 	| "case-flip"
 	| "interior-whitespace"
 	| "body-1-short"
-	| "charset-violation";
+	| "charset-violation"
+	| "placeholder";
 
 export interface NearMissMutation {
 	readonly ruleId: string;
@@ -364,14 +416,15 @@ const TWILIO_BODY = "CA".repeat(16);
  */
 export const NEAR_MISS_MUTATIONS: readonly NearMissMutation[] = [
 	{
+		// The key body is at least 32 characters.
 		ruleId: "anthropic-admin-api-key",
-		kind: "truncated-last-char",
-		value: `sk-ant-admin01-${BODY_93}A`,
+		kind: "body-1-short",
+		value: `sk-ant-admin01-${pad("CANARY", 31, "A")}`,
 	},
 	{
 		ruleId: "anthropic-admin-api-key",
 		kind: "mutated-prefix-char",
-		value: `sk-ant-admin02-${BODY_93}AA`,
+		value: `sk-ant-adm1n01-${BODY_93}AA`,
 	},
 	{
 		ruleId: "anthropic-admin-api-key",
@@ -379,24 +432,26 @@ export const NEAR_MISS_MUTATIONS: readonly NearMissMutation[] = [
 		value: `SK-ant-admin01-${BODY_93}AA`,
 	},
 	{
+		// The space lands before the 32-character minimum; the rest has no prefix.
 		ruleId: "anthropic-admin-api-key",
 		kind: "interior-whitespace",
-		value: `sk-ant-admin01-${BODY_93.slice(0, 40)} ${BODY_93.slice(40)}AA`,
+		value: `sk-ant-admin01-${BODY_93.slice(0, 20)} ${BODY_93.slice(20)}AA`,
 	},
 	{
 		ruleId: "anthropic-admin-api-key",
-		kind: "body-1-short",
-		value: `sk-ant-admin01-${pad("CANARY", 92, "A")}AA`,
+		kind: "charset-violation",
+		value: `sk-ant-admin01-${BODY_93.slice(0, 20)}!${BODY_93.slice(21)}AA`,
 	},
 	{
 		ruleId: "anthropic-api-key",
-		kind: "truncated-last-char",
-		value: `sk-ant-api03-${BODY_93}A`,
+		kind: "body-1-short",
+		value: `sk-ant-api03-${pad("CANARY", 31, "A")}`,
 	},
 	{
+		// "apx" is none of the api/oat/ort/sid key kinds.
 		ruleId: "anthropic-api-key",
 		kind: "mutated-prefix-char",
-		value: `sk-ant-api04-${BODY_93}AA`,
+		value: `sk-ant-apx03-${BODY_93}AA`,
 	},
 	{
 		ruleId: "anthropic-api-key",
@@ -406,12 +461,33 @@ export const NEAR_MISS_MUTATIONS: readonly NearMissMutation[] = [
 	{
 		ruleId: "anthropic-api-key",
 		kind: "interior-whitespace",
-		value: `sk-ant-api03-${BODY_93.slice(0, 40)} ${BODY_93.slice(40)}AA`,
+		value: `sk-ant-api03-${BODY_93.slice(0, 20)} ${BODY_93.slice(20)}AA`,
 	},
 	{
 		ruleId: "anthropic-api-key",
-		kind: "body-1-short",
-		value: `sk-ant-api03-${pad("CANARY", 92, "A")}AA`,
+		kind: "charset-violation",
+		value: `sk-ant-api03-${BODY_93.slice(0, 20)}!${BODY_93.slice(21)}AA`,
+	},
+	{
+		ruleId: "aws-secret-access-key-pair",
+		kind: "truncated-last-char",
+		value: `[REDACTED:aws-access-key-id],${AWS_SECRET_CANARY.slice(0, 39)}`,
+	},
+	{
+		ruleId: "aws-secret-access-key-pair",
+		kind: "mutated-prefix-char",
+		value: `[REDACTED:aws-access-key-ie],${AWS_SECRET_CANARY}`,
+	},
+	{
+		// A hex digest has no upper-case letter, unlike a base64 secret key.
+		ruleId: "aws-secret-access-key-pair",
+		kind: "charset-violation",
+		value: `[REDACTED:aws-access-key-id],${"0123456789abcdef".repeat(3).slice(0, 40)}`,
+	},
+	{
+		ruleId: "aws-secret-access-key-pair",
+		kind: "interior-whitespace",
+		value: `[REDACTED:aws-access-key-id],${AWS_SECRET_CANARY.slice(0, 20)} ${AWS_SECRET_CANARY.slice(20)}`,
 	},
 	{
 		ruleId: "aws-access-key-id",
@@ -439,6 +515,32 @@ export const NEAR_MISS_MUTATIONS: readonly NearMissMutation[] = [
 		ruleId: "aws-access-key-id",
 		kind: "charset-violation",
 		value: "AKIACANARY834567ABCD",
+	},
+	{
+		// The rule is case-insensitive, so it gets no case-flip mutation.
+		ruleId: "aws-secret-access-key",
+		kind: "body-1-short",
+		value: `AWS_SECRET_ACCESS_KEY=${AWS_SECRET_CANARY.slice(0, 15)}`,
+	},
+	{
+		ruleId: "aws-secret-access-key",
+		kind: "mutated-prefix-char",
+		value: `AWS_SECRET_ACCESS_KAY=${AWS_SECRET_CANARY}`,
+	},
+	{
+		ruleId: "aws-secret-access-key",
+		kind: "interior-whitespace",
+		value: `AWS_SECRET_ACCESS_KEY=${AWS_SECRET_CANARY.slice(0, 10)} ${AWS_SECRET_CANARY.slice(10)}`,
+	},
+	{
+		ruleId: "aws-secret-access-key",
+		kind: "charset-violation",
+		value: `AWS_SECRET_ACCESS_KEY=${AWS_SECRET_CANARY.slice(0, 10)}!${AWS_SECRET_CANARY.slice(11)}`,
+	},
+	{
+		ruleId: "aws-secret-access-key",
+		kind: "placeholder",
+		value: "AWS_SECRET_ACCESS_KEY=<your-secret-access-key>",
 	},
 	{
 		ruleId: "google-api-key",
@@ -610,6 +712,32 @@ export const NEAR_MISS_MUTATIONS: readonly NearMissMutation[] = [
 		value: `glpat-${BODY_20.slice(0, 8)}!${BODY_20.slice(9)}`,
 	},
 	{
+		// The signature is at least 16 characters.
+		ruleId: "jwt",
+		kind: "body-1-short",
+		value: `${JWT_CANARY.slice(0, JWT_CANARY.lastIndexOf(".") + 1)}${pad("CANARY", 15, "C")}`,
+	},
+	{
+		ruleId: "jwt",
+		kind: "mutated-prefix-char",
+		value: `eyK${JWT_CANARY.slice(3)}`,
+	},
+	{
+		ruleId: "jwt",
+		kind: "case-flip",
+		value: `EYJ${JWT_CANARY.slice(3)}`,
+	},
+	{
+		ruleId: "jwt",
+		kind: "interior-whitespace",
+		value: `${JWT_CANARY.slice(0, 10)} ${JWT_CANARY.slice(10)}`,
+	},
+	{
+		ruleId: "jwt",
+		kind: "charset-violation",
+		value: `${JWT_CANARY.slice(0, 10)}!${JWT_CANARY.slice(11)}`,
+	},
+	{
 		ruleId: "npm-access-token",
 		kind: "truncated-last-char",
 		value: `npm_${NPM_BODY.slice(0, 35)}`,
@@ -631,9 +759,10 @@ export const NEAR_MISS_MUTATIONS: readonly NearMissMutation[] = [
 		value: `npm_${NPM_BODY.slice(0, 12)}-${NPM_BODY.slice(13)}`,
 	},
 	{
+		// A legacy key is at least 32 characters after sk-.
 		ruleId: "openai-api-key",
 		kind: "truncated-last-char",
-		value: `sk-${BODY_20}T3BlbkFJ${OPENAI_TAIL.slice(0, 19)}`,
+		value: `sk-${pad("CANARY", 31, "A")}`,
 	},
 	{
 		ruleId: "openai-api-key",
@@ -651,17 +780,19 @@ export const NEAR_MISS_MUTATIONS: readonly NearMissMutation[] = [
 		value: `sk-${BODY_20.slice(0, 10)} ${BODY_20.slice(10)}T3BlbkFJ${OPENAI_TAIL}`,
 	},
 	{
-		// The magic T3BlbkFJ infix off by its final letter.
 		ruleId: "openai-api-key",
 		kind: "charset-violation",
-		value: `sk-${BODY_20}T3BlbkFK${OPENAI_TAIL}`,
+		value: `sk-${BODY_20}!T3BlbkFJ${OPENAI_TAIL}`,
 	},
 	{
+		// A project key body is at least 20 characters.
 		ruleId: "openai-api-key",
 		kind: "body-1-short",
-		value: `sk-${BODY_20.slice(0, 19)}T3BlbkFJ${OPENAI_TAIL}`,
+		value: `sk-proj-${pad("CANARY", 19, "A")}`,
 	},
 	{
+		// A block that runs to end of input is redacted as unterminated, so the
+		// mutants below close with a non-body character instead.
 		ruleId: "private-key",
 		kind: "truncated-last-char",
 		value: [
@@ -671,11 +802,13 @@ export const NEAR_MISS_MUTATIONS: readonly NearMissMutation[] = [
 		].join("\n"),
 	},
 	{
+		// A 64-character line before the footer would be redacted as a
+		// private-key-fragment, so the body is one character shorter.
 		ruleId: "private-key",
 		kind: "mutated-prefix-char",
 		value: [
 			"-----BEGIM PRIVATE KEY-----",
-			pad("CANARY", 64, "A"),
+			pad("CANARY", 63, "A"),
 			"-----END PRIVATE KEY-----",
 		].join("\n"),
 	},
@@ -699,6 +832,27 @@ export const NEAR_MISS_MUTATIONS: readonly NearMissMutation[] = [
 			`${pad("CANARY", 64, "A").slice(0, 30)}!${pad("CANARY", 64, "A").slice(31)}`,
 			"-----END PRIVATE KEY-----",
 		].join("\n"),
+	},
+	{
+		// The rule is case-insensitive, so it gets no case-flip mutation.
+		ruleId: "private-key-fragment",
+		kind: "body-1-short",
+		value: `${pad("CANARY", 63, "A")}\n-----END PRIVATE KEY-----`,
+	},
+	{
+		ruleId: "private-key-fragment",
+		kind: "mutated-prefix-char",
+		value: `${pad("CANARY", 64, "A")}\n-----END PRIVATE KEX-----`,
+	},
+	{
+		ruleId: "private-key-fragment",
+		kind: "interior-whitespace",
+		value: `${pad("CANARY", 64, "A").slice(0, 30)} ${pad("CANARY", 64, "A").slice(30)}\n-----END PRIVATE KEY-----`,
+	},
+	{
+		ruleId: "private-key-fragment",
+		kind: "charset-violation",
+		value: `${pad("CANARY", 64, "A").slice(0, 30)}!${pad("CANARY", 64, "A").slice(31)}\n-----END PRIVATE KEY-----`,
 	},
 	{
 		ruleId: "sendgrid-api-token",
@@ -871,6 +1025,53 @@ export const NEAR_MISS_MUTATIONS: readonly NearMissMutation[] = [
 		ruleId: "twilio-api-key",
 		kind: "charset-violation",
 		value: `SKg${TWILIO_BODY.slice(1)}`,
+	},
+	{
+		ruleId: "connection-string-password",
+		kind: "mutated-prefix-char",
+		value: "postgres:/app:CANARY-db-pass-1@db.example.dev/app",
+	},
+	{
+		ruleId: "connection-string-password",
+		kind: "interior-whitespace",
+		value: "postgres://app:CANARY db-pass-1@db.example.dev/app",
+	},
+	{
+		// A port is not a password: the authority ends before any @.
+		ruleId: "connection-string-password",
+		kind: "charset-violation",
+		value: "https://db.example.dev:8443/app/@CANARY",
+	},
+	{
+		ruleId: "connection-string-password",
+		kind: "placeholder",
+		value: "postgres://app:$DB_PASSWORD@db.example.dev/app",
+	},
+	{
+		// A local default password, not a secret.
+		ruleId: "connection-string-password",
+		kind: "placeholder",
+		value: "redis://default:default@localhost:6379",
+	},
+	{
+		ruleId: "authorization-header",
+		kind: "body-1-short",
+		value: `Authorization: Bearer ${pad("CANARY", 15, "A")}`,
+	},
+	{
+		ruleId: "authorization-header",
+		kind: "mutated-prefix-char",
+		value: `Authorisation: Bearer ${pad("CANARY", 32, "A")}`,
+	},
+	{
+		ruleId: "authorization-header",
+		kind: "interior-whitespace",
+		value: `Authorization: Bearer ${pad("CANARY", 10, "A")} ${pad("CANARY", 22, "A")}`,
+	},
+	{
+		ruleId: "authorization-header",
+		kind: "placeholder",
+		value: "Authorization: Bearer $GITHUB_TOKEN",
 	},
 ];
 

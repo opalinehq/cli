@@ -13,6 +13,7 @@ import type { SecretRule } from "../types.js";
 import {
 	AWS_CANARY,
 	CANONICAL_SECRETS,
+	CONTEXTUAL_SECRETS,
 	OPENAI_CANARY,
 	PRESERVED_CORPUS,
 } from "./helpers/rule-corpus.js";
@@ -41,7 +42,7 @@ test("uses capture indices when the full match repeats the secret", () => {
 });
 
 describe("filterKnownSecrets", () => {
-	for (const positiveCase of CANONICAL_SECRETS) {
+	for (const positiveCase of [...CANONICAL_SECRETS, ...CONTEXTUAL_SECRETS]) {
 		test(`redacts ${positiveCase.ruleId}`, () => {
 			const result = filterKnownSecrets(positiveCase.input);
 
@@ -140,7 +141,7 @@ test("fully redacts an overlong span and resumes after the matched secret", () =
 
 test("engine counts the full matched span for every generated rule", () => {
 	const worstCases = new Map(
-		CANONICAL_SECRETS.map((positiveCase) => [
+		[...CANONICAL_SECRETS, ...CONTEXTUAL_SECRETS].map((positiveCase) => [
 			positiveCase.ruleId,
 			positiveCase.input,
 		]),
@@ -175,6 +176,32 @@ test("engine counts the full matched span for every generated rule", () => {
 			expect(result.counts[OVERLONG_REDACTION_RULE_ID]).toBe(1);
 		}
 	}
+});
+
+test("reads a backslash before a rule keyword literally outside JSON", () => {
+	// In a Windows path, \n is a backslash and the n of npm_, not an escaped
+	// line break; in JSON the same bytes are a line break before pm_.
+	const token = `npm_${"CANARY".padEnd(36, "a")}`;
+
+	expect(filterKnownSecrets(`tools\\repo\\${token}`).text).toBe(
+		"tools\\repo\\[REDACTED:npm-access-token]",
+	);
+	expect(filterKnownSecrets(JSON.stringify({ c: `line\n${token}` })).text).toBe(
+		'{"c":"line\\n[REDACTED:npm-access-token]"}',
+	);
+});
+
+test("keeps matching escaped secrets after earlier redactions move them", () => {
+	const anthropic = CANONICAL_SECRETS.find(
+		({ ruleId }) => ruleId === "anthropic-api-key",
+	)?.secret;
+	const jwt = CANONICAL_SECRETS.find(({ ruleId }) => ruleId === "jwt")?.secret;
+	const escapedAws = `\\u0041${AWS_CANARY.slice(1)}`;
+	const input = `{"a":"${anthropic}","b":"${escapedAws}","c":"${jwt}\\/x","d":"${escapedAws}"}`;
+
+	expect(filterKnownSecrets(input).text).toBe(
+		'{"a":"[REDACTED:anthropic-api-key]","b":"[REDACTED:aws-access-key-id]","c":"[REDACTED:jwt]\\/x","d":"[REDACTED:aws-access-key-id]"}',
+	);
 });
 
 describe("filterSessionTextFields", () => {

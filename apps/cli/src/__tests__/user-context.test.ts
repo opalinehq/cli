@@ -1029,8 +1029,9 @@ describe("user-level context roots", () => {
 			expect(text).toContain("[REDACTED:");
 		}
 		for (const blob of bundle.blobs) expect(blob.content).not.toContain(opaque);
+		// The known-secret filter runs first and owns the Authorization header.
 		expect(bundle.manifest.coverage.redactionCounts).toMatchObject({
-			"authorization-value": 1,
+			"authorization-header": 1,
 			"connection-string-password": 2,
 			"credential-assignment": 3,
 			"credential-flag": 1,

@@ -12,7 +12,20 @@ Choose repositories in the CLI, review your selection, and confirm. Automatic up
 
 ## Known-secret filtering
 
-Before upload, the CLI applies deterministic filtering for known secret patterns to both the main transcript and sub-agent transcripts.
+Before upload, the CLI applies deterministic filtering for known secret patterns to both the main transcript and sub-agent transcripts. The Opaline server applies the same filter again before storage.
+
+A matched value is replaced with `[REDACTED:<rule>]`. Filter version 7 covers:
+
+- Anthropic API and admin keys, and Claude OAuth tokens.
+- AWS access key IDs, and AWS secret access keys assigned to a name such as `AWS_SECRET_ACCESS_KEY`, `aws_secret_access_key` or `SecretAccessKey`, or written next to their access key ID.
+- OpenAI project, service-account, admin and legacy keys.
+- GitHub, GitLab, npm, Google API, SendGrid, Slack (tokens and webhooks), Stripe and Twilio keys.
+- JSON Web Tokens.
+- Private keys in PEM format, including the header and footer parts of a key split across several JSON strings.
+- Passwords in connection strings such as `postgres://user:password@host`: only the password is replaced, so the scheme, user and host stay readable. Variables, templates, masks and placeholder or local-default passwords (for example `password` or `postgres`) are kept.
+- `Authorization: Bearer`, `Token` and `Basic` header values.
+
+Matching works inside JSON-escaped transcript text at any nesting depth, including `\uXXXX`-escaped characters.
 
 **Filtering is best-effort and cannot guarantee that every sensitive value is removed.** Custom credentials, split or encoded secrets, unusual formats, screenshots, and other sensitive values may not match.
 

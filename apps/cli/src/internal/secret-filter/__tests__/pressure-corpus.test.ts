@@ -4,6 +4,7 @@ import { filterKnownSecrets, getUtf8ByteLength } from "../index.js";
 import {
 	buildRedactedExpectation,
 	CANONICAL_SECRETS,
+	CONTEXTUAL_SECRETS,
 	type CorpusOutcome,
 	DELIMITER_ANCHORED_RULE_IDS,
 	DELIMITER_CONTEXTS,
@@ -78,13 +79,10 @@ describe("known delimiter-anchor gap", () => {
 	 * Pinned as accepted behaviour; these tests fail loudly — flip them to the
 	 * redacting corpus — when the ruleset fix lands.
 	 */
-	test("the derived anchored-rule set matches the seven documented rules", () => {
+	test("the derived anchored-rule set matches the four documented rules", () => {
 		expect([...DELIMITER_ANCHORED_RULE_IDS].sort()).toEqual([
-			"anthropic-admin-api-key",
-			"anthropic-api-key",
 			"google-api-key",
 			"npm-access-token",
-			"openai-api-key",
 			"sendgrid-api-token",
 			"stripe-access-token",
 		]);
@@ -190,7 +188,8 @@ test("the generated corpus covers every canonical secret in every context", () =
 	expect(generatedCases).toHaveLength(
 		CANONICAL_SECRETS.length * DELIMITER_CONTEXTS.length,
 	);
-	expect(new Set(CANONICAL_SECRETS.map((c) => c.ruleId)).size).toBe(
-		GENERATED_SECRET_RULES.length,
-	);
+	expect(
+		new Set([...CANONICAL_SECRETS, ...CONTEXTUAL_SECRETS].map((c) => c.ruleId))
+			.size,
+	).toBe(GENERATED_SECRET_RULES.length);
 });
