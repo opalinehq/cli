@@ -36,7 +36,7 @@ jobs:
       - name: Verify
         run: |
           cd apps/cli
-          timeout -s KILL 300 bun test src/__tests__/live-session-follower.test.ts > /tmp/out.txt 2>&1; echo "exit=$?"
+          timeout -s KILL 300 bun test src/__tests__/live-session-follower.test.ts > /tmp/out.txt 2>&1 || echo "exit=$?"
           grep -nE '\((pass|fail|skip)\)|error|Error' /tmp/out.txt | tail -80
           tail -30 /tmp/out.txt
 
