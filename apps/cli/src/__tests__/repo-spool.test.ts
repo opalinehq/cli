@@ -1285,6 +1285,239 @@ describe("repository spool retirement", () => {
 		expect(listing.captures.every((c) => c.integrity === "valid")).toBe(true);
 		expect(listing.quota.orphanBlobCount).toBe(0);
 	});
+
+	test("retires the accepted heads of idle worktrees once only heads fill the spool", async () => {
+		const env = createRepositorySpoolEnv(join(tempRoot, "retire-idle-heads"));
+		// One finished worktree per task: each keeps only its accepted head.
+		const idle = [];
+		for (let index = 0; index < 4; index += 1) {
+			const binding = await makeWorktreeBinding(`idle-${index}`);
+			const head = makeHistoricalCandidate(index);
+			await writeRepositoryBundle(head, binding, repositoryRoot, "end", env);
+			await markRepositorySpoolCaptureAccepted(
+				binding,
+				head.captureId,
+				"local-context",
+				env,
+			);
+			idle.push({ binding, head });
+		}
+		const current = await makeWorktreeBinding("current");
+		const full = await listRepositorySpool(current, repositoryRoot, env);
+		const next = makeHistoricalCandidate(9);
+		const plan = await planRepositoryBundle(
+			next,
+			current,
+			repositoryRoot,
+			"start",
+			env,
+		);
+		// Only the newest heads fit next to the new capture.
+		const constrained: RepositorySpoolEnv = {
+			...env,
+			maxStoredBytes: full.quota.usedBytes + plan.storedNewBytes - 1,
+		};
+
+		const result = await writeRepositoryBundle(
+			next,
+			current,
+			repositoryRoot,
+			"start",
+			constrained,
+		);
+		const audit = await listRepositorySpool(current, repositoryRoot, env);
+
+		expect(result.created).toBe(true);
+		expect(result.capture.integrity).toBe("valid");
+		// Least recently captured first, down to the retirement target.
+		const remaining = [];
+		for (const { binding, head } of idle) {
+			const parent = await getAcceptedRepositorySpoolParent(
+				binding,
+				"local-context",
+				env,
+			);
+			const listing = await listRepositorySpool(binding, repositoryRoot, env);
+			if (parent === null) {
+				expect(listing.captures).toHaveLength(0);
+			} else {
+				expect(parent.id).toBe(head.captureId);
+				remaining.push(head.captureId);
+			}
+		}
+		expect(remaining.length).toBeGreaterThan(0);
+		expect(remaining.length).toBeLessThan(idle.length);
+		expect(remaining).toEqual(
+			idle
+				.slice(idle.length - remaining.length)
+				.map(({ head }) => head.captureId),
+		);
+		expect(audit.quota.usedBytes).toBeLessThanOrEqual(
+			constrained.maxStoredBytes * 0.9,
+		);
+		expect(audit.quota.orphanBlobCount).toBe(0);
+		expect(audit.quota.captureCount).toBe(remaining.length + 1);
+		expect(result.quota.usedBytes).toBe(audit.quota.usedBytes);
+		expect(result.quota.blobCount).toBe(audit.quota.blobCount);
+	});
+
+	test("keeps captures awaiting delivery, their parents, and the writing worktree's head", async () => {
+		const env: RepositorySpoolEnv = {
+			...createRepositorySpoolEnv(join(tempRoot, "retire-heads-guarded")),
+			maxCaptures: 5,
+		};
+		const pendingBinding = await makeWorktreeBinding("pending");
+		const pendingParent = makeHistoricalCandidate(0);
+		const pendingChild = {
+			...makeHistoricalCandidate(1),
+			parentCaptureId: pendingParent.captureId,
+		};
+		await writeRepositoryBundle(
+			pendingParent,
+			pendingBinding,
+			repositoryRoot,
+			"start",
+			env,
+		);
+		await markRepositorySpoolCaptureAccepted(
+			pendingBinding,
+			pendingParent.captureId,
+			"local-context",
+			env,
+		);
+		await writeRepositoryBundle(
+			pendingChild,
+			pendingBinding,
+			repositoryRoot,
+			"end",
+			env,
+		);
+		const idleBinding = await makeWorktreeBinding("idle");
+		const idleHead = makeHistoricalCandidate(2);
+		const current = await makeWorktreeBinding("current");
+		const currentHead = makeHistoricalCandidate(3);
+		for (const [binding, head] of [
+			[idleBinding, idleHead],
+			[current, currentHead],
+		] as const) {
+			await writeRepositoryBundle(head, binding, repositoryRoot, "end", env);
+			await markRepositorySpoolCaptureAccepted(
+				binding,
+				head.captureId,
+				"local-context",
+				env,
+			);
+		}
+		const unsentOther = makeHistoricalCandidate(4);
+		await writeRepositoryBundle(
+			unsentOther,
+			idleBinding,
+			repositoryRoot,
+			"checkpoint",
+			env,
+		);
+		expect(
+			(await listRepositorySpool(current, repositoryRoot, env)).quota
+				.captureCount,
+		).toBe(env.maxCaptures);
+
+		const next = {
+			...makeHistoricalCandidate(5),
+			parentCaptureId: currentHead.captureId,
+		};
+		const result = await writeRepositoryBundle(
+			next,
+			current,
+			repositoryRoot,
+			"start",
+			env,
+		);
+
+		expect(result.created).toBe(true);
+		const ids = async (binding: typeof current) =>
+			(await listRepositorySpool(binding, repositoryRoot, env)).captures
+				.map((capture) => capture.captureId)
+				.sort();
+		expect(await ids(pendingBinding)).toEqual(
+			[pendingParent.captureId, pendingChild.captureId].sort(),
+		);
+		expect(await ids(idleBinding)).toEqual([unsentOther.captureId]);
+		expect(await ids(current)).toEqual(
+			[currentHead.captureId, next.captureId].sort(),
+		);
+		expect(
+			await getAcceptedRepositorySpoolParent(
+				pendingBinding,
+				"local-context",
+				env,
+			),
+		).toMatchObject({ id: pendingParent.captureId });
+		expect(
+			await getAcceptedRepositorySpoolParent(current, "local-context", env),
+		).toMatchObject({ id: currentHead.captureId });
+		const audit = await listRepositorySpool(current, repositoryRoot, env);
+		expect(audit.captures.every((c) => c.integrity === "valid")).toBe(true);
+		expect(audit.quota.orphanBlobCount).toBe(0);
+		expect(result.quota.captureCount).toBe(audit.quota.captureCount);
+		expect(result.quota.usedBytes).toBe(audit.quota.usedBytes);
+	});
+
+	test("reclaims blobs a failed write left in a binding with nothing to retire", async () => {
+		const env = createRepositorySpoolEnv(join(tempRoot, "retire-orphans"));
+		const failed = await makeWorktreeBinding("failed");
+		const failingEnv: RepositorySpoolEnv = {
+			...env,
+			commitImmutableFile: async (temporaryPath, finalPath) => {
+				if (finalPath.endsWith(".capture.json")) {
+					throw new Error("simulated hook stop before the capture commit");
+				}
+				await env.commitImmutableFile(temporaryPath, finalPath);
+			},
+		};
+		await expect(
+			writeRepositoryBundle(
+				makeCandidate({
+					captureId: "capture-never-committed",
+					capturedAt: "2026-09-21T00:00:00.000Z",
+					contents: ["blob of a capture that was never committed ".repeat(64)],
+				}),
+				failed,
+				repositoryRoot,
+				"start",
+				failingEnv,
+			),
+		).rejects.toThrow("simulated hook stop");
+		const current = await makeWorktreeBinding("current");
+		const before = await listRepositorySpool(current, repositoryRoot, env);
+		expect(before.quota.orphanBlobCount).toBe(1);
+		const next = makeHistoricalCandidate(0);
+		const plan = await planRepositoryBundle(
+			next,
+			current,
+			repositoryRoot,
+			"start",
+			env,
+		);
+		const constrained: RepositorySpoolEnv = {
+			...env,
+			maxStoredBytes: before.quota.usedBytes + plan.storedNewBytes - 1,
+		};
+
+		const result = await writeRepositoryBundle(
+			next,
+			current,
+			repositoryRoot,
+			"start",
+			constrained,
+		);
+		const audit = await listRepositorySpool(current, repositoryRoot, env);
+
+		expect(result.created).toBe(true);
+		expect(audit.quota.orphanBlobCount).toBe(0);
+		expect(audit.quota.orphanBlobBytes).toBe(0);
+		expect(audit.quota.captureCount).toBe(1);
+		expect(result.quota.usedBytes).toBe(audit.quota.usedBytes);
+	});
 });
 
 function makeHistoricalCandidate(index: number): RepositoryBundleCandidate {
@@ -1386,6 +1619,18 @@ async function makeBinding(
 		accountId,
 		workspaceId: "workspace-a",
 		localIdentity: makeLocalIdentity(root),
+	});
+}
+
+async function makeWorktreeBinding(worktree: string) {
+	return createRepositorySpoolBinding({
+		apiBaseUrl: "https://opaline.so",
+		accountId: "account-a",
+		workspaceId: "workspace-a",
+		localIdentity: {
+			...makeLocalIdentity(repositoryRoot),
+			worktreeId: `local-worktree:${hash(`worktree\u0000${worktree}`)}`,
+		},
 	});
 }
 
