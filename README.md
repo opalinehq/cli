@@ -51,7 +51,7 @@ Already started in the browser? Run the command Opaline gives you, including its
 ## How it works
 
 - **One view across both agents.** The picker groups sessions by repository, including sessions from Git worktrees, and shows local and uploaded counts.
-- **Automatic uploads for your selections.** Opaline sets up Claude Code and Codex hooks for enabled repositories. Sessions already uploaded to the destination are skipped. Running Claude Code sessions also stream new transcript lines within seconds; the full upload when a session ends is unchanged.
+- **Automatic uploads for your selections.** Opaline sets up Claude Code and Codex hooks for enabled repositories. Sessions already uploaded to the destination are skipped. Running Claude Code and Codex sessions also stream new transcript lines within seconds; the regular uploads are unchanged.
 - **Change your mind anytime.** Run the command again to turn repositories ON or OFF. OFF stops future uploads; it does not delete sessions already uploaded. An upload already running may finish.
 
 Type to filter the list. Press Esc to go back from review or leave the picker without saving.
