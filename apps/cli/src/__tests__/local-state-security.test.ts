@@ -10,7 +10,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { normalizeRemoteUrl } from "../lib/git-info.js";
+import { getLegacyRemoteUrl, normalizeRemoteUrl } from "../lib/git-info.js";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 const FAKE_TOKEN = "fake_pat_RUD204";
@@ -81,13 +81,80 @@ describe("git remote sanitization", () => {
 			"ssh://git:fake-password@git.example.com/acme/widget.git",
 			"git.example.com/acme/widget",
 		],
-		[
-			"https://git.example.com:8443/acme/widget.git",
-			"git.example.com/8443/acme/widget",
-		],
 		["git@github.com:acme/widget.git", "github.com/acme/widget"],
 	])("normalizes %s without credentials", (remote, expected) => {
 		expect(normalizeRemoteUrl(remote)).toBe(expected);
+	});
+
+	test.each([
+		"https://git.example.com:8443/acme/widget.git",
+		`https://oauth2:${FAKE_TOKEN}@git.example.com:8443/acme/widget.git`,
+		"ssh://git@git.example.com:2222/acme/widget.git",
+		"git://git.example.com/acme/widget.git",
+		"deploy@git.example.com:acme/widget.git",
+		"git.example.com:acme/widget",
+	])("drops the port and user from %s", (remote) => {
+		expect(normalizeRemoteUrl(remote)).toBe("git.example.com/acme/widget");
+	});
+
+	test("keeps the key older releases saved for remotes with a port", () => {
+		expect(
+			getLegacyRemoteUrl("https://git.example.com:8443/acme/widget.git"),
+		).toBe("git.example.com/8443/acme/widget");
+		expect(
+			getLegacyRemoteUrl("git@github.com:acme/widget.git"),
+		).toBeUndefined();
+	});
+
+	test("resolves a project saved under the pre-port-fix key, then rewrites it", async () => {
+		const fixtureRoot = join(tempRoot, "project-port");
+		const configDir = join(fixtureRoot, "config");
+		const projectDir = join(fixtureRoot, "repo");
+		const projectsPath = join(configDir, "projects.json");
+		await Promise.all([
+			mkdir(configDir, { recursive: true }),
+			mkdir(projectDir, { recursive: true }),
+		]);
+		await writeFile(
+			projectsPath,
+			JSON.stringify({
+				projects: {
+					"git.example.com/8443/acme/widget": { organizationId: "org-legacy" },
+				},
+			}),
+		);
+		await runCommand(["git", "-C", projectDir, "init", "-q"]);
+		await runCommand([
+			"git",
+			"-C",
+			projectDir,
+			"remote",
+			"add",
+			"origin",
+			"https://git.example.com:8443/acme/widget.git",
+		]);
+
+		const legacyResult = await runProjectConfig("get", projectDir, configDir);
+		expect(legacyResult.stdout).toBe("org-legacy");
+
+		expect(
+			(await runProjectConfig("set", projectDir, configDir)).exitCode,
+		).toBe(0);
+		const config = JSON.parse(await readFile(projectsPath, "utf8"));
+		expect(Object.keys(config.projects)).toEqual([
+			"git.example.com/acme/widget",
+		]);
+		await runCommand([
+			"git",
+			"-C",
+			projectDir,
+			"remote",
+			"set-url",
+			"origin",
+			"git@git.example.com:acme/widget.git",
+		]);
+		const getResult = await runProjectConfig("get", projectDir, configDir);
+		expect(getResult.stdout).toBe("org-123");
 	});
 
 	test("persists the sanitized key and resolves it across remote formats", async () => {

@@ -13,7 +13,7 @@ import { isRepositoryAutoUploadAllowed } from "../lib/auto-upload-config.js";
 import { updateHookSettings } from "../lib/auto-upload-hooks.js";
 import { getGitInfo } from "../lib/git-info.js";
 import {
-	getLegacyRepositoryKey,
+	getLegacyRepositoryKeys,
 	resolveUploadRepositoryIdentity,
 } from "../lib/repository-discovery.js";
 import { saveRepositoryChanges } from "../lib/repository-upload.js";
@@ -122,7 +122,10 @@ test("keeps legacy allowlist selections ON and removes the old key when switched
 	const claude = createClaudeCodeAdapter({ homeDir: fixture.root });
 	claude.installHook({ global: true });
 	const gitInfo = await getGitInfo(fixture.repo);
-	const legacyKey = getLegacyRepositoryKey(fixture.repo, gitInfo);
+	const legacyKeys = getLegacyRepositoryKeys(fixture.repo, gitInfo);
+	expect(legacyKeys).toHaveLength(1);
+	const legacyKey = legacyKeys[0];
+	assert(legacyKey);
 	const canonicalKey = resolveUploadRepositoryIdentity(
 		fixture.repo,
 		gitInfo,
@@ -155,6 +158,71 @@ test("keeps legacy allowlist selections ON and removes the old key when switched
 	);
 	expect(
 		isRepositoryAutoUploadAllowed(canonicalKey, "claude_code", [legacyKey]),
+	).toBe(false);
+	expect(
+		await readFile(join(fixture.config, "auto-upload.json"), "utf8"),
+	).not.toContain(`"${legacyKey}"`);
+});
+
+test("keeps settings saved before remotes with a port dropped it, and removes the old key when switched OFF", async () => {
+	const fixture = await createFixture();
+	const repo = join(fixture.root, "self-hosted");
+	await mkdir(repo);
+	for (const command of [
+		["git", "init", "--quiet", repo],
+		[
+			"git",
+			"-C",
+			repo,
+			"remote",
+			"add",
+			"origin",
+			"https://git.example.com:8443/acme/widget.git",
+		],
+	])
+		expect(
+			await Bun.spawn(command, { stdout: "pipe", stderr: "pipe" }).exited,
+		).toBe(0);
+	const claude = createClaudeCodeAdapter({ homeDir: fixture.root });
+	claude.installHook({ global: true });
+	const legacyKey = "remote:git.example.com/8443/acme/widget";
+	const canonicalKey = "remote:git.example.com/acme/widget";
+	const gitInfo = await getGitInfo(repo);
+	expect(resolveUploadRepositoryIdentity(repo, gitInfo).repoKey).toBe(
+		canonicalKey,
+	);
+	const legacyKeys = getLegacyRepositoryKeys(repo, gitInfo);
+	expect(legacyKeys).toEqual([canonicalKey, legacyKey]);
+	await writeFile(
+		join(fixture.config, "auto-upload.json"),
+		JSON.stringify({
+			version: 1,
+			repositories: {
+				[legacyKey]: { label: "acme/widget", sources: ["claude_code"] },
+			},
+		}),
+	);
+	expect(
+		isRepositoryAutoUploadAllowed(canonicalKey, "claude_code", legacyKeys),
+	).toBe(true);
+	const rows = await discoverUploadRepositories(() => {}, {
+		cwd: repo,
+		configDir: fixture.config,
+		adapters: [claude],
+	});
+	expect(rows).toHaveLength(1);
+	const row = rows[0];
+	assert(row);
+	expect(row.key).toBe(canonicalKey);
+	expect(row.enabled).toBe(true);
+	await saveRepositoryChanges(
+		rows,
+		[{ repository: row, enabled: false }],
+		[claude],
+		{ configDir: fixture.config },
+	);
+	expect(
+		isRepositoryAutoUploadAllowed(canonicalKey, "claude_code", legacyKeys),
 	).toBe(false);
 	expect(
 		await readFile(join(fixture.config, "auto-upload.json"), "utf8"),

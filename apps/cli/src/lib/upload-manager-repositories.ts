@@ -14,7 +14,7 @@ import {
 import type { GitInfo } from "./git-info.js";
 import {
 	discoverProjectRepositories,
-	getLegacyRepositoryKey,
+	getLegacyRepositoryKeys,
 	resolveUploadRepositoryIdentity,
 } from "./repository-discovery.js";
 import type { SessionUploadDetail, UploadSpeed } from "./upload-progress.js";
@@ -141,13 +141,15 @@ export async function discoverUploadRepositories(
 
 	function addRepository(path: string, info: GitInfo) {
 		const identity = resolveUploadRepositoryIdentity(path, info);
-		const legacyKey = getLegacyRepositoryKey(path, info);
+		const legacyKeys = getLegacyRepositoryKeys(path, info);
 		const savedKey = savedPaths.get(path);
 		const setting =
 			config?.repositories[identity.repoKey] ??
-			config?.repositories[legacyKey] ??
+			legacyKeys
+				.map((key) => config?.repositories[key])
+				.find((entry) => entry !== undefined) ??
 			(savedKey ? config?.repositories[savedKey] : undefined);
-		consumedKeys.add(legacyKey);
+		for (const key of legacyKeys) consumedKeys.add(key);
 		if (savedKey) consumedKeys.add(savedKey);
 		let repository = repositories.get(identity.repoKey);
 		if (!repository) {
@@ -167,7 +169,7 @@ export async function discoverUploadRepositories(
 		}
 		repository.paths.push(path);
 		repository.current ||= path === cwd;
-		for (const key of [savedKey, legacyKey])
+		for (const key of [savedKey, ...legacyKeys])
 			if (
 				key &&
 				key !== repository.key &&

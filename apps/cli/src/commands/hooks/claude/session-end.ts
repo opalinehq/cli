@@ -24,7 +24,7 @@ import {
 } from "../../../lib/hook-upload-failure.js";
 import { getProjectOrgId } from "../../../lib/project-config.js";
 import {
-	getLegacyRepositoryKey,
+	getLegacyRepositoryKeys,
 	resolveUploadRepositoryIdentity,
 } from "../../../lib/repository-discovery.js";
 import { captureAndUploadSessionEvidence } from "../../../lib/session-evidence.js";
@@ -105,7 +105,7 @@ async function runSessionEnd(): Promise<undefined | Error> {
 			!isRepositoryAutoUploadAllowed(
 				repository.repoKey,
 				claudeCodeAdapter.source,
-				[getLegacyRepositoryKey(input.cwd, gitInfo)],
+				getLegacyRepositoryKeys(input.cwd, gitInfo),
 			)
 		) {
 			logger.info(
@@ -152,7 +152,7 @@ async function runSessionEnd(): Promise<undefined | Error> {
 			isRepositoryAutoUploadDisabled(
 				inferred.repository.repoKey,
 				claudeCodeAdapter.source,
-				[inferred.legacyKey],
+				inferred.legacyKeys,
 			)
 		) {
 			logger.info(

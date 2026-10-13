@@ -12,7 +12,7 @@ import { loadCredentials } from "../../../lib/credentials.js";
 import { getGitInfo } from "../../../lib/git-info.js";
 import { getProjectOrgId } from "../../../lib/project-config.js";
 import {
-	getLegacyRepositoryKey,
+	getLegacyRepositoryKeys,
 	resolveUploadRepositoryIdentity,
 } from "../../../lib/repository-discovery.js";
 import { readRepositoryEvidencePauseUntil } from "../../../lib/repository-evidence-pause.js";
@@ -67,7 +67,7 @@ async function runSessionStart(): Promise<undefined> {
 			!isRepositoryAutoUploadAllowed(
 				repository.repoKey,
 				claudeCodeAdapter.source,
-				[getLegacyRepositoryKey(input.cwd, gitInfo)],
+				getLegacyRepositoryKeys(input.cwd, gitInfo),
 			)
 		) {
 			return;

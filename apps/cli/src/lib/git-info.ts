@@ -6,6 +6,8 @@ import { exec } from "./exec.js";
 export interface GitInfo {
 	repositoryRoot?: string;
 	gitRemote?: string;
+	/** The key older releases saved for this remote, when it differs from `gitRemote`. */
+	legacyGitRemote?: string;
 	packageName?: string;
 	packageType?: string;
 	branch?: string;
@@ -16,11 +18,23 @@ export interface GitInfo {
  * Normalize a git remote URL to a canonical form: "github.com/owner/repo"
  */
 export function normalizeRemoteUrl(url: string): string {
-	const sanitizedUrl = url.replace(/^([a-z][a-z\d+.-]*:\/\/)[^/]+@/i, "$1");
-	return sanitizedUrl
+	// URL remotes carry `[user@]host[:port]`: keep only the host. Without a scheme
+	// the remote is scp-style `[user@]host:path`, where the colon separates the path.
+	const urlRemote = /^[a-z][a-z\d+.-]*:\/\/([^/]*)(.*)$/i.exec(url);
+	const remote = urlRemote
+		? `${urlRemote[1]?.replace(/^.*@/, "").replace(/:\d*$/, "")}${urlRemote[2]}`
+		: url.replace(/^[^/@]+@/, "").replace(/:/, "/");
+	return remote.replace(/\.git$/, "");
+}
+
+/** The key older releases saved for `url`, when it differs from the canonical one. */
+export function getLegacyRemoteUrl(url: string): string | undefined {
+	const legacy = url
+		.replace(/^([a-z][a-z\d+.-]*:\/\/)[^/]+@/i, "$1")
 		.replace(/^(https?:\/\/|git@|ssh:\/\/)/, "")
 		.replace(/:/, "/")
 		.replace(/\.git$/, "");
+	return legacy === normalizeRemoteUrl(url) ? undefined : legacy;
 }
 
 /**
@@ -35,11 +49,10 @@ export async function getGitInfo(cwd: string): Promise<GitInfo> {
 		getPackageInfo(repositoryRoot ?? cwd, repositoryRoot),
 	]);
 
-	const gitRemote = remoteUrl ? normalizeRemoteUrl(remoteUrl) : undefined;
-
 	return {
 		repositoryRoot,
-		gitRemote,
+		gitRemote: remoteUrl ? normalizeRemoteUrl(remoteUrl) : undefined,
+		legacyGitRemote: remoteUrl ? getLegacyRemoteUrl(remoteUrl) : undefined,
 		packageName: packageInfo?.name,
 		packageType: packageInfo?.type,
 		branch: branch ?? undefined,
@@ -57,6 +70,7 @@ export async function getRepositoryInfo(cwd: string): Promise<GitInfo> {
 	return {
 		repositoryRoot,
 		gitRemote: remoteUrl ? normalizeRemoteUrl(remoteUrl) : undefined,
+		legacyGitRemote: remoteUrl ? getLegacyRemoteUrl(remoteUrl) : undefined,
 		packageName: packageInfo?.name,
 		packageType: packageInfo?.type,
 	};

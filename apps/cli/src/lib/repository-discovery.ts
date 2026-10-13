@@ -5,6 +5,7 @@ import { type RepoIdentity, resolveRepoIdentity } from "../contracts/index.js";
 import { exec } from "./exec.js";
 import {
 	type GitInfo,
+	getLegacyRemoteUrl,
 	getRepositoryInfo,
 	normalizeRemoteUrl,
 } from "./git-info.js";
@@ -31,15 +32,22 @@ export function resolveUploadRepositoryIdentity(
 	});
 }
 
-export function getLegacyRepositoryKey(
+export function getLegacyRepositoryKeys(
 	projectPath: string,
 	gitInfo: GitInfo,
-): string {
-	return resolveRepoIdentity({
-		projectPath,
-		gitRemote: gitInfo.gitRemote ?? null,
-		packageName: gitInfo.packageName ?? null,
-	}).repoKey;
+): string[] {
+	const remotes = gitInfo.legacyGitRemote
+		? [gitInfo.gitRemote ?? null, gitInfo.legacyGitRemote]
+		: [gitInfo.gitRemote ?? null];
+	const keys = remotes.map(
+		(gitRemote) =>
+			resolveRepoIdentity({
+				projectPath,
+				gitRemote,
+				packageName: gitInfo.packageName ?? null,
+			}).repoKey,
+	);
+	return [...new Set(keys)];
 }
 
 export async function discoverProjectRepositories(
@@ -58,8 +66,10 @@ export async function discoverProjectRepositories(
 			const info = await getRepositoryInfo(path);
 			options.signal?.throwIfAborted();
 			const recordedRemote = recordedRemotes.get(path);
-			if (!info.gitRemote && !info.repositoryRoot && recordedRemote)
+			if (!info.gitRemote && !info.repositoryRoot && recordedRemote) {
 				info.gitRemote = normalizeRemoteUrl(recordedRemote);
+				info.legacyGitRemote = getLegacyRemoteUrl(recordedRemote);
+			}
 			if (info.repositoryRoot) options.onRepository?.(path, info);
 			return [path, info] as const;
 		},
