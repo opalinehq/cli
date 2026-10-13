@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.3](https://github.com/opalinehq/cli/compare/opaline-cli@0.12.2...opaline-cli@0.12.3) (2026-10-13)
+
+
+### Bug Fixes
+
+* **cli:** retire idle worktrees' accepted heads when the repository spool fills ([#507](https://github.com/opalinehq/cli/issues/507)) ([51659fe](https://github.com/opalinehq/cli/commit/51659fe1a171e1a83776e40270e87cbf072716b5))
+
 ## [0.12.2](https://github.com/opalinehq/cli/compare/opaline-cli@0.12.1...opaline-cli@0.12.2) (2026-10-13)
 
 
