@@ -37,10 +37,7 @@ jobs:
         timeout-minutes: 8
         working-directory: apps/cli
         run: |
-          for file in src/__tests__/live-session-lines.test.ts src/__tests__/live-session-follower.test.ts src/__tests__/live-session-hook.test.ts; do
-            echo "=== ${file}"
-            timeout 240 bun test "${file}" 2>&1 || echo "=== exit $? for ${file}"
-          done
+          timeout 240 script -qec "bun test src/__tests__/live-session-follower.test.ts" /dev/null || echo "=== exit $?"
 
       - name: Verify
         run: bun run verify
