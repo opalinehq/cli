@@ -305,6 +305,8 @@ export async function runCli(
 			USERPROFILE: fixture.home,
 			RUDEL_CONFIG_DIR: join(fixture.home, ".rudel"),
 			POSTHOG_ENABLED: "false",
+			// Hook tests opt in to the detached live session follower.
+			OPALINE_LIVE_SESSIONS: "0",
 			...options.env,
 		},
 		stdin: "pipe",

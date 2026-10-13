@@ -134,7 +134,11 @@ async function renewLease(
 	await utimes(lockPath, now, now);
 }
 
-function isProcessAlive(processId: number): boolean {
+/**
+ * Whether a process with this id exists. Only ESRCH means gone: EPERM is a
+ * live process owned by someone else.
+ */
+export function isProcessAlive(processId: number): boolean {
 	try {
 		process.kill(processId, 0);
 		return true;

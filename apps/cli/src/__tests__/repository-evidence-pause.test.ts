@@ -175,7 +175,18 @@ test.each(HOOK_CASES)(
 					},
 				);
 				expect(start.exitCode).toBe(0);
-				expect(await readFile(calls, "utf8")).toBe(commands);
+				// SessionStart still resolves the repository's allowlist entry and
+				// workspace (live session updates do not follow the evidence
+				// pause), but runs no repository capture commands.
+				const startCommands = (await readFile(calls, "utf8")).slice(
+					commands.length,
+				);
+				expect(startCommands).not.toMatch(/\b(diff|ls-files|status)\b/u);
+				expect(
+					stub.requests.some((request) =>
+						request.pathname.includes("repositoryEvidence"),
+					),
+				).toBe(false);
 			}
 		} finally {
 			stub.server.stop(true);

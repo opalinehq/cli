@@ -4,7 +4,9 @@ export {
 	decodeProjectPath,
 	discoverClaudeSubagentFiles,
 	extractAgentIds,
+	isContainedPath,
 	readSubagentFiles,
+	SUBAGENT_FILENAME_PATTERN,
 } from "./adapters/claude-code/index.js";
 export {
 	codexAdapter,
