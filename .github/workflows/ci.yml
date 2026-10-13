@@ -36,10 +36,12 @@ jobs:
       - name: Verify
         run: |
           cd apps/cli
-                    for F in src/__tests__/dbg-nofifo.test.ts src/__tests__/dbg-noswap.test.ts src/__tests__/dbg-nocrafted.test.ts; do t="FIFOs, swapped symlinks|already exited at registration";
-            s=$(date +%s); timeout -s KILL 90 bun test "$F" -t "$t" > /tmp/o.txt 2>&1 || echo "KILLED_OR_FAILED"; echo "CASE [$F] secs=$(( $(date +%s) - s ))"; grep -E '\((pass|fail|skip)\)|^error|Error' /tmp/o.txt | head -10; tail -5 /tmp/o.txt
-          done
-          ls -la /proc/self/fd | wc -l
+          sudo apt-get install -y strace >/dev/null 2>&1 || true
+          t="FIFOs, swapped symlinks|already exited at registration"
+          timeout -s KILL 60 strace -f -tt -e trace=openat,open,read,epoll_wait,epoll_ctl,futex,unlink,unlinkat,close -o /tmp/st.txt bun test src/__tests__/live-session-follower.test.ts -t "$t" > /tmp/o.txt 2>&1 || echo KILLED
+          tail -5 /tmp/o.txt
+          echo "=== fifo-related"; grep -n 'agent-fifo' /tmp/st.txt | tail -20
+          echo "=== last lines per pid"; for p in $(awk '{print $1}' /tmp/st.txt | sort | uniq -c | sort -rn | head -8 | awk '{print $2}'); do echo "--- pid $p"; grep "^$p " /tmp/st.txt | tail -4; done
 
   integration:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
