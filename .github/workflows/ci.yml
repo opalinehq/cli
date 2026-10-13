@@ -36,9 +36,11 @@ jobs:
       - name: Verify
         run: |
           cd apps/cli
-          timeout -s KILL 300 bun test src/__tests__/live-session-follower.test.ts > /tmp/out.txt 2>&1 || echo "exit=$?"
-          grep -nE '\((pass|fail|skip)\)|error|Error' /tmp/out.txt | tail -80
-          tail -30 /tmp/out.txt
+          F=src/__tests__/live-session-follower.test.ts
+          for t in "FIFOs, swapped symlinks" "already exited at registration" "FIFOs, swapped symlinks|already exited at registration"; do
+            s=$(date +%s); timeout -s KILL 90 bun test "$F" -t "$t" > /tmp/o.txt 2>&1 || echo "KILLED_OR_FAILED"; echo "CASE [$t] secs=$(( $(date +%s) - s ))"; grep -E '\((pass|fail|skip)\)|^error|Error' /tmp/o.txt | head -10; tail -5 /tmp/o.txt
+          done
+          ls -la /proc/self/fd | wc -l
 
   integration:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
