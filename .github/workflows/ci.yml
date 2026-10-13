@@ -33,12 +33,6 @@ jobs:
       - name: Setup Bun
         uses: ./.github/actions/setup
 
-      - name: Diagnose live session tests (temporary)
-        timeout-minutes: 8
-        working-directory: apps/cli
-        run: |
-          timeout 240 script -qec "bun test src/__tests__/live-session-follower.test.ts" /dev/null || echo "=== exit $?"
-
       - name: Verify
         run: bun run verify
 

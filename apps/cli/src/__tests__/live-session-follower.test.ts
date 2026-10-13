@@ -8,6 +8,7 @@ import {
 	readFile,
 	rm,
 	symlink,
+	unlink,
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -1088,7 +1089,10 @@ test.skipIf(process.platform === "win32")(
 		const id = "guarded";
 		await writeFile(transcriptPath(fixture, id), jsonl(record(0)));
 		const subagents = await subagentDirectory(fixture, id);
-		Bun.spawnSync(["mkfifo", join(subagents, "agent-fifo.jsonl")]);
+		const fifo = join(subagents, "agent-fifo.jsonl");
+		Bun.spawnSync(["mkfifo", fifo]);
+		// Removed on its own first: a recursive removal may open it and block.
+		cleanups.push(() => unlink(fifo).catch(() => undefined));
 		const swapped = join(subagents, "agent-swap.jsonl");
 		await writeFile(swapped, jsonl(record(1)));
 		const outside = join(fixture.home, "outside.jsonl");
