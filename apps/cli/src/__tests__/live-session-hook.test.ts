@@ -347,3 +347,22 @@ test("inside a Codex sandbox, hooks register but do not start a follower", async
 	expect(await followerPid(configDir)).toBeUndefined();
 	expect(stub.paths.filter((path) => path.includes("liveSession"))).toEqual([]);
 }, 30_000);
+
+test("SIGTERM ends the detached follower promptly, keeping registrations", async () => {
+	const { configDir, fixture, stub, transcriptPath } =
+		await setup("claude_code");
+	const agent = startAgent();
+	await sessionStart(fixture, fixture.sessionId, transcriptPath, agent.pid);
+	await waitFor(async () => (await followerPid(configDir)) !== undefined);
+	await waitFor(() => stub.lines(fixture.sessionId).length === 1);
+	const pid = (await followerPid(configDir)) as number;
+	process.kill(pid, "SIGTERM");
+	await waitFor(() => !isProcessAlive(pid), 10_000);
+	const log = await readFile(
+		join(configDir, "logs", "hook-upload.log"),
+		"utf8",
+	);
+	expect(log).toContain("stopped: 'signal-sigterm'");
+	expect(await listLiveSessionRegistrations(configDir)).toHaveLength(1);
+	expect(stub.session(fixture.sessionId).ended).toBe(false);
+}, 60_000);

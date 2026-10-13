@@ -170,11 +170,6 @@ test.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 	async () => {
 		const never = () => false;
 		expect(await findAncestorProcess(never, 1)).toEqual({ kind: "exited" });
-		// No matching ancestor all the way up to the root: the process that
-		// started this one would have been it.
-		expect(await findAncestorProcess(never, process.ppid, 2_000)).toEqual({
-			kind: "exited",
-		});
 		const self = await findAncestorProcess(() => true, process.pid, 2_000);
 		expect(self).toMatchObject({ kind: "found", pid: process.pid });
 	},

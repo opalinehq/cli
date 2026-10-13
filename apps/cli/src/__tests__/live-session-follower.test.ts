@@ -1151,32 +1151,6 @@ test("a lease left as a regular file does not keep the follower from starting", 
 	expect((await running).reason).toBe("idle");
 }, 30_000);
 
-test("SIGTERM flushes pending lines, keeps registrations, and exits", async () => {
-	const stub = startStub();
-	const fixture = await createFixture(stub);
-	const agent = startAgent();
-	await writeFile(transcriptPath(fixture, "signal"), jsonl(record(0)));
-	await register(fixture, "signal", agent.pid);
-	const running = runLiveSessionFollower({
-		configDir: fixture.configDir,
-		handleSignals: true,
-		timing: { ...FAST_TIMING, debounceMs: 60_000 },
-		transcriptRoots: {
-			claude_code: [join(fixture.home, ".claude", "projects")],
-			codex: [],
-		},
-	});
-	await waitFor(() => stub.paths.includes("/rpc/liveSession/state"));
-	await Bun.sleep(300);
-	expect(stub.lines("signal")).toEqual([]);
-	process.emit("SIGTERM", "SIGTERM");
-	const result = await running;
-	expect(result.reason).toBe("signal-sigterm");
-	expect(stub.lines("signal")).toEqual([record(0)]);
-	expect(await listLiveSessionRegistrations(fixture.configDir)).toHaveLength(1);
-	expect(process.listenerCount("SIGTERM")).toBe(0);
-}, 30_000);
-
 test("requests are split by their JSON-escaped size", async () => {
 	const stub = startStub();
 	const fixture = await createFixture(stub);
