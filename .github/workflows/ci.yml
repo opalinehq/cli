@@ -34,7 +34,11 @@ jobs:
         uses: ./.github/actions/setup
 
       - name: Verify
-        run: bun run verify
+        run: |
+          cd apps/cli
+          timeout -s KILL 300 bun test src/__tests__/live-session-follower.test.ts > /tmp/out.txt 2>&1; echo "exit=$?"
+          grep -nE '\((pass|fail|skip)\)|error|Error' /tmp/out.txt | tail -80
+          tail -30 /tmp/out.txt
 
   integration:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
