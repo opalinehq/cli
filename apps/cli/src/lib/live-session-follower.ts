@@ -257,6 +257,8 @@ interface Ending {
 	readonly reason: string;
 	/** Monotonic time from which the final read may start. */
 	readonly readAt: number;
+	/** Set once a read ran after `readAt`, so a final partial line was seen. */
+	finalRead?: boolean;
 	readonly deadline: number;
 }
 
@@ -633,7 +635,11 @@ class LiveSessionFollower {
 		await this.syncRegistrations().catch(() => false);
 		for (const session of this.sessions.values())
 			if (session.ending)
-				session.ending = { ...session.ending, readAt: performance.now() };
+				session.ending = {
+					...session.ending,
+					finalRead: false,
+					readAt: performance.now(),
+				};
 		while (performance.now() < deadline) {
 			const backlog = await this.readAll();
 			this.startSends(performance.now(), true, true);
@@ -1599,7 +1605,9 @@ class LiveSessionFollower {
 				session.ending !== undefined &&
 				performance.now() >= session.ending.readAt;
 			try {
-				if (await this.readSession(session, final)) {
+				const stopped = await this.readSession(session, final);
+				if (final && session.ending) session.ending.finalRead = true;
+				if (stopped) {
 					backlog = true;
 					break;
 				}
@@ -2093,6 +2101,7 @@ function isReadyToFinish(session: Session): boolean {
 	return (
 		session.ending !== undefined &&
 		performance.now() >= session.ending.readAt &&
+		session.ending.finalRead === true &&
 		session.serverStreams !== undefined &&
 		session.discovered &&
 		[...session.streams.values()].every(
