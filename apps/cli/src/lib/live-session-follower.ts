@@ -1229,6 +1229,10 @@ class LiveSessionFollower {
 		session.watched.add(directory);
 		if (this.watchers.has(directory)) return;
 		if (this.watchers.size >= MAX_WATCHED_DIRECTORIES) return;
+		// Bun's directory watcher opens every entry on Linux, and opening a FIFO
+		// without a writer blocks that thread for good. Node uses inotify on the
+		// directory alone; under Bun the 1 s tick is the only wake-up.
+		if (process.versions.bun) return;
 		try {
 			const watcher = watch(directory, { persistent: false }, () =>
 				this.wake("file"),
