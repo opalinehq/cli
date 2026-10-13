@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.2](https://github.com/opalinehq/cli/compare/opaline-cli@0.12.1...opaline-cli@0.12.2) (2026-10-13)
+
+
+### Bug Fixes
+
+* **cli:** drop the port from normalized git remotes ([#504](https://github.com/opalinehq/cli/issues/504)) ([4e226a6](https://github.com/opalinehq/cli/commit/4e226a6d7b55e4c4cd68fe553cfd9bd4d3e9b706)), closes [#465](https://github.com/opalinehq/cli/issues/465)
+
 ## [0.12.1](https://github.com/opalinehq/cli/compare/opaline-cli@0.12.0...opaline-cli@0.12.1) (2026-10-11)
 
 

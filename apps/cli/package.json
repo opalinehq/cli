@@ -1,6 +1,6 @@
 {
 	"name": "@opalinehq/cli",
-	"version": "0.12.1",
+	"version": "0.12.2",
 	"type": "module",
 	"description": "Opaline CLI for Claude Code and Codex session analytics",
 	"license": "MIT",
