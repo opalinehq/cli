@@ -1,3 +1,4 @@
+import { stat } from "node:fs/promises";
 import { getLogger } from "@logtape/logtape";
 import { buildCommand } from "@stricli/core";
 import { ensureClaudeHooksCurrent } from "../../../internal/agent-adapters/adapters/claude-code/settings.js";
@@ -123,6 +124,15 @@ async function runSessionEnd(): Promise<undefined | Error> {
 			process.stderr.write(
 				`Opaline hook upload skipped for session ${input.session_id}: not authenticated; run \`opaline login\`.\n`,
 			);
+			return;
+		}
+
+		// Claude Code writes no transcript for a session that never got a
+		// message: nothing to upload.
+		if (!(await pathExists(input.transcript_path))) {
+			logger.debug("Skipping session {sessionId}: no transcript was written", {
+				sessionId: input.session_id,
+			});
 			return;
 		}
 
@@ -255,3 +265,16 @@ export const sessionEndCommand = buildCommand({
 		brief: "Handle Claude Code SessionEnd hook",
 	},
 });
+
+async function pathExists(path: string): Promise<boolean> {
+	try {
+		await stat(path);
+		return true;
+	} catch (error) {
+		return !(
+			error instanceof Error &&
+			"code" in error &&
+			error.code === "ENOENT"
+		);
+	}
+}

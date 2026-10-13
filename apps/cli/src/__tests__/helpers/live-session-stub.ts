@@ -59,7 +59,21 @@ export interface LiveSessionStubOptions {
 		readonly pathname: string;
 		readonly index: number;
 		readonly body: unknown;
-	}) => Response | "commit-then-fail" | undefined;
+		readonly headers: Headers;
+	}) =>
+		| Response
+		| Promise<Response | undefined>
+		| "commit-then-fail"
+		| undefined;
+	/** Rewrites the committed state an append answers with (a lying server). */
+	readonly transformAppendResult?: (
+		streams: {
+			agentId: string | null;
+			committedLines: number;
+			lastLineSha256: string | null;
+			status: string;
+		}[],
+	) => unknown[];
 }
 
 export function sha256(text: string): string {
@@ -105,7 +119,12 @@ export function startLiveSessionStub(
 			paths.push(pathname);
 			const text = await request.text();
 			const body: unknown = text ? JSON.parse(text).json : undefined;
-			const intercepted = options.intercept?.({ body, index, pathname });
+			const intercepted = await options.intercept?.({
+				body,
+				headers: request.headers,
+				index,
+				pathname,
+			});
 			if (intercepted instanceof Response) return intercepted;
 			if (pathname === "/rpc/cli/authStatus")
 				return Response.json({
@@ -146,7 +165,13 @@ export function startLiveSessionStub(
 				if (result instanceof Response) return result;
 				if (intercepted === "commit-then-fail")
 					return new Response("bad gateway", { status: 502 });
-				return Response.json({ json: { streams: result } });
+				return Response.json({
+					json: {
+						streams: options.transformAppendResult
+							? options.transformAppendResult(result)
+							: result,
+					},
+				});
 			}
 			return new Response("not found", { status: 404 });
 		},
@@ -177,6 +202,11 @@ function applyAppend(
 	const seen = new Set<string>();
 	let totalBytes = 0;
 	if (input.streams.length > 64) return orpcError(400, "BAD_REQUEST");
+	if (
+		input.streams.reduce((total, stream) => total + stream.lines.length, 0) >
+		20_000
+	)
+		return orpcError(400, "BAD_REQUEST");
 	for (const stream of input.streams) {
 		const key = stream.agentId ?? "";
 		if (seen.has(key)) return orpcError(400, "BAD_REQUEST");

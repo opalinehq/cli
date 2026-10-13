@@ -5,7 +5,9 @@ import {
 	mkdir,
 	mkdtemp,
 	readdir,
+	readFile,
 	rm,
+	symlink,
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -15,7 +17,10 @@ import {
 	type LiveSessionFollowerTiming,
 	runLiveSessionFollower,
 } from "../lib/live-session-follower.js";
-import { getLiveSessionFollowerLeasePath } from "../lib/live-session-launch.js";
+import {
+	getLiveSessionFollowerLeasePath,
+	writeFollowerMarker,
+} from "../lib/live-session-launch.js";
 import {
 	hashLiveSessionLine,
 	processLiveSessionLine,
@@ -43,7 +48,11 @@ const FAST_TIMING: Partial<LiveSessionFollowerTiming> = {
 	identityCheckMs: 100,
 	idleExitMs: 300,
 	leaseWaitMs: 300,
+	authBackoffInitialMs: 300,
+	capabilityCheckMs: 200,
 	rateLimitBackoffMs: 600,
+	requestTimeoutMs: 3_000,
+	resetBackoffInitialMs: 100,
 	settingsCheckMs: 200,
 	tickMs: 50,
 };
@@ -140,7 +149,26 @@ function follow(
 	return runLiveSessionFollower({
 		configDir: fixture.configDir,
 		timing: { ...FAST_TIMING, ...timing },
+		transcriptRoots: {
+			claude_code: [join(fixture.home, ".claude", "projects")],
+			codex: [join(fixture.home, ".codex", "sessions")],
+		},
 	});
+}
+
+/** A Codex rollout path in today's sessions directory. */
+async function codexPath(fixture: Fixture, threadId: string): Promise<string> {
+	const now = new Date();
+	const directory = join(
+		fixture.home,
+		".codex",
+		"sessions",
+		String(now.getFullYear()),
+		String(now.getMonth() + 1).padStart(2, "0"),
+		String(now.getDate()).padStart(2, "0"),
+	);
+	await mkdir(directory, { recursive: true });
+	return join(directory, `rollout-2026-10-13T10-00-00-${threadId}.jsonl`);
 }
 
 function record(index: number, text = `message ${index}`): string {
@@ -418,10 +446,11 @@ test("splits backlogs into requests within the byte, line and stream limits", as
 		jsonl(...Array.from({ length: 8 }, (_, index) => big(index))),
 	);
 	const subagents = await subagentDirectory(fixture, id);
-	await writeFile(
-		join(subagents, "agent-many.jsonl"),
-		jsonl(...Array.from({ length: 10_050 }, (_, index) => `{"i":${index}}`)),
-	);
+	for (const name of ["many", "many2", "many3"])
+		await writeFile(
+			join(subagents, `agent-${name}.jsonl`),
+			jsonl(...Array.from({ length: 10_050 }, (_, index) => `{"i":${index}}`)),
+		);
 	await Promise.all(
 		Array.from({ length: 70 }, (_, index) =>
 			writeFile(
@@ -436,7 +465,9 @@ test("splits backlogs into requests within the byte, line and stream limits", as
 		() =>
 			stub.lines(id).length === 8 &&
 			stub.lines(id, "many").length === 10_050 &&
-			stub.session(id).streams.size === 72 &&
+			stub.lines(id, "many2").length === 10_050 &&
+			stub.lines(id, "many3").length === 10_050 &&
+			stub.session(id).streams.size === 74 &&
 			[...stub.session(id).streams.values()].every(
 				(stream) => stream.lines.length > 0,
 			),
@@ -448,6 +479,9 @@ test("splits backlogs into requests within the byte, line and stream limits", as
 			.reduce((total, line) => total + Buffer.byteLength(line), 0);
 		expect(bytes).toBeLessThanOrEqual(1_572_864);
 		expect(append.streams.length).toBeLessThanOrEqual(64);
+		expect(
+			append.streams.reduce((total, stream) => total + stream.lines.length, 0),
+		).toBeLessThanOrEqual(20_000);
 		for (const stream of append.streams)
 			expect(stream.lines.length).toBeLessThanOrEqual(10_000);
 	}
@@ -520,7 +554,8 @@ test.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 		);
 		expect(identity).toBeDefined();
 		await writeFile(transcriptPath(fixture, "real"), jsonl(record(0)));
-		await writeFile(transcriptPath(fixture, "reused"), jsonl(record(1)));
+		const reusedPath = await codexPath(fixture, "reused");
+		await writeFile(reusedPath, jsonl(record(1)));
 		await register(fixture, "real", agent.pid, {
 			agentStartIdentity: identity ?? null,
 		});
@@ -528,7 +563,7 @@ test.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 		await register(fixture, "reused", agent.pid, {
 			agentStartIdentity: `${process.platform}:another start`,
 			source: "codex",
-			transcriptPath: transcriptPath(fixture, "reused"),
+			transcriptPath: reusedPath,
 		});
 		const running = follow(fixture);
 		await waitFor(() => stub.session("reused", "codex").ended);
@@ -585,17 +620,32 @@ test("waits for the transcript to appear, and gives up when it never does", asyn
 	await running;
 }, 30_000);
 
-test("forgets registrations whose agent is long gone without syncing them", async () => {
+test("a registration left behind by a dead agent is flushed and ended", async () => {
 	const stub = startStub();
 	const fixture = await createFixture(stub);
 	const gone = Bun.spawn(["sleep", "0"]);
 	await gone.exited;
-	await writeFile(transcriptPath(fixture, "stale"), jsonl(record(0)));
+	await writeFile(
+		transcriptPath(fixture, "stale"),
+		jsonl(record(0), record(1)),
+	);
+	// The server has part of it and was never told it ended.
+	stub.session("stale").streams.set("", { generation: 1, lines: [record(0)] });
 	await register(fixture, "stale", gone.pid, {
 		startedAt: Date.now() - 60 * 60_000,
 	});
+	// And one from more than a week ago is only forgotten.
+	await writeFile(transcriptPath(fixture, "ancient"), jsonl(record(2)));
+	await register(fixture, "ancient", gone.pid, {
+		source: "codex",
+		startedAt: Date.now() - 8 * 24 * 60 * 60_000,
+	});
 	expect((await follow(fixture)).reason).toBe("idle");
-	expect(stub.appends).toEqual([]);
+	expect(stub.lines("stale")).toEqual([record(0), record(1)]);
+	expect(stub.session("stale").ended).toBe(true);
+	expect(stub.appends.some((append) => append.sessionId === "ancient")).toBe(
+		false,
+	);
 	expect(await listLiveSessionRegistrations(fixture.configDir)).toEqual([]);
 });
 
@@ -628,12 +678,12 @@ test("a workspace pause drops that workspace's sessions and is honoured next tim
 	await writeFile(transcriptPath(fixture, "paused"), jsonl(record(0)));
 	await writeFile(transcriptPath(fixture, "other-org"), jsonl(record(1)));
 	await register(fixture, "paused", agent.pid);
-	await register(fixture, "other-org", agent.pid, {
+	const other = startAgent();
+	await register(fixture, "other-org", other.pid, {
 		organizationId: "org-2",
-		source: "codex",
 	});
 	const running = follow(fixture);
-	await waitFor(() => stub.lines("other-org", "", "codex").length === 1);
+	await waitFor(() => stub.lines("other-org").length === 1);
 	await waitFor(() => isLiveSessionPaused(fixture.configDir, "org-1"));
 	expect(isLiveSessionPaused(fixture.configDir, "org-2")).toBe(false);
 	await waitFor(
@@ -647,6 +697,7 @@ test("a workspace pause drops that workspace's sessions and is honoured next tim
 		stub.appends.filter((append) => append.sessionId === "paused-again"),
 	).toEqual([]);
 	agent.kill();
+	other.kill();
 	await running;
 }, 30_000);
 
@@ -690,9 +741,10 @@ test("an ownership conflict drops only that session", async () => {
 	await writeFile(transcriptPath(fixture, "taken"), jsonl(record(0)));
 	await writeFile(transcriptPath(fixture, "mine"), jsonl(record(1)));
 	await register(fixture, "taken", agent.pid);
-	await register(fixture, "mine", agent.pid, { source: "codex" });
+	const other = startAgent();
+	await register(fixture, "mine", other.pid);
 	const running = follow(fixture);
-	await waitFor(() => stub.lines("mine", "", "codex").length === 1);
+	await waitFor(() => stub.lines("mine").length === 1);
 	await waitFor(
 		async () =>
 			(await listLiveSessionRegistrations(fixture.configDir)).length === 1,
@@ -701,6 +753,7 @@ test("an ownership conflict drops only that session", async () => {
 	await Bun.sleep(300);
 	expect(conflicts).toBe(1);
 	agent.kill();
+	other.kill();
 	await running;
 }, 30_000);
 
@@ -712,7 +765,10 @@ test("backs off on server errors and rate limits, then delivers", async () => {
 			if (pathname !== "/rpc/liveSession/append") return undefined;
 			if (failures < 2) {
 				failures += 1;
-				return new Response("unavailable", { status: 503 });
+				// A proxy's plain 503, then the API's typed retryable one.
+				return failures === 1
+					? new Response("unavailable", { status: 503 })
+					: orpcError(503, "SERVICE_UNAVAILABLE");
 			}
 			if (limited < 1) {
 				limited += 1;
@@ -736,20 +792,68 @@ test("backs off on server errors and rate limits, then delivers", async () => {
 	expect((await running).reason).toBe("idle");
 }, 30_000);
 
-test("stops on 401 and forgets its registrations", async () => {
+test("a 401 re-reads credentials and continues with a new token, forgetting nothing", async () => {
 	const stub = startStub({
-		intercept: ({ pathname }) =>
-			pathname === "/rpc/liveSession/state"
+		intercept: ({ pathname, headers }) =>
+			pathname.startsWith("/rpc/liveSession/") &&
+			headers.get("x-api-key") === "live-test-token"
 				? orpcError(401, "UNAUTHORIZED")
 				: undefined,
 	});
 	const fixture = await createFixture(stub);
 	const agent = startAgent();
-	await writeFile(transcriptPath(fixture, "revoked"), jsonl(record(0)));
-	await register(fixture, "revoked", agent.pid);
-	expect((await follow(fixture)).reason).toBe("unauthorized");
-	expect(await listLiveSessionRegistrations(fixture.configDir)).toEqual([]);
-});
+	await writeFile(transcriptPath(fixture, "rotated"), jsonl(record(0)));
+	await register(fixture, "rotated", agent.pid);
+	const running = follow(fixture);
+	await waitFor(() => stub.paths.includes("/rpc/liveSession/state"));
+	await Bun.sleep(500);
+	expect(stub.lines("rotated")).toEqual([]);
+	expect(await listLiveSessionRegistrations(fixture.configDir)).toHaveLength(1);
+	// A new login replaces the token.
+	const credentials = JSON.parse(
+		await readFile(join(fixture.configDir, "credentials.json"), "utf8"),
+	);
+	await writeFile(
+		join(fixture.configDir, "credentials.json"),
+		JSON.stringify({ ...credentials, token: "rotated-token" }),
+	);
+	await waitFor(() => stub.lines("rotated").length === 1);
+	agent.kill();
+	expect((await running).reason).toBe("idle");
+}, 30_000);
+
+test("a malformed 200 response is transient, and a plain 403 drops only that session", async () => {
+	let malformed = 0;
+	const stub = startStub({
+		intercept: ({ pathname, body }) => {
+			if (pathname !== "/rpc/liveSession/append") return undefined;
+			if ((body as { sessionId: string }).sessionId === "forbidden")
+				return new Response("forbidden", { status: 403 });
+			if (malformed < 2) {
+				malformed += 1;
+				return malformed === 1
+					? new Response("<html>gateway</html>", { status: 200 })
+					: Response.json({ json: {} });
+			}
+			return undefined;
+		},
+	});
+	const fixture = await createFixture(stub);
+	await writeFile(transcriptPath(fixture, "flaky"), jsonl(record(0)));
+	await writeFile(transcriptPath(fixture, "forbidden"), jsonl(record(1)));
+	const agent = startAgent();
+	await register(fixture, "flaky", agent.pid);
+	await register(fixture, "forbidden", startAgent().pid);
+	const running = follow(fixture);
+	await waitFor(() => stub.lines("flaky").length === 1);
+	expect(malformed).toBe(2);
+	await waitFor(
+		async () =>
+			(await listLiveSessionRegistrations(fixture.configDir)).length === 1,
+	);
+	agent.kill();
+	expect((await running).reason).toBe("idle");
+}, 30_000);
 
 test("stops when the user logs out or the repository is turned off", async () => {
 	const stub = startStub();
@@ -786,8 +890,11 @@ test("only one follower runs per machine", async () => {
 		getLiveSessionFollowerLeasePath(fixture.configDir),
 	);
 	expect(lease).not.toBeNull();
+	// This process now holds the lease like a follower does.
+	await writeFollowerMarker(fixture.configDir);
 	expect((await follow(fixture)).reason).toBe("already-running");
-	expect(stub.paths).toEqual([]);
+	// The server is asked first; the lease is taken only once it answered.
+	expect(stub.paths).toEqual(["/rpc/cli/authStatus"]);
 	await lease?.release();
 	const running = follow(fixture);
 	await waitFor(() => stub.lines("single").length === 1);
@@ -939,3 +1046,292 @@ test("a resumed Codex stream slims later records exactly like an uninterrupted o
 	expect(resumed.appends[0]?.streams[0]?.startLine).toBe(4);
 	expect(resumed.lines(thread, "", "codex")).toEqual(sent);
 }, 40_000);
+
+// Hardening -----------------------------------------------------------------------
+
+test("a server that never agrees cannot cause a reset storm", async () => {
+	const stub = startStub({
+		// Always one line ahead of what was sent.
+		transformAppendResult: (streams) =>
+			streams.map((stream) => ({
+				...stream,
+				committedLines: stream.committedLines + 1,
+				status: "appended",
+			})),
+	});
+	const fixture = await createFixture(stub);
+	const agent = startAgent();
+	await writeFile(transcriptPath(fixture, "liar"), jsonl(record(0), record(1)));
+	await register(fixture, "liar", agent.pid);
+	const started = Date.now();
+	const result = follow(fixture, { resetBackoffInitialMs: 200 });
+	await waitFor(
+		async () =>
+			(await listLiveSessionRegistrations(fixture.configDir)).length === 0,
+		20_000,
+	);
+	const appends = stub.appends.filter((append) => append.sessionId === "liar");
+	// Five resets with growing pauses, then the session is dropped.
+	expect(appends.filter((append) => append.streams[0]?.reset)).toHaveLength(5);
+	expect(appends.length).toBeLessThanOrEqual(20);
+	expect(Date.now() - started).toBeGreaterThanOrEqual(200 + 400 + 800);
+	agent.kill();
+	expect((await result).reason).toBe("idle");
+}, 40_000);
+
+test.skipIf(process.platform === "win32")(
+	"FIFOs, swapped symlinks and paths outside the transcript directory are never read",
+	async () => {
+		const stub = startStub();
+		const fixture = await createFixture(stub);
+		const agent = startAgent();
+		const id = "guarded";
+		await writeFile(transcriptPath(fixture, id), jsonl(record(0)));
+		const subagents = await subagentDirectory(fixture, id);
+		Bun.spawnSync(["mkfifo", join(subagents, "agent-fifo.jsonl")]);
+		const swapped = join(subagents, "agent-swap.jsonl");
+		await writeFile(swapped, jsonl(record(1)));
+		const outside = join(fixture.home, "outside.jsonl");
+		await writeFile(outside, jsonl('{"secret":"outside"}'));
+		await register(fixture, id, agent.pid);
+		// A crafted registration pointing outside the Claude projects directory.
+		await register(fixture, "crafted", startAgent().pid, {
+			transcriptPath: outside,
+		});
+		const running = follow(fixture);
+		await waitFor(
+			() => stub.lines(id).length === 1 && stub.lines(id, "swap").length === 1,
+		);
+		await rm(swapped);
+		await symlink(outside, swapped);
+		await appendFile(transcriptPath(fixture, id), jsonl(record(2)));
+		await waitFor(() => stub.lines(id).length === 2);
+		await Bun.sleep(300);
+		expect(stub.lines(id, "swap")).toEqual([record(1)]);
+		expect(stub.session(id).streams.has("fifo")).toBe(false);
+		expect(stub.appends.some((append) => append.sessionId === "crafted")).toBe(
+			false,
+		);
+		expect(JSON.stringify(stub.appends)).not.toContain("outside");
+		agent.kill();
+		expect((await running).reason).toBe("idle");
+	},
+	30_000,
+);
+
+test("a session whose agent already exited at registration is flushed and ended at once", async () => {
+	const stub = startStub();
+	const fixture = await createFixture(stub);
+	const path = await codexPath(fixture, "exec-thread");
+	await writeFile(path, jsonl(record(0), record(1)));
+	await register(fixture, "exec-thread", null, {
+		agentPidSource: "exited",
+		source: "codex",
+		transcriptPath: path,
+	});
+	const started = Date.now();
+	const result = await follow(fixture);
+	expect(result.reason).toBe("idle");
+	expect(stub.lines("exec-thread", "", "codex")).toHaveLength(2);
+	expect(stub.session("exec-thread", "codex").ended).toBe(true);
+	expect(Date.now() - started).toBeLessThan(5_000);
+}, 30_000);
+
+test("a lease left as a regular file does not keep the follower from starting", async () => {
+	const stub = startStub();
+	const fixture = await createFixture(stub);
+	const agent = startAgent();
+	await mkdir(join(fixture.configDir, "live-sessions"), { recursive: true });
+	await writeFile(getLiveSessionFollowerLeasePath(fixture.configDir), "junk");
+	await writeFile(transcriptPath(fixture, "lease-file"), jsonl(record(0)));
+	await register(fixture, "lease-file", agent.pid);
+	const running = follow(fixture);
+	await waitFor(() => stub.lines("lease-file").length === 1);
+	agent.kill();
+	expect((await running).reason).toBe("idle");
+}, 30_000);
+
+test("SIGTERM flushes pending lines, keeps registrations, and exits", async () => {
+	const stub = startStub();
+	const fixture = await createFixture(stub);
+	const agent = startAgent();
+	await writeFile(transcriptPath(fixture, "signal"), jsonl(record(0)));
+	await register(fixture, "signal", agent.pid);
+	const running = runLiveSessionFollower({
+		configDir: fixture.configDir,
+		handleSignals: true,
+		timing: { ...FAST_TIMING, debounceMs: 60_000 },
+		transcriptRoots: {
+			claude_code: [join(fixture.home, ".claude", "projects")],
+			codex: [],
+		},
+	});
+	await waitFor(() => stub.paths.includes("/rpc/liveSession/state"));
+	await Bun.sleep(300);
+	expect(stub.lines("signal")).toEqual([]);
+	process.emit("SIGTERM", "SIGTERM");
+	const result = await running;
+	expect(result.reason).toBe("signal-sigterm");
+	expect(stub.lines("signal")).toEqual([record(0)]);
+	expect(await listLiveSessionRegistrations(fixture.configDir)).toHaveLength(1);
+	expect(process.listenerCount("SIGTERM")).toBe(0);
+}, 30_000);
+
+test("requests are split by their JSON-escaped size", async () => {
+	const stub = startStub();
+	const fixture = await createFixture(stub);
+	const agent = startAgent();
+	// Control characters expand six-fold when JSON-escaped.
+	const control = (index: number) =>
+		`{"i":${index},"text":"${"\u0001".repeat(250_000)}"}`;
+	await writeFile(
+		transcriptPath(fixture, "escaped"),
+		jsonl(...Array.from({ length: 8 }, (_, index) => control(index))),
+	);
+	await register(fixture, "escaped", agent.pid);
+	const running = follow(fixture);
+	await waitFor(() => stub.lines("escaped").length === 8);
+	for (const append of stub.appends)
+		expect(JSON.stringify(append.streams).length).toBeLessThanOrEqual(
+			3_600_000,
+		);
+	// 2 MB of raw lines alone would fit in two requests.
+	expect(stub.appends.length).toBeGreaterThanOrEqual(4);
+	agent.kill();
+	await running;
+}, 30_000);
+
+test("a hanging request of one session does not delay another session", async () => {
+	let release: (() => void) | undefined;
+	const hanging = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const stub = startStub({
+		intercept: async ({ pathname, body }) => {
+			if (
+				pathname === "/rpc/liveSession/append" &&
+				(body as { sessionId: string }).sessionId === "slow"
+			)
+				await hanging;
+			return undefined;
+		},
+	});
+	cleanups.push(() => release?.());
+	const fixture = await createFixture(stub);
+	const slowAgent = startAgent();
+	const fastAgent = startAgent();
+	await writeFile(transcriptPath(fixture, "slow"), jsonl(record(0)));
+	await writeFile(transcriptPath(fixture, "fast"), jsonl(record(1)));
+	await register(fixture, "slow", slowAgent.pid);
+	await register(fixture, "fast", fastAgent.pid);
+	const running = follow(fixture, { requestTimeoutMs: 20_000 });
+	await waitFor(() => stub.lines("fast").length === 1);
+	await Bun.sleep(200);
+	const killedAt = Date.now();
+	fastAgent.kill();
+	await waitFor(() => stub.session("fast").ended);
+	expect(Date.now() - killedAt).toBeLessThan(3_000);
+	release?.();
+	await waitFor(() => stub.lines("slow").length === 1);
+	slowAgent.kill();
+	await running;
+}, 40_000);
+
+test("inside an agent sandbox the follower does not start", async () => {
+	const stub = startStub();
+	const fixture = await createFixture(stub);
+	const agent = startAgent();
+	await writeFile(transcriptPath(fixture, "sandboxed"), jsonl(record(0)));
+	await register(fixture, "sandboxed", agent.pid);
+	const previous = process.env.CODEX_SANDBOX;
+	process.env.CODEX_SANDBOX = "seatbelt";
+	try {
+		expect((await follow(fixture)).reason).toBe("sandboxed");
+	} finally {
+		if (previous === undefined) delete process.env.CODEX_SANDBOX;
+		else process.env.CODEX_SANDBOX = previous;
+	}
+	expect(stub.paths).toEqual([]);
+	expect(await listLiveSessionRegistrations(fixture.configDir)).toHaveLength(1);
+	expect(await liveSessionFiles(fixture)).not.toContain("follower.lease");
+});
+
+test("without network the follower never takes the lease, and gives it up after repeated failures", async () => {
+	const stub = startStub();
+	const fixture = await createFixture(stub);
+	stub.stop();
+	const agent = startAgent();
+	await writeFile(transcriptPath(fixture, "offline"), jsonl(record(0)));
+	await register(fixture, "offline", agent.pid);
+	expect((await follow(fixture)).reason).toBe("capability-unconfirmed");
+	expect(await liveSessionFiles(fixture)).not.toContain("follower.lease");
+	expect(await listLiveSessionRegistrations(fixture.configDir)).toHaveLength(1);
+}, 30_000);
+
+test("a follower that fails unexpectedly hands its sessions to a successor", async () => {
+	const stub = startStub();
+	const fixture = await createFixture(stub);
+	const agent = startAgent();
+	await writeFile(transcriptPath(fixture, "handed-over"), jsonl(record(0)));
+	await register(fixture, "handed-over", agent.pid);
+	let respawned = 0;
+	const result = await runLiveSessionFollower({
+		configDir: fixture.configDir,
+		respawn: () => {
+			respawned += 1;
+		},
+		timing: FAST_TIMING,
+		transcriptRoots: {
+			get claude_code(): string[] {
+				throw new Error("unexpected fault");
+			},
+			codex: [],
+		},
+	});
+	expect(result.reason).toBe("failed");
+	expect(respawned).toBe(1);
+	expect(await listLiveSessionRegistrations(fixture.configDir)).toHaveLength(1);
+	expect(await liveSessionFiles(fixture)).not.toContain("follower.lease");
+});
+
+test.skipIf(
+	(process.platform !== "linux" && process.platform !== "darwin") ||
+		process.getuid?.() === 0,
+)(
+	"an agent process it may not signal (EPERM) ends by transcript idleness",
+	async () => {
+		const root = Bun.spawnSync(["ps", "-A", "-o", "pid=,user="])
+			.stdout.toString()
+			.split("\n")
+			.map((line) => line.trim().split(/\s+/u))
+			.find(([pid, user]) => user === "root" && Number(pid) > 1)?.[0];
+		if (!root) return;
+		const stub = startStub();
+		const fixture = await createFixture(stub);
+		const path = transcriptPath(fixture, "foreign");
+		await writeFile(path, jsonl(record(0)));
+		await register(fixture, "foreign", Number(root));
+		const result = await follow(fixture, { orphanIdleMs: 1_000 });
+		expect(result.reason).toBe("idle");
+		expect(stub.lines("foreign")).toEqual([record(0)]);
+		expect(stub.session("foreign").ended).toBe(true);
+	},
+	30_000,
+);
+
+test("a lease held by a process that is not a follower is taken over", async () => {
+	const stub = startStub();
+	const fixture = await createFixture(stub);
+	const agent = startAgent();
+	// A fresh lease naming a live process that never acts as a follower (a
+	// reused PID): no follower marker.
+	const lease = getLiveSessionFollowerLeasePath(fixture.configDir);
+	await mkdir(lease, { recursive: true });
+	await writeFile(join(lease, "owner"), `${agent.pid}:not-a-follower`);
+	await writeFile(transcriptPath(fixture, "reclaimed"), jsonl(record(0)));
+	await register(fixture, "reclaimed", agent.pid);
+	const running = follow(fixture, { leaseWaitMs: 5_000 });
+	await waitFor(() => stub.lines("reclaimed").length === 1);
+	agent.kill();
+	expect((await running).reason).toBe("idle");
+}, 30_000);

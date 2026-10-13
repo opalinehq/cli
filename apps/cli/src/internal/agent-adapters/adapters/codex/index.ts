@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import pMap from "p-map";
+import { getCodexHomeDir } from "../../../../lib/codex-thread-family.js";
 import { scanBoundedJsonlFile } from "../../bounded-jsonl-scan.js";
 import { MissingTranscriptTimestampError } from "../../errors.js";
 import type {
@@ -24,8 +25,6 @@ import {
 	removeHook,
 	validateHook,
 } from "./config.js";
-
-const SESSIONS_BASE_DIR = join(homedir(), ".codex", "sessions");
 
 async function transcriptHasTimestamp(path: string): Promise<boolean> {
 	const state = await scanBoundedJsonlFile(
@@ -98,7 +97,8 @@ export async function readCodexSessionMeta(
 export async function findActiveRolloutFile(
 	threadId: string,
 ): Promise<string | null> {
-	const files = await walkJsonlFiles(SESSIONS_BASE_DIR);
+	// `$CODEX_HOME/sessions`, like Codex itself and the live session follower.
+	const files = await walkJsonlFiles(join(getCodexHomeDir(), "sessions"));
 
 	for (const filePath of files) {
 		if (!basename(filePath).includes(threadId)) continue;

@@ -17,10 +17,20 @@ export const LIVE_SESSION_MAX_RAW_LINE_BYTES = 8 * 1024 * 1024;
 const READ_CHUNK_BYTES = 1024 * 1024;
 const NEWLINE = 0x0a;
 
+/**
+ * One request's lines may expand when JSON-escaped (control characters become
+ * `\u00XX`); requests are also split by this serialized size, and a line that
+ * alone exceeds it is omitted.
+ */
+export const LIVE_SESSION_MAX_WIRE_BYTES = 3_500_000;
+
 export interface LiveSessionLine {
 	/** The line exactly as sent (filtered and slimmed, without `\n`). */
 	readonly text: string;
+	/** UTF-8 bytes of `text`. */
 	readonly bytes: number;
+	/** UTF-8 bytes of `text` as a JSON string. */
+	readonly wireBytes: number;
 	readonly sha256: string;
 }
 
@@ -66,8 +76,12 @@ export function processLiveSessionLine(
 	const bytes = Buffer.byteLength(text, "utf8");
 	if (bytes > LIVE_SESSION_MAX_LINE_BYTES)
 		return omittedLine("too-large", inputBytes);
+	const wireBytes = wireLength(text);
+	if (wireBytes > LIVE_SESSION_MAX_WIRE_BYTES)
+		return omittedLine("too-large", inputBytes);
 	return {
 		bytes,
+		wireBytes,
 		inputBytes,
 		redactedBytes: filtered.redactedBytes,
 		redactions: filtered.counts,
@@ -87,12 +101,17 @@ function omittedLine(
 	});
 	return {
 		bytes: Buffer.byteLength(text, "utf8"),
+		wireBytes: wireLength(text),
 		inputBytes: originalBytes,
 		redactedBytes: 0,
 		redactions: {},
 		sha256: hashLiveSessionLine(text),
 		text,
 	};
+}
+
+function wireLength(text: string): number {
+	return Buffer.byteLength(JSON.stringify(text), "utf8");
 }
 
 export interface ReadLinesResult {

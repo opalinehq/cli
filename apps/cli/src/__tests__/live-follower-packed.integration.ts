@@ -55,10 +55,12 @@ test("the packed follower outlives its launcher, syncs, and exits after the agen
 	const configDir = join(home, ".rudel");
 	const projectPath = join(home, "project");
 	const sessionId = "packed-live-session";
-	const transcriptPath = join(home, "transcripts", `${sessionId}.jsonl`);
+	// Claude Code keeps transcripts under ~/.claude/projects.
+	const transcripts = join(home, ".claude", "projects", "-project");
+	const transcriptPath = join(transcripts, `${sessionId}.jsonl`);
 	await mkdir(configDir, { recursive: true });
 	await mkdir(projectPath, { recursive: true });
-	await mkdir(join(home, "transcripts"), { recursive: true });
+	await mkdir(transcripts, { recursive: true });
 	await writeFile(
 		join(configDir, "credentials.json"),
 		JSON.stringify({

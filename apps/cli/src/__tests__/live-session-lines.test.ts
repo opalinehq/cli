@@ -19,6 +19,9 @@ import {
 	writeLiveSessionRegistration,
 } from "../lib/live-session-registry.js";
 import {
+	darwinIdentity,
+	findAncestorProcess,
+	isSameStartIdentity,
 	parseProcStat,
 	readProcessStartIdentities,
 } from "../lib/process-identity.js";
@@ -119,6 +122,13 @@ test("the Claude Code process comes from CLAUDE_PID, else the hook's parent", ()
 	expect(resolveClaudeAgentPid({ CLAUDE_PID: "0" }, 7)).toEqual(parent);
 	expect(resolveClaudeAgentPid({ CLAUDE_PID: "-1" }, 7)).toEqual(parent);
 	expect(resolveClaudeAgentPid({ CLAUDE_PID: "12abc" }, 7)).toEqual(parent);
+	// Beyond the platform's pid range (would otherwise wrap around).
+	expect(resolveClaudeAgentPid({ CLAUDE_PID: "4294967296" }, 7)).toEqual(
+		parent,
+	);
+	expect(resolveClaudeAgentPid({ CLAUDE_PID: "2147483648" }, 7)).toEqual(
+		parent,
+	);
 	expect(resolveClaudeAgentPid({}, 7)).toEqual(parent);
 });
 
@@ -140,6 +150,35 @@ test("reads Linux process start times, also for names with spaces and parenthese
 	});
 	expect(parseProcStat("garbage")).toBeNull();
 });
+
+test("macOS start identities are time-zone independent and tolerate a second", () => {
+	expect(darwinIdentity("Tue Oct 13 10:11:44 2026")).toBe(
+		`darwin:${Date.UTC(2026, 9, 13, 10, 11, 44) / 1_000}`,
+	);
+	expect(darwinIdentity("Tue Oct  6 09:01:02 2026")).toBe(
+		`darwin:${Date.UTC(2026, 9, 6, 9, 1, 2) / 1_000}`,
+	);
+	expect(darwinIdentity("garbage")).toBeUndefined();
+	expect(isSameStartIdentity("darwin:100", "darwin:101")).toBe(true);
+	expect(isSameStartIdentity("darwin:100", "darwin:104")).toBe(false);
+	expect(isSameStartIdentity("linux:100", "linux:101")).toBe(false);
+	expect(isSameStartIdentity("linux:100", "linux:100")).toBe(true);
+});
+
+test.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
+	"the ancestor walk reports a parent that is already gone as exited",
+	async () => {
+		const never = () => false;
+		expect(await findAncestorProcess(never, 1)).toEqual({ kind: "exited" });
+		// No matching ancestor all the way up to the root: the process that
+		// started this one would have been it.
+		expect(await findAncestorProcess(never, process.ppid, 2_000)).toEqual({
+			kind: "exited",
+		});
+		const self = await findAncestorProcess(() => true, process.pid, 2_000);
+		expect(self).toMatchObject({ kind: "found", pid: process.pid });
+	},
+);
 
 test.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 	"reads this process's start identity",
@@ -186,12 +225,17 @@ test("registrations are atomic, validated, and removed only when unchanged", asy
 			"{",
 		);
 		expect(await listLiveSessionRegistrations(configDir)).toHaveLength(1);
-		await expect(
-			writeLiveSessionRegistration(configDir, {
-				...registration,
-				sessionId: "../escape",
-			}),
-		).rejects.toThrow();
+		for (const invalid of [
+			{ sessionId: "../escape" },
+			{ agentPid: 4_294_967_296 },
+			{ agentPid: null },
+		])
+			await expect(
+				writeLiveSessionRegistration(configDir, {
+					...registration,
+					...invalid,
+				}),
+			).rejects.toThrow();
 	} finally {
 		await rm(configDir, { force: true, recursive: true });
 	}

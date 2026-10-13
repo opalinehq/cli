@@ -17,6 +17,8 @@ export const LIVE_SESSION_MAX_LINE_BYTES = 1_048_576;
  */
 export const LIVE_SESSION_MAX_REQUEST_LINE_BYTES = 1_572_864;
 export const LIVE_SESSION_MAX_LINES_PER_STREAM = 10_000;
+/** Lines across all streams of one append. */
+export const LIVE_SESSION_MAX_REQUEST_LINES = 20_000;
 export const LIVE_SESSION_MAX_STREAMS_PER_REQUEST = 64;
 export const LIVE_SESSIONS_DISABLED_CODE = "LIVE_SESSIONS_DISABLED";
 

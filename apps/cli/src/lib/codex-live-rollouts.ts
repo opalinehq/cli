@@ -1,6 +1,10 @@
 import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { type CodexThread, readCodexThread } from "./codex-thread-family.js";
+import {
+	type CodexThread,
+	codexThreadFromFirstRecord,
+} from "./codex-thread-family.js";
+import { readFirstJsonLine } from "./live-session-paths.js";
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 /** Look this far back for sub-agents of a session that started earlier. */
@@ -83,7 +87,11 @@ export class CodexRolloutIndex {
 			}
 		}
 		for (const [path, attempts] of this.unclassified) {
-			const thread = await readCodexThread(path).catch(() => null);
+			// Regular files only (never blocks on a FIFO named like a rollout).
+			const thread = codexThreadFromFirstRecord(
+				await readFirstJsonLine(path),
+				path,
+			);
 			if (thread) {
 				this.unclassified.delete(path);
 				if (thread.kind === "subagent" && thread.parentThreadId) {

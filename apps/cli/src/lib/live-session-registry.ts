@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import { getLiveSessionsDirectory } from "./live-session-pause.js";
+import { isValidPid } from "./process-identity.js";
 
 /**
  * Hooks register running sessions here; the machine-wide follower reads the
@@ -22,9 +23,10 @@ export type LiveSessionSource = "claude_code" | "codex";
 /**
  * How the agent process was found: Claude Code's `CLAUDE_PID` (`env`), the
  * hook's parent (`parent`), the nearest `codex` ancestor of the notify
- * process (`ancestor`), or not at all (`none`, ended by idleness).
+ * process (`ancestor`), not at all (`none`, ended by idleness), or already
+ * gone when the hook ran (`exited`, ended right away).
  */
-export type AgentPidSource = "env" | "parent" | "ancestor" | "none";
+export type AgentPidSource = "env" | "parent" | "ancestor" | "none" | "exited";
 
 export interface LiveSessionRegistration {
 	readonly version: 1;
@@ -170,15 +172,15 @@ function isValidRegistration(value: unknown): value is LiveSessionRegistration {
 		isBoundedString(record.transcriptPath, 4096) &&
 		isBoundedString(record.cwd, 4096) &&
 		isBoundedString(record.organizationId, 200) &&
-		(record.agentPid === null ||
-			(typeof record.agentPid === "number" &&
-				Number.isSafeInteger(record.agentPid) &&
-				record.agentPid > 1)) &&
+		(record.agentPid === null || isValidPid(record.agentPid)) &&
 		(record.agentPidSource === "env" ||
 			record.agentPidSource === "parent" ||
 			record.agentPidSource === "ancestor" ||
-			record.agentPidSource === "none") &&
-		(record.agentPid === null) === (record.agentPidSource === "none") &&
+			record.agentPidSource === "none" ||
+			record.agentPidSource === "exited") &&
+		(record.agentPid === null) ===
+			(record.agentPidSource === "none" ||
+				record.agentPidSource === "exited") &&
 		(record.agentStartIdentity === null ||
 			isBoundedString(record.agentStartIdentity, 200)) &&
 		(record.hookSource === undefined ||

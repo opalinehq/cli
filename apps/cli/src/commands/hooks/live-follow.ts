@@ -29,7 +29,20 @@ async function runLiveFollow(flags: {
 	}
 	try {
 		await setupHookLogging();
-		await runLiveSessionFollower();
+		const respawns = Number(process.env.OPALINE_LIVE_FOLLOWER_RESPAWNS ?? "0");
+		await runLiveSessionFollower({
+			handleSignals: true,
+			// A follower that fails hands its sessions to a successor (a few
+			// times at most, so a persistent fault cannot loop).
+			respawn:
+				Number.isSafeInteger(respawns) && respawns < 3
+					? () =>
+							spawnLiveFollowProcess(true, {
+								...process.env,
+								OPALINE_LIVE_FOLLOWER_RESPAWNS: String(respawns + 1),
+							})
+					: undefined,
+		});
 	} catch {
 		// Detached: there is nowhere to report this, and nothing to clean up.
 	} finally {

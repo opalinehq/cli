@@ -91,12 +91,21 @@ async function setup(
 			projects: { [fixture.projectPath]: { organizationId: "org-1" } },
 		}),
 	);
+	// Claude Code keeps transcripts under ~/.claude/projects.
+	const claudeProjects = join(fixture.home, ".claude", "projects", "-project");
+	await mkdir(claudeProjects, { recursive: true });
+	const transcriptPath =
+		source === "claude_code"
+			? join(claudeProjects, `${fixture.sessionId}.jsonl`)
+			: fixture.transcriptPath;
+	if (source === "claude_code")
+		await writeFile(transcriptPath, await readFile(fixture.transcriptPath));
 	if (options.evidencePaused)
 		await writeFile(
 			join(configDir, "repository-evidence-pause.json"),
 			JSON.stringify({ until: Date.now() + 3_600_000 }),
 		);
-	return { configDir, fixture, stub };
+	return { claudeProjects, configDir, fixture, stub, transcriptPath };
 }
 
 function sessionStart(
@@ -121,18 +130,17 @@ function sessionStart(
 test.each([false, true])(
 	"SessionStart registers sessions with one detached follower and keeps its evidence behaviour (evidence paused: %s)",
 	async (evidencePaused) => {
-		const { configDir, fixture, stub } = await setup("claude_code", {
-			evidencePaused,
-		});
+		const { claudeProjects, configDir, fixture, stub, transcriptPath } =
+			await setup("claude_code", { evidencePaused });
 		const first = startAgent();
 		const second = startAgent();
-		const secondPath = join(fixture.projectPath, "second-session.jsonl");
+		const secondPath = join(claudeProjects, "second-session.jsonl");
 		await writeFile(secondPath, '{"type":"user","n":1}\n');
 		const startedAt = performance.now();
 		const result = await sessionStart(
 			fixture,
 			fixture.sessionId,
-			fixture.transcriptPath,
+			transcriptPath,
 			first.pid,
 		);
 		expect(result.exitCode).toBe(0);
@@ -195,12 +203,13 @@ test.each([false, true])(
 );
 
 test("SessionStart does not register when live updates are turned off locally", async () => {
-	const { configDir, fixture, stub } = await setup("claude_code");
+	const { configDir, fixture, stub, transcriptPath } =
+		await setup("claude_code");
 	const agent = startAgent();
 	const result = await sessionStart(
 		fixture,
 		fixture.sessionId,
-		fixture.transcriptPath,
+		transcriptPath,
 		agent.pid,
 		{},
 	);
@@ -278,16 +287,63 @@ test("the Codex notify hook registers its thread, but not internal or sub-agent 
 		source: "codex",
 		transcriptPath: codexRolloutPath(fixture.home, fixture.sessionId),
 	});
-	// The test runner is not a codex process.
-	expect(registration?.agentPidSource).toBe("none");
-	// The first turn becomes visible once it ends (the fixture's last line has
-	// no newline yet).
-	await waitFor(() => stub.lines(fixture.sessionId, "", "codex").length === 1);
-	// Re-registration on later turns is a no-op.
-	await codexNotify(fixture, fixture.sessionId);
-	expect(
-		(await listLiveSessionRegistrations(configDir)).map(
-			(item) => item.startedAt,
-		),
-	).toEqual([registration?.startedAt as number]);
+	if (process.platform === "linux" || process.platform === "darwin") {
+		// No `codex` process above the notify command: it already exited (as
+		// `codex exec` does), so the thread is flushed and ended right away.
+		expect(registration?.agentPidSource).toBe("exited");
+		await waitFor(() => stub.session(fixture.sessionId, "codex").ended);
+		// The final line without a newline is complete JSON, so it is sent.
+		expect(stub.lines(fixture.sessionId, "", "codex")).toHaveLength(2);
+	} else {
+		expect(registration?.agentPidSource).toBe("none");
+		await waitFor(
+			() => stub.lines(fixture.sessionId, "", "codex").length === 1,
+		);
+	}
 }, 60_000);
+
+test("hooks write nothing to stdout", async () => {
+	const claude = await setup("claude_code");
+	const agent = startAgent();
+	const env = { CLAUDE_PID: String(agent.pid), OPALINE_LIVE_SESSIONS: "1" };
+	const input = JSON.stringify({
+		cwd: claude.fixture.projectPath,
+		hook_event_name: "SessionStart",
+		session_id: claude.fixture.sessionId,
+		source: "startup",
+		transcript_path: claude.transcriptPath,
+	});
+	for (const hook of ["session-start", "session-end"]) {
+		const result = await runCli(["hooks", "claude", hook], claude.fixture, {
+			env,
+			stdin: input,
+		});
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toBe("");
+	}
+	const codex = await setup("codex");
+	const result = await codexNotify(codex.fixture, codex.fixture.sessionId);
+	expect(result.stdout).toBe("");
+}, 60_000);
+
+test("inside a Codex sandbox, hooks register but do not start a follower", async () => {
+	const { configDir, fixture, stub, transcriptPath } =
+		await setup("claude_code");
+	const agent = startAgent();
+	const result = await sessionStart(
+		fixture,
+		fixture.sessionId,
+		transcriptPath,
+		agent.pid,
+		{
+			CODEX_SANDBOX: "seatbelt",
+			CODEX_SANDBOX_NETWORK_DISABLED: "1",
+			OPALINE_LIVE_SESSIONS: "1",
+		},
+	);
+	expect(result.exitCode).toBe(0);
+	await Bun.sleep(1_500);
+	expect(await listLiveSessionRegistrations(configDir)).toHaveLength(1);
+	expect(await followerPid(configDir)).toBeUndefined();
+	expect(stub.paths.filter((path) => path.includes("liveSession"))).toEqual([]);
+}, 30_000);

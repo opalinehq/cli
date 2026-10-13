@@ -199,7 +199,14 @@ async function findDescendants(
 export async function readCodexThread(
 	path: string,
 ): Promise<CodexThread | null> {
-	const first = await readJsonlFirstLine(path);
+	return codexThreadFromFirstRecord(await readJsonlFirstLine(path), path);
+}
+
+/** A rollout's thread from its first record (`session_meta`). */
+export function codexThreadFromFirstRecord(
+	first: unknown,
+	path: string,
+): CodexThread | null {
 	if (!isRecord(first) || first.type !== "session_meta") return null;
 	const payload = first.payload;
 	if (!isRecord(payload) || typeof payload.id !== "string") return null;
