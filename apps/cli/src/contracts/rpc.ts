@@ -15,6 +15,13 @@ import {
 	SESSION_UPLOAD_SHRINK_REJECTED_MESSAGE,
 } from "./ingest.js";
 import {
+	LiveSessionAppendInputSchema,
+	LiveSessionAppendOutputSchema,
+	LiveSessionErrors,
+	LiveSessionStateInputSchema,
+	LiveSessionStateOutputSchema,
+} from "./live-session.js";
+import {
 	RepositoryEvidenceCommitInputSchema,
 	RepositoryEvidenceCommitOutputSchema,
 	RepositoryEvidenceErrors,
@@ -39,6 +46,8 @@ const CliUserSchema = z.object({
 			analysisLinkedUploads: z.literal(true).optional(),
 			/** The server accepts slimmed transcripts (no shrink rejection). */
 			transcriptSlimming: z.literal(true).optional(),
+			/** The server accepts live session updates (`liveSession.*`). */
+			liveSessions: z.literal(true).optional(),
 		})
 		.optional(),
 });
@@ -60,6 +69,13 @@ export const CliSessionUploadStatusOutputSchema = z.object({
 	organizationId: z.string(),
 	uploadedSessionIds: z.array(z.string()),
 });
+const LiveSessionRpcErrors = {
+	...LiveSessionErrors,
+	[SESSION_OWNERSHIP_CONFLICT_CODE]: {
+		status: 409,
+		message: SESSION_OWNERSHIP_CONFLICT_MESSAGE,
+	},
+};
 const OrganizationSchema = z.object({
 	id: z.string(),
 	name: z.string(),
@@ -123,6 +139,16 @@ export const contract = {
 				}),
 			},
 		}),
+	liveSession: {
+		state: oc
+			.input(LiveSessionStateInputSchema)
+			.output(LiveSessionStateOutputSchema)
+			.errors(LiveSessionRpcErrors),
+		append: oc
+			.input(LiveSessionAppendInputSchema)
+			.output(LiveSessionAppendOutputSchema)
+			.errors(LiveSessionRpcErrors),
+	},
 	repositoryEvidence: {
 		commit: oc
 			.errors(RepositoryEvidenceErrors)

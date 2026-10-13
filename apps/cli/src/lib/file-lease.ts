@@ -21,10 +21,17 @@ export interface FileLeaseOptions {
 	readonly hardStaleMs: number;
 	/** Grace period for a lease directory whose owner file is not written yet. */
 	readonly ownerlessGraceMs: number;
+	/**
+	 * Renew only while this holds (for example while the owner's main loop
+	 * makes progress), so a wedged owner's lease goes stale and is taken over.
+	 */
+	readonly shouldRenew?: () => boolean;
 }
 
 export interface FileLease {
 	readonly release: () => Promise<void>;
+	/** Whether this lease still owns the lock (it may have been recovered as stale). */
+	readonly isOwned: () => Promise<boolean>;
 }
 
 export const DEFAULT_FILE_LEASE_OPTIONS: FileLeaseOptions = {
@@ -59,10 +66,12 @@ export async function tryAcquireFileLease(
 			throw error;
 		}
 		const heartbeat = setInterval(() => {
+			if (options.shouldRenew && !options.shouldRenew()) return;
 			void renewLease(lockPath, ownerPath, ownerToken).catch(() => undefined);
 		}, options.heartbeatMs);
 		heartbeat.unref();
 		return {
+			isOwned: async () => (await readIfPresent(ownerPath)) === ownerToken,
 			release: async () => {
 				clearInterval(heartbeat);
 				if ((await readIfPresent(ownerPath)) === ownerToken)
@@ -105,12 +114,12 @@ async function inspectLease(
 ): Promise<"absent" | "held" | "stale"> {
 	let ageMs: number;
 	try {
+		const metadata = await stat(lockPath);
+		// Not a lease this code created (for example a stray regular file).
+		if (!metadata.isDirectory()) return "stale";
 		// Wall time from the performance clock, not Date.now(), which tests may
 		// freeze.
-		ageMs =
-			performance.timeOrigin +
-			performance.now() -
-			(await stat(lockPath)).mtimeMs;
+		ageMs = performance.timeOrigin + performance.now() - metadata.mtimeMs;
 	} catch (error) {
 		if (isErrorCode(error, "ENOENT")) return "absent";
 		throw error;
@@ -134,7 +143,11 @@ async function renewLease(
 	await utimes(lockPath, now, now);
 }
 
-function isProcessAlive(processId: number): boolean {
+/**
+ * Whether a process with this id exists. Only ESRCH means gone: EPERM is a
+ * live process owned by someone else.
+ */
+export function isProcessAlive(processId: number): boolean {
 	try {
 		process.kill(processId, 0);
 		return true;
@@ -147,7 +160,8 @@ async function readIfPresent(path: string): Promise<string | undefined> {
 	try {
 		return await readFile(path, "utf8");
 	} catch (error) {
-		if (isErrorCode(error, "ENOENT")) return undefined;
+		if (isErrorCode(error, "ENOENT") || isErrorCode(error, "ENOTDIR"))
+			return undefined;
 		throw error;
 	}
 }

@@ -35,7 +35,8 @@ import {
 } from "./settings.js";
 
 const SAFE_BASENAME_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
-const SUBAGENT_FILENAME_PATTERN = /^agent-([A-Za-z0-9_-]{1,200})\.jsonl$/u;
+export const SUBAGENT_FILENAME_PATTERN =
+	/^agent-([A-Za-z0-9_-]{1,200})\.jsonl$/u;
 const MAX_SUBAGENT_DIRECTORY_ENTRIES = 4_096;
 
 // ── Exported utilities ──
@@ -655,7 +656,10 @@ function isMissingPath(error: unknown): boolean {
 	return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
-function isContainedPath(parentPath: string, candidatePath: string): boolean {
+export function isContainedPath(
+	parentPath: string,
+	candidatePath: string,
+): boolean {
 	const pathFromParent = relative(parentPath, candidatePath);
 	return (
 		pathFromParent !== "" &&

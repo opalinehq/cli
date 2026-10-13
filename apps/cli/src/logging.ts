@@ -19,6 +19,14 @@ export async function setupHookLogging(): Promise<void> {
 				sinks: ["file"],
 			},
 			{
+				// Hooks must not write to stdout; older LogTape releases announce
+				// their configuration on the meta logger unless it is configured.
+				category: ["logtape", "meta"],
+				lowestLevel: "error",
+				parentSinks: "override",
+				sinks: ["file"],
+			},
+			{
 				category: ["opaline", "cli"],
 				lowestLevel: "debug",
 				sinks: ["file"],

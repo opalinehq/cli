@@ -10,6 +10,10 @@ import { findHookAnalysisMarkers } from "../../../lib/analysis-hook.js";
 import { isRepositoryAutoUploadAllowed } from "../../../lib/auto-upload-config.js";
 import { loadCredentials } from "../../../lib/credentials.js";
 import { getGitInfo } from "../../../lib/git-info.js";
+import {
+	resolveClaudeAgentProcess,
+	scheduleLiveSessionFollower,
+} from "../../../lib/live-session-launch.js";
 import { getProjectOrgId } from "../../../lib/project-config.js";
 import {
 	getLegacyRepositoryKeys,
@@ -23,6 +27,8 @@ interface SessionStartInput {
 	readonly cwd: string;
 	readonly session_id: string;
 	readonly transcript_path: string;
+	/** `startup`, `resume`, `clear` or `compact`; absent in older Claude Code. */
+	readonly source?: unknown;
 }
 
 async function readStdin(): Promise<string> {
@@ -41,7 +47,6 @@ async function runSessionStart(): Promise<undefined> {
 		if (!raw.trim()) return;
 		const input: unknown = JSON.parse(raw);
 		if (!isSessionStartInput(input)) return;
-		if (readRepositoryEvidencePauseUntil() !== undefined) return;
 		// A chat linked by `opaline import --analysis` (for example a resumed
 		// session) captures no repository evidence while the link is live, as
 		// in the SessionEnd and Codex turn-complete hooks.
@@ -82,6 +87,25 @@ async function runSessionStart(): Promise<undefined> {
 			);
 			return;
 		}
+		// Live updates are independent of repository evidence: its pause must
+		// not stop them, and they must not delay or change the capture below.
+		await scheduleLiveSessionFollower({
+			credentials,
+			cwd: input.cwd,
+			hookSource:
+				typeof input.source === "string" &&
+				/^[a-z_-]{1,32}$/u.test(input.source)
+					? input.source
+					: undefined,
+			onInfo: (message) => logger.info("{message}", { message }),
+			onWarning: (warning) => logger.warn("{warning}", { warning }),
+			organizationId,
+			resolveAgent: resolveClaudeAgentProcess,
+			sessionId: input.session_id,
+			source: "claude_code",
+			transcriptPath: input.transcript_path,
+		});
+		if (readRepositoryEvidencePauseUntil() !== undefined) return;
 		let transcriptExists = true;
 		try {
 			await stat(input.transcript_path);

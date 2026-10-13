@@ -38,7 +38,10 @@ export async function runCli(
 		}
 	}
 	debugLog("starting command", { command: commandName, version: pkg.version });
-	await initializeR2StagingCleanup();
+	// The live session follower stages nothing and runs for the whole agent
+	// session: it neither scavenges other processes' staging directories nor
+	// installs their signal handlers.
+	if (!isLiveFollowCommand(commandArgs)) await initializeR2StagingCleanup();
 	try {
 		if (
 			commandName !== "doctor" &&
@@ -64,6 +67,10 @@ export async function runCli(
 			exitCode: process.exitCode ?? 0,
 		});
 	}
+}
+
+function isLiveFollowCommand(args: readonly string[]): boolean {
+	return args[0] === "hooks" && args[1] === "live-follow";
 }
 
 function getTopLevelCommandName(args: readonly string[]) {

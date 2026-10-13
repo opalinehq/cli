@@ -24,6 +24,10 @@ import {
 	reconcilePendingUploadsInHook,
 	reportHookUploadFailure,
 } from "../../../lib/hook-upload-failure.js";
+import {
+	scheduleCodexLiveSession,
+	startCodexAgentLookup,
+} from "../../../lib/live-session-launch.js";
 import { getProjectOrgId } from "../../../lib/project-config.js";
 import {
 	getLegacyRepositoryKeys,
@@ -69,6 +73,8 @@ async function runTurnComplete(
 	// A custom notifier may call the Opaline/Rudel alias itself. Forwarding must
 	// not recursively upload the same turn. This marker exists only in the child.
 	if (process.env.OPALINE_CODEX_NOTIFY_FORWARDED === "1") return;
+	// Before anything else: `codex exec` may exit right after starting us.
+	const codexAgent = startCodexAgentLookup();
 	const forwarded = flags.previousNotify
 		? forwardNotification(flags.previousNotify, notification)
 		: Promise.resolve();
@@ -159,6 +165,18 @@ async function runTurnComplete(
 		const request = inferred
 			? withSessionRepository(builtRequest, inferred.gitInfo)
 			: builtRequest;
+		// Live updates of this thread from now on; runs alongside the upload.
+		const liveRegistration = organizationId
+			? scheduleCodexLiveSession({
+					agent: codexAgent,
+					credentials,
+					cwd: input.cwd,
+					onWarning: (warning) => logger.warn("{warning}", { warning }),
+					organizationId,
+					threadId: input.threadId,
+					transcriptPath,
+				})
+			: Promise.resolve();
 		const evidenceUpload = organizationId
 			? captureAndUploadSessionEvidence({
 					credentials,
@@ -199,7 +217,7 @@ async function runTurnComplete(
 			authType: credentials.authType,
 			r2StatusMaxPolls: HOOK_R2_STATUS_MAX_POLLS,
 		});
-		await Promise.all([evidenceUpload, reconciliation]);
+		await Promise.all([evidenceUpload, reconciliation, liveRegistration]);
 
 		if (result.success) {
 			const redactionSummary = formatRedactionSummary(

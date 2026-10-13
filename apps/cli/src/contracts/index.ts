@@ -23,6 +23,23 @@ export {
 	SESSION_UPLOAD_SHRINK_REJECTED_CODE,
 } from "./ingest.js";
 export {
+	LIVE_SESSION_MAX_LINE_BYTES,
+	LIVE_SESSION_MAX_LINES_PER_STREAM,
+	LIVE_SESSION_MAX_REQUEST_LINE_BYTES,
+	LIVE_SESSION_MAX_REQUEST_LINES,
+	LIVE_SESSION_MAX_STREAMS_PER_REQUEST,
+	LIVE_SESSION_PROTOCOL,
+	LIVE_SESSIONS_DISABLED_CODE,
+	type LiveSessionAppendInput,
+	LiveSessionAppendInputSchema,
+	type LiveSessionAppendOutput,
+	LiveSessionAppendOutputSchema,
+	type LiveSessionAppendStream,
+	type LiveSessionStateOutput,
+	LiveSessionStateOutputSchema,
+	type LiveSessionStreamState,
+} from "./live-session.js";
+export {
 	PRODUCT_ANALYTICS_EVENT_VERSION,
 	PRODUCT_ANALYTICS_EVENTS,
 	type ProductAnalyticsEventName,

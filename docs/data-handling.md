@@ -10,6 +10,8 @@ Enable uploads only for projects and environments where that data may be sent to
 
 Choose repositories in the CLI, review your selection, and confirm. Automatic uploads are enabled for the selected repositories. Turning a repository OFF stops future uploads; it does not delete sessions already uploaded, and hooks already uploading may finish.
 
+Transcripts are also sent while sessions run (live updates). The Claude Code session-start hook and the Codex turn-complete notification register the session under `live-sessions/sessions/` in the CLI's config directory. One background process per machine then sends each new complete line of the main transcript and its sub-agent transcripts (Claude Code subagents, Codex sub-agent threads) within a few seconds. Live updates use the same repository allowlist, workspace binding and credentials as session uploads and need an ingest API key. Only transcripts inside the agent's own transcript directory are read (`~/.claude/projects` or `$CLAUDE_CONFIG_DIR/projects`, `~/.codex/sessions` or `$CODEX_HOME/sessions`), as regular files: symbolic links and special files are skipped. The background process rereads credentials, pauses and repository settings as soon as those files change (and every minute), and checks the server's live-update capability every minute, so turning a repository OFF or logging out stops live updates within seconds. A session's live updates end when its agent process exits (Claude Code: `CLAUDE_PID`; Codex: the `codex` process that ran the notification). If that process cannot be identified, they end once the transcript has been idle for 10 minutes (Claude Code) or 30 minutes (Codex). They also end when a Codex thread has been idle for 6 hours, after seven days, or when the server pauses live updates. A server pause is stored in `live-sessions/paused.json` until it expires. Set `OPALINE_LIVE_SESSIONS=0` to turn live updates off on one machine. The regular session uploads are unchanged and remain the complete record.
+
 ## Known-secret filtering
 
 Before upload, the CLI applies deterministic filtering for known secret patterns to both the main transcript and sub-agent transcripts. The Opaline server applies the same filter again before storage.
@@ -31,11 +33,15 @@ Matching works inside JSON-escaped transcript text at any nesting depth, includi
 
 Safety limits stop an upload when filtering cannot preserve transcript integrity, cannot converge, or redacts an unexpectedly large portion of the payload. They cannot prove that the remaining transcript is free of secrets. Treat filtering as an additional safeguard, not a substitute for keeping sensitive data out of sessions.
 
+Live updates filter each transcript line on its own before it leaves the machine, then slim it like an upload (inline images become a marker). Filtering lines one at a time gives the same result as filtering the whole file. A line that cannot be filtered safely, that is larger than 8 MiB as written, or that is larger than 1 MiB after slimming is replaced by a marker naming only the reason and its size. Live updates stop if redaction exceeds the same safety ratio after the first 256 KiB. The server filters every live line again before storing it.
+
 ## Upload transport
 
 When the authenticated server advertises direct R2 ingest support, the CLI stages filtered transcript objects in private temporary files and sends them as bounded multipart uploads.
 
 Servers without that capability continue to receive the filtered legacy ingest request. Large file-backed requests fail locally rather than being materialized without a safe bound.
+
+Live updates send complete transcript lines in JSON requests of at most 1.5 MiB of lines (and about 3.5 MB once JSON-escaped) each to the same API, with the same endpoint checks as uploads. Reading pauses while about 2 MiB of lines across all sessions wait to be sent, so the transcript files act as the buffer. Live updates back off when the server is unavailable, busy or answers unexpectedly. A refused API key pauses them until the credentials change; a rejected session stops only that session. A transcript that keeps disagreeing with the server is retried with growing pauses and then no longer followed.
 
 The CLI defaults to `https://opaline.so`. Insecure login and upload overrides are documented in the [configuration reference](usage.md#configuration); they transmit credentials or transcripts without transport encryption.
 
