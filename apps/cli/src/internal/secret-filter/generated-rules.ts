@@ -3,23 +3,36 @@ import type { SecretRule } from "./types.js";
 export const GITLEAKS_VERSION = "v8.30.1";
 
 export const GENERATED_SECRET_RULES: readonly SecretRule[] = [
+	// Local regex override applied from scripts/ruleset-config.ts.
 	{
 		id: "anthropic-admin-api-key",
 		sourceId: "anthropic-admin-api-key",
-		regexSource:
-			"\\b(sk-ant-admin01-[a-zA-Z0-9_\\-]{93}AA)(?:[\\x60'\"\\s;]|\\\\[nr]|$)",
+		regexSource: "\\b(sk-ant-admin\\d{2}-[A-Za-z0-9_-]{32,})",
 		caseInsensitive: false,
 		secretGroup: 1,
 		allowlistRegexSources: [],
+		keywords: ["sk-ant-admin"],
 	},
+	// Local regex override applied from scripts/ruleset-config.ts.
 	{
 		id: "anthropic-api-key",
 		sourceId: "anthropic-api-key",
-		regexSource:
-			"\\b(sk-ant-api03-[a-zA-Z0-9_\\-]{93}AA)(?:[\\x60'\"\\s;]|\\\\[nr]|$)",
+		regexSource: "\\b(sk-ant-(?:api|oat|ort|sid)\\d{2}-[A-Za-z0-9_-]{32,})",
 		caseInsensitive: false,
 		secretGroup: 1,
 		allowlistRegexSources: [],
+		keywords: ["sk-ant-"],
+	},
+	// Local rule defined in scripts/ruleset-config.ts.
+	{
+		id: "aws-secret-access-key-pair",
+		sourceId: "opaline",
+		regexSource:
+			'(?:\\[REDACTED:aws-access-key-id(?::[0-9a-f]{1,64})?\\]|(?:AKIA|ASIA)[A-Z2-7]{16}(?![A-Za-z0-9]))(?:[\\s,;:|\'"=]|\\\\+"){1,8}((?=[A-Za-z0-9/+]{0,39}[a-z])(?=[A-Za-z0-9/+]{0,39}[A-Z])[A-Za-z0-9/+]{40})(?![A-Za-z0-9/+=])',
+		caseInsensitive: false,
+		secretGroup: 1,
+		allowlistRegexSources: ["EXAMPLE"],
+		keywords: ["akia", "asia", "[redacted:aws-access-key-id"],
 	},
 	{
 		id: "aws-access-key-id",
@@ -28,11 +41,23 @@ export const GENERATED_SECRET_RULES: readonly SecretRule[] = [
 		caseInsensitive: false,
 		secretGroup: 1,
 		allowlistRegexSources: [".+EXAMPLE$"],
+		keywords: ["a3t", "akia", "asia", "abia", "acca"],
+	},
+	// Local rule defined in scripts/ruleset-config.ts.
+	{
+		id: "aws-secret-access-key",
+		sourceId: "opaline",
+		regexSource:
+			"(?:aws[_.-]?secret(?:[_.-]?access)?[_.-]?key|secret[_. -]?access[_. -]?key)\\\\*[\"']?(?:[ \\t]*(?::=|=>|[:=])[ \\t]*|[ \\t]+)\\\\*[\"']?([A-Za-z0-9/+=]{16,128})(?![A-Za-z0-9/+=_-])",
+		caseInsensitive: true,
+		secretGroup: 1,
+		allowlistRegexSources: ["EXAMPLE"],
+		keywords: ["secret"],
 	},
 	{
 		id: "google-api-key",
 		sourceId: "gcp-api-key",
-		regexSource: "\\b(AIza[\\w-]{35})(?:[\\x60'\"\\s;]|\\\\[nr]|$)",
+		regexSource: "\\b(AIza[\\w-]{35})(?:[\\x60'\"\\s;]|\\\\|$)",
 		caseInsensitive: false,
 		secretGroup: 1,
 		allowlistRegexSources: [
@@ -53,6 +78,7 @@ export const GENERATED_SECRET_RULES: readonly SecretRule[] = [
 			"AIzaSyB8qGxt4ec15vitgn44duC5ucxaOi4FmqE",
 			"AIzaSyA8vmApnrHNFE0bApF4hoZ11srVL_n0nvY",
 		],
+		keywords: ["aiza"],
 	},
 	{
 		id: "github-app-token",
@@ -61,6 +87,7 @@ export const GENERATED_SECRET_RULES: readonly SecretRule[] = [
 		caseInsensitive: false,
 		secretGroup: 0,
 		allowlistRegexSources: [],
+		keywords: ["ghu_", "ghs_"],
 	},
 	{
 		id: "github-fine-grained-pat",
@@ -69,6 +96,7 @@ export const GENERATED_SECRET_RULES: readonly SecretRule[] = [
 		caseInsensitive: false,
 		secretGroup: 0,
 		allowlistRegexSources: [],
+		keywords: ["github_pat_"],
 	},
 	{
 		id: "github-oauth",
@@ -77,6 +105,7 @@ export const GENERATED_SECRET_RULES: readonly SecretRule[] = [
 		caseInsensitive: false,
 		secretGroup: 0,
 		allowlistRegexSources: [],
+		keywords: ["gho_"],
 	},
 	{
 		id: "github-pat",
@@ -85,6 +114,7 @@ export const GENERATED_SECRET_RULES: readonly SecretRule[] = [
 		caseInsensitive: false,
 		secretGroup: 0,
 		allowlistRegexSources: [],
+		keywords: ["ghp_"],
 	},
 	{
 		id: "gitlab-pat",
@@ -93,42 +123,69 @@ export const GENERATED_SECRET_RULES: readonly SecretRule[] = [
 		caseInsensitive: false,
 		secretGroup: 0,
 		allowlistRegexSources: [],
+		keywords: ["glpat-"],
+	},
+	// Local regex override applied from scripts/ruleset-config.ts.
+	{
+		id: "jwt",
+		sourceId: "jwt",
+		regexSource:
+			"\\b(eyJ[A-Za-z0-9_-]{15,}\\.eyJ[A-Za-z0-9_-]{15,}\\.[A-Za-z0-9_-]{16,})",
+		caseInsensitive: false,
+		secretGroup: 1,
+		allowlistRegexSources: [],
+		keywords: ["eyj"],
 	},
 	{
 		id: "npm-access-token",
 		sourceId: "npm-access-token",
-		regexSource: "\\b(npm_[a-z0-9]{36})(?:[\\x60'\"\\s;]|\\\\[nr]|$)",
+		regexSource: "\\b(npm_[a-z0-9]{36})(?:[\\x60'\"\\s;]|\\\\|$)",
 		caseInsensitive: true,
 		secretGroup: 1,
 		allowlistRegexSources: [],
+		keywords: ["npm_"],
 	},
+	// Local regex override applied from scripts/ruleset-config.ts.
 	{
 		id: "openai-api-key",
 		sourceId: "openai-api-key",
 		regexSource:
-			"\\b(sk-(?:proj|svcacct|admin)-(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})T3BlbkFJ(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})\\b|sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20})(?:[\\x60'\"\\s;]|\\\\[nr]|$)",
+			"\\b(sk-(?:proj|svcacct|admin|None)-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{32,}(?![A-Za-z0-9_-]))",
 		caseInsensitive: false,
 		secretGroup: 1,
 		allowlistRegexSources: [],
+		keywords: ["sk-"],
 	},
 	// Local regex override applied from scripts/ruleset-config.ts.
 	{
 		id: "private-key",
 		sourceId: "private-key",
 		regexSource:
-			"-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----(?:(?:[A-Za-z0-9+/=\\s-]|\\\\[nr]){64,}?KEY(?: BLOCK)?-----|(?:[A-Za-z0-9+/=\\s-]|\\\\[nr])+\\\\?$)",
+			"-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----(?:[A-Za-z0-9+/=\\s-]{64,}?KEY(?: BLOCK)?-----|[A-Za-z0-9+/=\\s-]+\\\\*$|\\s*[A-Za-z0-9+/=]{40,}(?:\\s+[A-Za-z0-9+/=]+)*\\s*(?=\\\\*[\"']))",
 		caseInsensitive: true,
 		secretGroup: 0,
 		allowlistRegexSources: [],
+		keywords: ["-----begin"],
+	},
+	// Local rule defined in scripts/ruleset-config.ts.
+	{
+		id: "private-key-fragment",
+		sourceId: "opaline",
+		regexSource:
+			"(?:^|[\"'\\s])([A-Za-z0-9+/]{64,}={0,2}(?:\\s+[A-Za-z0-9+/=]+)*\\s*-----END[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----)",
+		caseInsensitive: true,
+		secretGroup: 1,
+		allowlistRegexSources: [],
+		keywords: ["-----end"],
 	},
 	{
 		id: "sendgrid-api-token",
 		sourceId: "sendgrid-api-token",
-		regexSource:
-			"\\b(SG\\.[a-zA-Z0-9=_\\-\\.]{66})(?:[\\x60'\"\\s;]|\\\\[nr]|$)",
+		regexSource: "\\b(SG\\.[a-zA-Z0-9=_\\-\\.]{66})(?:[\\x60'\"\\s;]|\\\\|$)",
 		caseInsensitive: false,
 		secretGroup: 1,
 		allowlistRegexSources: [],
+		keywords: ["sg."],
 	},
 	{
 		id: "slack-bot-token",
@@ -137,6 +194,7 @@ export const GENERATED_SECRET_RULES: readonly SecretRule[] = [
 		caseInsensitive: false,
 		secretGroup: 0,
 		allowlistRegexSources: [],
+		keywords: ["xoxb"],
 	},
 	{
 		id: "slack-user-token",
@@ -145,6 +203,7 @@ export const GENERATED_SECRET_RULES: readonly SecretRule[] = [
 		caseInsensitive: false,
 		secretGroup: 0,
 		allowlistRegexSources: [],
+		keywords: ["xoxp-", "xoxe-"],
 	},
 	{
 		id: "slack-webhook-url",
@@ -154,15 +213,24 @@ export const GENERATED_SECRET_RULES: readonly SecretRule[] = [
 		caseInsensitive: false,
 		secretGroup: 0,
 		allowlistRegexSources: [],
+		keywords: ["hooks"],
 	},
 	{
 		id: "stripe-access-token",
 		sourceId: "stripe-access-token",
 		regexSource:
-			"\\b((?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99})(?:[\\x60'\"\\s;]|\\\\[nr]|$)",
+			"\\b((?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99})(?:[\\x60'\"\\s;]|\\\\|$)",
 		caseInsensitive: false,
 		secretGroup: 1,
 		allowlistRegexSources: [],
+		keywords: [
+			"sk_test",
+			"sk_live",
+			"sk_prod",
+			"rk_test",
+			"rk_live",
+			"rk_prod",
+		],
 	},
 	{
 		id: "twilio-api-key",
@@ -171,5 +239,31 @@ export const GENERATED_SECRET_RULES: readonly SecretRule[] = [
 		caseInsensitive: false,
 		secretGroup: 0,
 		allowlistRegexSources: [],
+		keywords: ["sk"],
+	},
+	// Local rule defined in scripts/ruleset-config.ts.
+	{
+		id: "connection-string-password",
+		sourceId: "opaline",
+		regexSource: ":\\/\\/[^\\s:/?#@\"'\\\\]{0,256}:([^\\s/?#\"'\\\\]{1,256})@",
+		caseInsensitive: true,
+		secretGroup: 1,
+		allowlistRegexSources: [
+			"^(?:[$<{[(*|^\\])]|%[sd(])",
+			"^(?:x+|\\.\\.\\.|\\u2026)$",
+			"^(?:your|my)?[_-]?(?:db[_-]?)?(?:pass(?:word|wd)?|pwd|pw|secret|token|changeme|changeit|example|placeholder|redacted|test|postgres|mysql|root|admin|guest|default|user)$",
+		],
+		keywords: ["://"],
+	},
+	// Local rule defined in scripts/ruleset-config.ts.
+	{
+		id: "authorization-header",
+		sourceId: "opaline",
+		regexSource:
+			"authorization\\\\*[\"']?(?:[ \\t]*(?::=|=>|[:=])[ \\t]*|[ \\t]+)\\\\*[\"']?(?:bearer|token|basic)[ \\t]+([\\w.~+/=-]{16,})",
+		caseInsensitive: true,
+		secretGroup: 1,
+		allowlistRegexSources: ["^(?:(?:your|my)[_-]|x+$)"],
+		keywords: ["authorization"],
 	},
 ];

@@ -17,6 +17,7 @@ import {
 } from "../index.js";
 import {
 	CANONICAL_SECRETS,
+	CONTEXTUAL_SECRETS,
 	DELIMITER_ANCHORED_RULE_IDS,
 	PRESERVED_CORPUS,
 } from "./helpers/rule-corpus.js";
@@ -566,8 +567,8 @@ describe("multi-byte accounting", () => {
 
 describe("known gap: rules anchored on a trailing delimiter", () => {
 	/**
-	 * Seven rules require the secret to be followed by a backtick, quote,
-	 * whitespace, semicolon, an escaped newline, or end-of-string. Ordinary
+	 * Four rules require the secret to be followed by a backtick, quote,
+	 * whitespace, semicolon, a backslash (a JSON escape), or end-of-string. Ordinary
 	 * punctuation does not qualify, so these secrets survive every pass. The
 	 * fixpoint loop cannot help: nothing matches on any pass, so there is no
 	 * marker to create the delimiter. Closing this needs a ruleset change.
@@ -615,7 +616,7 @@ describe("filter provenance", () => {
 	 * this constant.
 	 */
 	const OUTPUT_FINGERPRINT =
-		"65e401d93304a6614b1614a7b7170e94984e86cb21cf2e3b1d2aaf7adf9230bb";
+		"b93afeb9934e27d4f7608deeb2996ff53ba02fd5bdaac2cf7e40e8432d648792";
 
 	test("output fingerprint matches the declared FILTER_VERSION", () => {
 		const corpus = [
@@ -625,6 +626,10 @@ describe("filter provenance", () => {
 			),
 			...CANARY_IDS.map((id) => `k="${getCanary(id)}", next=1`),
 			JSON.stringify({ key: getCanary("private-key") }),
+			...CONTEXTUAL_SECRETS.map(({ input }) => input),
+			...CONTEXTUAL_SECRETS.map(({ input }) => JSON.stringify({ input })),
+			JSON.stringify({ c: `\n${getCanary("aws-access-key-id")}` }),
+			JSON.stringify({ c: JSON.stringify({ k: `${getCanary("jwt")}\n` }) }),
 			`xoxb-1234567890-1234567890-${"A".repeat(
 				OVERLONG_MATCH_THRESHOLD_BYTES,
 			)}`,
@@ -638,7 +643,7 @@ describe("filter provenance", () => {
 			);
 		}
 
-		expect(FILTER_VERSION).toBe(6);
+		expect(FILTER_VERSION).toBe(7);
 		expect(digest.digest("hex")).toBe(OUTPUT_FINGERPRINT);
 	});
 });

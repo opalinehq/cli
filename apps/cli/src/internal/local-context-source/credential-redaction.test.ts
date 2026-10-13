@@ -22,7 +22,9 @@ describe("credential text redaction", () => {
 		],
 		[`run --token ${OPAQUE} --region eu`, "credential-flag"],
 		[`run --client-secret "${OPAQUE}"`, "credential-flag"],
-		[`curl -H "Authorization: Bearer ${OPAQUE}"`, "authorization-value"],
+		// The known-secret filter runs first and owns the Authorization header.
+		[`curl -H "Authorization: Bearer ${OPAQUE}"`, "authorization-header"],
+		[`curl -H "X-Auth: Bearer ${OPAQUE}"`, "authorization-value"],
 		[
 			`DATABASE_URL=postgres://app:${OPAQUE}@db.internal:5432/app`,
 			"connection-string-password",

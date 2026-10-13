@@ -7,6 +7,11 @@ export interface SecretRule {
 	readonly caseInsensitive: boolean;
 	readonly secretGroup: number;
 	readonly allowlistRegexSources: readonly string[];
+	/**
+	 * Lowercase literals of which at least one occurs, ignoring case, in every
+	 * match. Text containing none of them skips the rule.
+	 */
+	readonly keywords?: readonly string[];
 }
 
 export interface SecretFilterResult {
