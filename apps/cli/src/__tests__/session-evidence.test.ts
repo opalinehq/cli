@@ -346,6 +346,9 @@ test("carries a Claude session's task outputs, and a capture that must continue 
 				credentials,
 				hookReceivedAt: new Date().toISOString(),
 				lifecycle: requireDeliveredTranscript ? "checkpoint" : "end",
+				...(requireDeliveredTranscript
+					? { captureReason: "task-output-sweep" as const }
+					: {}),
 				organizationId: "org",
 				request: {
 					kind: "file",
@@ -378,6 +381,8 @@ test("carries a Claude session's task outputs, and a capture that must continue 
 		const delivered = stub.committed.get(first.contextId);
 		assert(delivered);
 		const localContext = delivered.manifest.localContext;
+		// A capture at the session's own time carries no reason.
+		expect(localContext.captureReason).toBeUndefined();
 		expect(localContext.taskOutputReferences).toEqual({
 			references: [
 				{
@@ -429,6 +434,9 @@ test("carries a Claude session's task outputs, and a capture that must continue 
 			),
 		).toEqual([]);
 		expect(continued.input.capture.timing.lifecycle).toBe("checkpoint");
+		expect(continued.manifest.localContext.captureReason).toBe(
+			"task-output-sweep",
+		);
 	} finally {
 		stub.stop();
 		for (const [key, value] of [

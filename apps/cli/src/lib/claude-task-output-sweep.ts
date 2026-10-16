@@ -310,6 +310,7 @@ async function sweepSession(
 	try {
 		await input.capture({
 			backgroundDelivery: "none",
+			captureReason: "task-output-sweep",
 			credentials: input.credentials,
 			hookReceivedAt: new Date().toISOString(),
 			lifecycle: "checkpoint",

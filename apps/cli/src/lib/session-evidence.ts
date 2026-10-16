@@ -10,6 +10,7 @@ import type {
 	FileBackedUploadRequest,
 	FileBackedUploadSubagentDiscovery,
 } from "../internal/agent-adapters/index.js";
+import type { CaptureReason } from "../internal/local-context-source/index.js";
 import { getRedactionBudgetAnomaly } from "../internal/secret-filter/index.js";
 import { getApiBaseOverride } from "./api-target.js";
 import {
@@ -149,6 +150,8 @@ export async function captureAndUploadSessionEvidence(input: {
 	 * TranscriptNotDeliveredError before anything is spooled.
 	 */
 	readonly requireDeliveredTranscript?: boolean;
+	/** Recorded in the manifest for a capture taken outside the hooks. */
+	readonly captureReason?: CaptureReason;
 }): Promise<
 	{ readonly contextId: string; readonly receiptId: string } | undefined
 > {
@@ -210,6 +213,7 @@ export async function captureAndUploadSessionEvidence(input: {
 			deadlineAt: captureDeadlineAt,
 			observedSkillNames: extractObservedSkills(request),
 			runtime: await collectCaptureRuntime(request.content, request.source),
+			captureReason: input.captureReason,
 			...(toolResultsDirectory === null
 				? {}
 				: {

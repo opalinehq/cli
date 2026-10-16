@@ -24,6 +24,7 @@ export type {
 	BoundedHashResult,
 	BoundedReadResult,
 	CaptureConsistency,
+	CaptureReason,
 	CaptureRuntime,
 	ContextBlob,
 	ContextDocumentIndex,

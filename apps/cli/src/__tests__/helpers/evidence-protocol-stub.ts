@@ -93,6 +93,7 @@ export interface CommittedManifest {
 		readonly userConfiguration?: UserAgentConfiguration;
 		readonly toolResultReferences?: ToolResultReferences;
 		readonly taskOutputReferences?: TaskOutputReferences;
+		readonly captureReason?: string;
 		readonly runtime?: CaptureRuntime;
 	};
 	readonly contextIndex: {

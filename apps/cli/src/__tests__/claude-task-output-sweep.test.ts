@@ -152,6 +152,7 @@ describe("one-time sweep of earlier sessions' task outputs", () => {
 		const [call] = machine.calls;
 		expect(call).toMatchObject({
 			backgroundDelivery: "none",
+			captureReason: "task-output-sweep",
 			lifecycle: "checkpoint",
 			organizationId: "org",
 			requireDeliveredTranscript: true,

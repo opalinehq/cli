@@ -689,6 +689,13 @@ export interface LocalContextManifest {
 	 * file was not on disk at capture time.
 	 */
 	readonly taskOutputReferences?: TaskOutputReferences;
+	/**
+	 * Why a capture was taken outside the session's own hooks. Absent for a
+	 * capture taken at the session's own time; `task-output-sweep` for the
+	 * one-time capture of an earlier session's task outputs, whose repository
+	 * and user context are from the time of the sweep.
+	 */
+	readonly captureReason?: CaptureReason;
 	/** Tool and agent versions on the capturing machine. */
 	readonly runtime?: CaptureRuntime;
 	readonly transport: {
@@ -801,6 +808,8 @@ export interface ToolResultReferences {
 	/** References beyond the manifest's bound that were not listed. */
 	readonly omitted: number;
 }
+
+export type CaptureReason = "task-output-sweep";
 
 export interface TaskOutputReference {
 	/** Claude Code's id of the background task (Bash, Monitor or agent). */
