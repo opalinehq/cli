@@ -17,6 +17,11 @@ import {
 	loadAutoUploadConfig,
 } from "./auto-upload-config.js";
 import {
+	isClaudeTaskOutputSweepDue,
+	TranscriptNotDeliveredError,
+} from "./claude-task-output-sweep.js";
+import { collectClaudeTaskOutputReferences } from "./claude-task-outputs.js";
+import {
 	findToolResultReferences,
 	getClaudeToolResultsDirectory,
 } from "./claude-tool-results.js";
@@ -138,6 +143,12 @@ export async function captureAndUploadSessionEvidence(input: {
 	 * leave spooled captures to the next hook or `upload --retry`.
 	 */
 	readonly backgroundDelivery?: "spawn" | "none";
+	/**
+	 * Capture only a session whose transcript continues a delivered revision,
+	 * so no delivered transcript byte is sent again; otherwise throw
+	 * TranscriptNotDeliveredError before anything is spooled.
+	 */
+	readonly requireDeliveredTranscript?: boolean;
 }): Promise<
 	{ readonly contextId: string; readonly receiptId: string } | undefined
 > {
@@ -166,14 +177,30 @@ export async function captureAndUploadSessionEvidence(input: {
 		| Awaited<ReturnType<typeof collectSessionRepositoryContext>>
 		| undefined;
 	try {
-		const toolResultsDirectory =
+		const claudeTranscriptPath =
 			request.source === "claude_code" &&
 			isFileBackedEvidenceRequest(input.request)
-				? getClaudeToolResultsDirectory(
-						input.request.transcriptPath,
-						request.sessionId,
-					)
+				? input.request.transcriptPath
 				: null;
+		const toolResultsDirectory =
+			claudeTranscriptPath === null
+				? null
+				: getClaudeToolResultsDirectory(
+						claudeTranscriptPath,
+						request.sessionId,
+					);
+		const streams = materialized.streams.map((stream) => ({
+			agentId: stream.declaredAgentId,
+			content: stream.content,
+		}));
+		const taskOutputs =
+			claudeTranscriptPath === null
+				? null
+				: await collectClaudeTaskOutputReferences({
+						sessionId: request.sessionId,
+						streams,
+						transcriptPath: claudeTranscriptPath,
+					});
 		contextCapture = await collectSessionRepositoryContext({
 			accountId: user.id,
 			endpoint,
@@ -189,16 +216,18 @@ export async function captureAndUploadSessionEvidence(input: {
 						toolResults: {
 							directory: toolResultsDirectory,
 							references: findToolResultReferences(
-								materialized.streams.map((stream) => ({
-									agentId: stream.declaredAgentId,
-									content: stream.content,
-								})),
+								streams,
 								toolResultsDirectory,
 							),
 							// Saved outputs get the transcript's slimming before the
 							// secret filter, like the records that reference them.
 							transformText: slimTranscriptText,
 						},
+					}),
+			...(taskOutputs === null
+				? {}
+				: {
+						taskOutputs: { ...taskOutputs, transformText: slimTranscriptText },
 					}),
 		});
 		const scope = {
@@ -228,6 +257,11 @@ export async function captureAndUploadSessionEvidence(input: {
 			scope,
 			terminal: input.terminalTranscript,
 		});
+		if (
+			input.requireDeliveredTranscript &&
+			(previous === undefined || transcriptRevision.resetReason !== null)
+		)
+			throw new TranscriptNotDeliveredError(request.sessionId);
 		const firstActionAt = findFirstTranscriptTimestamp(request.content);
 		const timing = getFirstActionTiming(
 			input.lifecycle,
@@ -672,7 +706,11 @@ async function scheduleBackgroundEvidenceDelivery(
 ): Promise<boolean> {
 	if (readRepositoryEvidencePauseUntil(configDir) !== undefined) return false;
 	// A cheap header peek: the deliverer applies the full eligibility checks.
-	if (!(await hasDuePendingRepositoryEvidence(configDir, actorId, endpoint)))
+	// It also runs the one-time sweep of earlier sessions' task outputs.
+	if (
+		!(await hasDuePendingRepositoryEvidence(configDir, actorId, endpoint)) &&
+		!(await isClaudeTaskOutputSweepDue(configDir))
+	)
 		return false;
 	try {
 		spawnBackgroundEvidenceDelivery();

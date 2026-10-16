@@ -23,6 +23,7 @@ import {
 	getLocalContextBundleExternalObjectIds,
 	type LocalContextBundle,
 	serializeLocalContextBundle,
+	type TaskOutputReferences,
 	type ToolResultReferences,
 } from "../internal/local-context-source/index.js";
 import { loadCredentials } from "./credentials.js";
@@ -160,6 +161,12 @@ export async function collectSessionRepositoryContext(input: {
 		readonly references: ToolResultReferences;
 		readonly transformText: (text: string) => string;
 	};
+	/** Claude Code session artifacts: output files of background tasks. */
+	readonly taskOutputs?: {
+		readonly directory: string;
+		readonly references: TaskOutputReferences;
+		readonly transformText: (text: string) => string;
+	};
 	readonly runtime?: CaptureRuntime;
 }): Promise<SessionRepositoryContextCapture> {
 	const resolvedContext = await resolveRepositoryContext(input.repositoryPath);
@@ -208,6 +215,7 @@ export async function collectSessionRepositoryContext(input: {
 		repositoryRoot: context.repositoryRoot,
 		sources: userSources,
 		toolResultsDirectory: input.toolResults?.directory ?? null,
+		taskOutputsDirectory: input.taskOutputs?.directory ?? null,
 	});
 	const safeRoots = await resolveSafeAdditionalRoots(
 		additionalRoots,
@@ -247,7 +255,10 @@ export async function collectSessionRepositoryContext(input: {
 			},
 			parentCapture,
 			forbiddenSymlinkTargets: [configBoundary.canonicalConfigDir],
-			transformToolResultText: input.toolResults?.transformText,
+			// One transform for both: the session-evidence capture passes the
+			// transcript's slimming to each.
+			transformToolResultText:
+				input.toolResults?.transformText ?? input.taskOutputs?.transformText,
 		},
 		createLocalContextSourceEnv(input.deadlineAt),
 	);
@@ -261,6 +272,9 @@ export async function collectSessionRepositoryContext(input: {
 			...(input.toolResults === undefined
 				? {}
 				: { toolResultReferences: input.toolResults.references }),
+			...(input.taskOutputs === undefined
+				? {}
+				: { taskOutputReferences: input.taskOutputs.references }),
 			...(input.runtime === undefined ? {} : { runtime: input.runtime }),
 		},
 	};

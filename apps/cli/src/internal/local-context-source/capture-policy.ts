@@ -44,6 +44,14 @@ export const PLUGIN_SUPPORT_CAP_DETAIL = "plugin-support-budget";
 export const SESSION_TOOL_RESULT_MAX_FILE_BYTES = 2 * 1024 * 1024;
 export const SESSION_TOOL_RESULT_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
 export const SESSION_TOOL_RESULT_MAX_FILES = 256;
+// Output files of the session's background Bash commands and Monitor tools.
+// Most are a few KiB; dev-server and CI-watch logs can grow without bound, so
+// a larger one keeps its last 256 KiB (a few thousand lines, where the errors
+// are). 16 such logs fill the pool, and the pool's 4 MiB is about 3% of the
+// 128 MiB evidence aggregate the transcript shares with the context bundle.
+export const SESSION_TASK_OUTPUT_MAX_FILE_BYTES = 256 * 1024;
+export const SESSION_TASK_OUTPUT_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
+export const SESSION_TASK_OUTPUT_MAX_FILES = 256;
 
 export const CLAUDE_USER_HOME_ROOT_ID = "claude-user-home";
 export const CODEX_USER_HOME_ROOT_ID = "codex-user-home";
@@ -51,6 +59,7 @@ export const CLAUDE_PLUGINS_ROOT_ID = "claude-plugins";
 export const CODEX_PLUGINS_ROOT_ID = "codex-plugins";
 export const CLAUDE_PROJECT_MEMORY_ROOT_ID = "claude-project-memory";
 export const CLAUDE_TOOL_RESULTS_ROOT_ID = "claude-tool-results";
+export const CLAUDE_TASK_OUTPUTS_ROOT_ID = "claude-task-outputs";
 /** User-level Claude Code directories captured in full from ~/.claude. */
 export const CLAUDE_USER_EXTENSION_DIRECTORIES = [
 	"agents",
@@ -245,6 +254,11 @@ export function isObservedPlugin(
 /** Claude Code's saved large tool outputs of the captured session. */
 export function isSessionToolResult(rootId: string): boolean {
 	return rootId === CLAUDE_TOOL_RESULTS_ROOT_ID;
+}
+
+/** Output files of the captured session's background tasks. */
+export function isSessionTaskOutput(rootId: string): boolean {
+	return rootId === CLAUDE_TASK_OUTPUTS_ROOT_ID;
 }
 
 /**

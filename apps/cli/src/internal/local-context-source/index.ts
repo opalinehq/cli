@@ -74,6 +74,8 @@ export type {
 	ParentCaptureReference,
 	RootCoverage,
 	SecretFilterMetadata,
+	TaskOutputReference,
+	TaskOutputReferences,
 	ToolResultReference,
 	ToolResultReferences,
 	UserAgentConfiguration,

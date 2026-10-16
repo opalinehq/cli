@@ -10,6 +10,7 @@ import type {
 	LocalContextFileSystem,
 	LocalContextGitRunner,
 	LocalContextSourceEnv,
+	TailReadResult,
 } from "./types.js";
 
 const HASH_CHUNK_BYTES = 1024 * 1024;
@@ -48,6 +49,7 @@ export function createNodeFileSystem(
 		readDirectory: (path, maxEntries) =>
 			getDirectoryEntries(path, maxEntries, deadlineAt),
 		readFileBounded: withDeadline(readFileBounded, deadlineAt),
+		readFileTail: withDeadline(readFileTail, deadlineAt),
 		hashFileBounded: withDeadline(hashFileBounded, deadlineAt),
 		readLink: withDeadline((path: string) => readlink(path), deadlineAt),
 	};
@@ -145,6 +147,36 @@ async function readFileBounded(
 		return {
 			bytes: Uint8Array.from(buffer.subarray(0, Math.min(offset, maxBytes))),
 			complete,
+		};
+	} finally {
+		await handle.close();
+	}
+}
+
+/** The last `maxBytes` bytes of a file that may still be growing. */
+async function readFileTail(
+	path: string,
+	maxBytes: number,
+): Promise<TailReadResult> {
+	const handle = await open(path, "r");
+	try {
+		const fileBytes = (await handle.stat()).size;
+		const start = Math.max(0, fileBytes - maxBytes);
+		const buffer = Buffer.alloc(fileBytes - start);
+		let offset = 0;
+		while (offset < buffer.byteLength) {
+			const result = await handle.read(
+				buffer,
+				offset,
+				buffer.byteLength - offset,
+				start + offset,
+			);
+			if (result.bytesRead === 0) break;
+			offset += result.bytesRead;
+		}
+		return {
+			bytes: Uint8Array.from(buffer.subarray(0, offset)),
+			fileBytes,
 		};
 	} finally {
 		await handle.close();
