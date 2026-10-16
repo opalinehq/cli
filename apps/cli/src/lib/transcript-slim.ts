@@ -117,10 +117,25 @@ function mayNeedStructuralSlimming(text: string): boolean {
 // identical input lines must produce identical bytes, so the API's own pass is
 // a no-op on CLI-slimmed uploads. Keep the two in lockstep.
 
+interface ImageReplacement {
+	readonly marker: string;
+	readonly mediaType: string;
+	/** The base64 payload (for a data URL, the part after `base64,`). */
+	readonly payload: string;
+}
+
 interface ImageReplacements {
 	/** Whole data URLs, replaced before bare payloads that they may contain. */
-	readonly dataUrls: Map<string, string>;
-	readonly payloads: Map<string, string>;
+	readonly dataUrls: Map<string, ImageReplacement>;
+	readonly payloads: Map<string, ImageReplacement>;
+}
+
+/** An inline image that slimming replaces with its marker. */
+export interface InlineImage {
+	/** Hex SHA-256 of the decoded bytes, as in the marker. */
+	readonly sha256: string;
+	readonly mediaType: string;
+	readonly bytes: Uint8Array;
 }
 
 /**
@@ -130,12 +145,58 @@ interface ImageReplacements {
  * do not parse, or would not parse afterwards, are returned unchanged.
  */
 export function stripInlineImagesFromLine(line: string): string {
-	if (!mayContainInlineImage(line)) return line;
+	return replaceInlineImages(line)?.text ?? line;
+}
+
+/**
+ * The images `stripInlineImagesFromLine` replaces in this line, each once, in
+ * the order their markers first appear: exactly those whose marker is in the
+ * stripped line, with the decoded bytes the marker's hash covers.
+ */
+export function extractInlineImagesFromLine(
+	line: string,
+): readonly InlineImage[] {
+	const replaced = replaceInlineImages(line);
+	if (replaced === undefined) return [];
+	const images: { readonly index: number; readonly image: InlineImage }[] = [];
+	const seen = new Set<string>();
+	for (const group of [
+		replaced.replacements.dataUrls,
+		replaced.replacements.payloads,
+	]) {
+		for (const replacement of group.values()) {
+			if (seen.has(replacement.marker)) continue;
+			const index = replaced.text.indexOf(replacement.marker);
+			if (index < 0) continue;
+			seen.add(replacement.marker);
+			const bytes = new Uint8Array(Buffer.from(replacement.payload, "base64"));
+			images.push({
+				index,
+				image: {
+					sha256: createHash("sha256").update(bytes).digest("hex"),
+					mediaType: replacement.mediaType,
+					bytes,
+				},
+			});
+		}
+	}
+	return images
+		.sort((left, right) => left.index - right.index)
+		.map((item) => item.image);
+}
+
+function replaceInlineImages(line: string):
+	| {
+			readonly text: string;
+			readonly replacements: ImageReplacements;
+	  }
+	| undefined {
+	if (!mayContainInlineImage(line)) return undefined;
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(line);
 	} catch {
-		return line;
+		return undefined;
 	}
 	const replacements: ImageReplacements = {
 		dataUrls: new Map(),
@@ -144,17 +205,17 @@ export function stripInlineImagesFromLine(line: string): string {
 	collectImageReplacements(parsed, replacements, 0);
 	let text = line;
 	for (const group of [replacements.dataUrls, replacements.payloads]) {
-		for (const [payload, marker] of group) {
-			text = replaceDelimitedOccurrences(text, payload, marker);
+		for (const [payload, replacement] of group) {
+			text = replaceDelimitedOccurrences(text, payload, replacement.marker);
 		}
 	}
-	if (text === line) return line;
+	if (text === line) return undefined;
 	try {
 		JSON.parse(text);
 	} catch {
-		return line;
+		return undefined;
 	}
-	return text;
+	return { text, replacements };
 }
 
 function collectImageReplacements(
@@ -224,7 +285,7 @@ function addDataUrl(value: string, replacements: ImageReplacements): void {
 	const mediaType = match?.[1];
 	const payload = match?.[2];
 	if (!mediaType || !payload || payload.length % 4 !== 0) return;
-	replacements.dataUrls.set(value, createImageMarker(payload, mediaType));
+	replacements.dataUrls.set(value, createImageReplacement(payload, mediaType));
 }
 
 function addImagePayload(
@@ -242,11 +303,21 @@ function addImagePayload(
 	) {
 		return;
 	}
-	replacements.payloads.set(payload, createImageMarker(payload, mediaType));
+	replacements.payloads.set(
+		payload,
+		createImageReplacement(payload, mediaType),
+	);
 }
 
-function createImageMarker(payload: string, mediaType: string): string {
-	return formatInlineImageMarker(Buffer.from(payload, "base64"), mediaType);
+function createImageReplacement(
+	payload: string,
+	mediaType: string,
+): ImageReplacement {
+	return {
+		marker: formatInlineImageMarker(Buffer.from(payload, "base64"), mediaType),
+		mediaType,
+		payload,
+	};
 }
 
 /**

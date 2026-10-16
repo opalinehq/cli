@@ -6,6 +6,20 @@ export const REPOSITORY_EVIDENCE_PART_SIZE_BYTES = 8 * 1024 * 1024;
 export const REPOSITORY_EVIDENCE_MAX_OBJECT_BYTES = 64 * 1024 * 1024;
 export const REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES = 128 * 1024 * 1024;
 export const REPOSITORY_EVIDENCE_MAX_OBJECTS = 4_096;
+/**
+ * Images (`image` objects: a session's screenshots and pasted images, raw
+ * bytes) have their own budget, so a capture's images never crowd out its
+ * repository context: each image up to 32 MiB, up to 256 MiB and 512 images
+ * per capture, on top of the 128 MiB for everything else. An image is stored
+ * once per workspace; a capture declares the images it has not yet seen
+ * committed, and later captures name them only in the manifest.
+ */
+export const REPOSITORY_EVIDENCE_MAX_IMAGE_BYTES = 32 * 1024 * 1024;
+export const REPOSITORY_EVIDENCE_MAX_IMAGE_AGGREGATE_BYTES = 256 * 1024 * 1024;
+export const REPOSITORY_EVIDENCE_MAX_IMAGE_OBJECTS = 512;
+/** An image object's media type: `image/<subtype>`, as the transcript marker writes it. */
+export const REPOSITORY_EVIDENCE_IMAGE_MEDIA_TYPE_PATTERN =
+	/^image\/[A-Za-z0-9.+-]{1,100}$/u;
 
 export const RepositoryEvidenceErrors = {
 	EVIDENCE_CAPTURE_DISABLED: {
@@ -184,6 +198,7 @@ export const RepositoryEvidenceObjectKindSchema = z.enum([
 	"transcript-chunk",
 	"ci-metadata",
 	"ci-log",
+	"image",
 ]);
 
 export const RepositoryEvidenceObjectDescriptorSchema = z
@@ -208,6 +223,29 @@ export const RepositoryEvidenceObjectDescriptorSchema = z
 				path: ["objectId"],
 			});
 		}
+		if (object.kind !== "image") return;
+		// The digest is the transcript marker's: of the decoded image bytes.
+		if (object.contentEncoding !== "identity") {
+			context.addIssue({
+				code: "custom",
+				message: "An image object holds its raw bytes (identity encoding)",
+				path: ["contentEncoding"],
+			});
+		}
+		if (!REPOSITORY_EVIDENCE_IMAGE_MEDIA_TYPE_PATTERN.test(object.mediaType)) {
+			context.addIssue({
+				code: "custom",
+				message: "An image object needs an image/<subtype> media type",
+				path: ["mediaType"],
+			});
+		}
+		if (object.byteLength > REPOSITORY_EVIDENCE_MAX_IMAGE_BYTES) {
+			context.addIssue({
+				code: "custom",
+				message: `An image object exceeds ${REPOSITORY_EVIDENCE_MAX_IMAGE_BYTES} bytes`,
+				path: ["byteLength"],
+			});
+		}
 	});
 
 export const RepositoryEvidenceCaptureSchema = z.object({
@@ -221,6 +259,7 @@ export const RepositoryEvidenceCaptureSchema = z.object({
 
 export function createRepositoryEvidenceInitInputSchema(
 	maxAggregateBytes = REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES,
+	maxImageAggregateBytes = REPOSITORY_EVIDENCE_MAX_IMAGE_AGGREGATE_BYTES,
 ) {
 	return z
 		.object({
@@ -268,14 +307,36 @@ export function createRepositoryEvidenceInitInputSchema(
 					path: ["coverage"],
 				});
 			}
-			const aggregateBytes = input.objects.reduce(
-				(total, object) => total + object.byteLength,
-				0,
-			);
+			// Images have their own budget; everything else keeps the old one.
+			let aggregateBytes = 0;
+			let imageBytes = 0;
+			let imageCount = 0;
+			for (const object of input.objects) {
+				if (object.kind === "image") {
+					imageBytes += object.byteLength;
+					imageCount += 1;
+				} else {
+					aggregateBytes += object.byteLength;
+				}
+			}
 			if (aggregateBytes > maxAggregateBytes) {
 				context.addIssue({
 					code: "custom",
 					message: `Aggregate evidence exceeds ${maxAggregateBytes} bytes`,
+					path: ["objects"],
+				});
+			}
+			if (imageBytes > maxImageAggregateBytes) {
+				context.addIssue({
+					code: "custom",
+					message: `Aggregate images exceed ${maxImageAggregateBytes} bytes`,
+					path: ["objects"],
+				});
+			}
+			if (imageCount > REPOSITORY_EVIDENCE_MAX_IMAGE_OBJECTS) {
+				context.addIssue({
+					code: "custom",
+					message: `A capture holds at most ${REPOSITORY_EVIDENCE_MAX_IMAGE_OBJECTS} images`,
 					path: ["objects"],
 				});
 			}

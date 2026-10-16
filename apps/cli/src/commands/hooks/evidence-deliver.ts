@@ -6,6 +6,7 @@ import {
 	captureAndUploadSessionEvidence,
 	deliverPendingSessionEvidenceInBackground,
 } from "../../lib/session-evidence.js";
+import { deliverImageBacklog } from "../../lib/session-image-backlog.js";
 import { disposeLogging, setupHookLogging } from "../../logging.js";
 
 /**
@@ -13,7 +14,8 @@ import { disposeLogging, setupHookLogging } from "../../logging.js";
  * repository evidence captures that the hook spooled but could not deliver
  * within its own budget, so a host's hook timeout never costs a capture.
  * Until it is complete, it first runs the one-time capture of task outputs
- * of earlier Claude Code sessions.
+ * of earlier Claude Code sessions. Last, it takes the follow-up captures of
+ * sessions whose images did not fit their delivered captures.
  */
 async function runEvidenceDeliver(): Promise<undefined> {
 	await setupHookLogging();
@@ -50,6 +52,16 @@ async function runEvidenceDeliver(): Promise<undefined> {
 					deferred: result.deferred,
 					delivered: result.delivered,
 				},
+			);
+		const backlog = await deliverImageBacklog({
+			capture: captureAndUploadSessionEvidence,
+			credentials,
+			onWarning: (warning) => logger.warn("{warning}", { warning }),
+		});
+		if (backlog.captured + backlog.failed > 0)
+			logger.info(
+				"Images left by earlier captures: {captured} follow-up captures, {waiting} waiting, {failed} failed",
+				{ ...backlog },
 			);
 	} catch (error) {
 		logger.warn("Background repository evidence delivery failed: {error}", {

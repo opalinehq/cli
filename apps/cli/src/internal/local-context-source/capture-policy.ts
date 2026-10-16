@@ -40,17 +40,24 @@ export const SESSION_SUPPORT_MAX_FILES = 512;
 export const SUPPORT_CAP_DETAIL = "support-budget";
 export const SKILL_SUPPORT_CAP_DETAIL = "skill-support-budget";
 export const PLUGIN_SUPPORT_CAP_DETAIL = "plugin-support-budget";
-// Large tool outputs Claude Code saved next to the session transcript.
-export const SESSION_TOOL_RESULT_MAX_FILE_BYTES = 2 * 1024 * 1024;
-export const SESSION_TOOL_RESULT_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
+// Large tool outputs Claude Code saved next to the session transcript (and
+// text attachments Codex saved for the thread). Each is read whole up to
+// 64 MiB and slimmed, so its inline images become image objects, and keeps
+// its first 8 MiB after slimming; a larger one records `truncation`. The
+// pool's 32 MiB is a quarter of the 128 MiB evidence aggregate; unchanged
+// outputs are reused from the parent capture and cost nothing again.
+export const SESSION_TOOL_RESULT_MAX_FILE_BYTES = 8 * 1024 * 1024;
+export const SESSION_TOOL_RESULT_MAX_READ_BYTES = 64 * 1024 * 1024;
+export const SESSION_TOOL_RESULT_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
 export const SESSION_TOOL_RESULT_MAX_FILES = 256;
 // Output files of the session's background Bash commands and Monitor tools.
 // Most are a few KiB; dev-server and CI-watch logs can grow without bound, so
-// a larger one keeps its last 256 KiB (a few thousand lines, where the errors
-// are). 16 such logs fill the pool, and the pool's 4 MiB is about 3% of the
-// 128 MiB evidence aggregate the transcript shares with the context bundle.
-export const SESSION_TASK_OUTPUT_MAX_FILE_BYTES = 256 * 1024;
-export const SESSION_TASK_OUTPUT_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
+// a larger one keeps its last 1 MiB (tens of thousands of lines, where the
+// errors are) and records `truncation`. 16 such logs fill the pool, and the
+// pool's 16 MiB is an eighth of the 128 MiB evidence aggregate the transcript
+// shares with the context bundle.
+export const SESSION_TASK_OUTPUT_MAX_FILE_BYTES = 1024 * 1024;
+export const SESSION_TASK_OUTPUT_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
 export const SESSION_TASK_OUTPUT_MAX_FILES = 256;
 
 export const CLAUDE_USER_HOME_ROOT_ID = "claude-user-home";
@@ -60,6 +67,9 @@ export const CODEX_PLUGINS_ROOT_ID = "codex-plugins";
 export const CLAUDE_PROJECT_MEMORY_ROOT_ID = "claude-project-memory";
 export const CLAUDE_TOOL_RESULTS_ROOT_ID = "claude-tool-results";
 export const CLAUDE_TASK_OUTPUTS_ROOT_ID = "claude-task-outputs";
+export const CLAUDE_SESSION_IMAGES_ROOT_ID = "claude-session-images";
+export const CODEX_ATTACHMENTS_ROOT_ID = "codex-attachments";
+export const CODEX_GENERATED_IMAGES_ROOT_ID = "codex-generated-images";
 /** User-level Claude Code directories captured in full from ~/.claude. */
 export const CLAUDE_USER_EXTENSION_DIRECTORIES = [
 	"agents",
@@ -251,9 +261,17 @@ export function isObservedPlugin(
 	return false;
 }
 
-/** Claude Code's saved large tool outputs of the captured session. */
+/**
+ * Claude Code's saved large tool outputs of the captured session, and the
+ * attachments Codex saved for the captured thread (pasted text), which share
+ * their pool. Binary files of these roots are hash-only here; their image
+ * bytes are delivered as `image` objects.
+ */
 export function isSessionToolResult(rootId: string): boolean {
-	return rootId === CLAUDE_TOOL_RESULTS_ROOT_ID;
+	return (
+		rootId === CLAUDE_TOOL_RESULTS_ROOT_ID ||
+		rootId === CODEX_ATTACHMENTS_ROOT_ID
+	);
 }
 
 /** Output files of the captured session's background tasks. */

@@ -8,6 +8,9 @@ import {
 	createRepositoryEvidenceInitInputSchema,
 	parseSafeApiEndpoint,
 	REPOSITORY_EVIDENCE_MAX_AGGREGATE_BYTES,
+	REPOSITORY_EVIDENCE_MAX_IMAGE_AGGREGATE_BYTES,
+	REPOSITORY_EVIDENCE_MAX_IMAGE_OBJECTS,
+	REPOSITORY_EVIDENCE_MAX_OBJECTS,
 	REPOSITORY_EVIDENCE_PROTOCOL,
 	type RepositoryEvidenceCapture,
 	type RepositoryEvidenceCommitInput,
@@ -22,6 +25,7 @@ import {
 	type GitDiff,
 	type GitRepositorySnapshot,
 	type LocalContextBundle,
+	type SessionImages,
 } from "../internal/local-context-source/index.js";
 import { filterContextMetadata } from "../internal/local-context-source/metadata-filter.js";
 import { FILTER_VERSION } from "../internal/secret-filter/index.js";
@@ -73,6 +77,35 @@ export function getTranscriptDeliveryBudget(
 	);
 }
 
+/**
+ * What a capture may declare for session images. Images have their own byte
+ * budget (apart from the 128 MiB aggregate the transcript and context share),
+ * but share the per-capture object bound with the context blobs and chunks.
+ */
+export function getImageDeliveryBudget(
+	bundle: LocalContextBundle,
+	transcriptRevision: Pick<TranscriptRevisionPlan, "newChunks">,
+	bounds: { readonly maxBytes: number; readonly maxObjects: number },
+): { readonly maxBytes: number; readonly maxObjects: number } {
+	return {
+		maxBytes: Math.max(
+			0,
+			Math.min(bounds.maxBytes, REPOSITORY_EVIDENCE_MAX_IMAGE_AGGREGATE_BYTES),
+		),
+		maxObjects: Math.max(
+			0,
+			Math.min(
+				bounds.maxObjects,
+				REPOSITORY_EVIDENCE_MAX_IMAGE_OBJECTS,
+				REPOSITORY_EVIDENCE_MAX_OBJECTS -
+					1 -
+					bundle.blobs.length -
+					transcriptRevision.newChunks.length,
+			),
+		),
+	};
+}
+
 export interface RepositoryEvidenceUploadConfig {
 	readonly allowInsecureEndpoint: boolean;
 	readonly authType?: "bearer" | "api-key";
@@ -100,6 +133,15 @@ export function buildRepositoryEvidenceUpload(
 		readonly terminalTranscript: boolean;
 		readonly transcriptLastEventAt: string | null;
 		readonly transcriptRevision: TranscriptRevisionPlan;
+		/** Session images: `image` objects and the manifest's `images` field. */
+		readonly images?: {
+			readonly objects: readonly {
+				readonly sha256: string;
+				readonly mediaType: string;
+				readonly bytes: Uint8Array;
+			}[];
+			readonly manifest: SessionImages;
+		};
 	},
 	limits: RepositoryEvidenceDeliveryLimits = {},
 ): BuiltRepositoryEvidenceUpload {
@@ -122,7 +164,10 @@ export function buildRepositoryEvidenceUpload(
 			facets: input.bundle.manifest.contextIndex.facets,
 			skills: skillAssessments,
 		},
-		localContext: input.bundle.manifest,
+		localContext:
+			input.images === undefined
+				? input.bundle.manifest
+				: { ...input.bundle.manifest, images: input.images.manifest },
 		protocol: REPOSITORY_EVIDENCE_PROTOCOL,
 		transcriptRevision: input.transcriptRevision.manifest,
 	});
@@ -166,6 +211,16 @@ export function buildRepositoryEvidenceUpload(
 			throw new Error("Transcript revision chunk failed its content hash.");
 		}
 		objects.set(object.descriptor.objectId, object);
+	}
+	// Image bytes are not text: the secret filter cannot scan them, so they
+	// carry no filter version.
+	for (const image of input.images?.objects ?? []) {
+		const object = buildObject(image.bytes, "image", image.mediaType, null);
+		if (object.descriptor.sha256 !== image.sha256) {
+			throw new Error("Session image failed its content hash.");
+		}
+		if (!objects.has(object.descriptor.objectId))
+			objects.set(object.descriptor.objectId, object);
 	}
 
 	const capture: RepositoryEvidenceCapture = {
@@ -284,6 +339,9 @@ export function buildRepositoryEvidenceContinuation(
 		"application/json",
 		FILTER_VERSION,
 	);
+	// Image objects are not declared again: the server has them from the
+	// accepted previous capture (the manifest's `images` says so), and their
+	// bytes would only take the aggregate the remaining transcript needs.
 	const objects = new Map(
 		[...previous.objects].filter(
 			([, object]) => object.descriptor.kind === "source-blob",
@@ -473,7 +531,7 @@ function buildObject(
 	bytes: Uint8Array,
 	kind: RepositoryEvidenceObjectDescriptor["kind"],
 	mediaType: string,
-	filterVersion: number,
+	filterVersion: number | null,
 ): RepositoryEvidenceBytes {
 	const sha256 = createHash("sha256").update(bytes).digest("hex");
 	return {

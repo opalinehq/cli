@@ -78,8 +78,14 @@ export async function continueAcceptedTranscript(
 	maxDeliveryBytes?: number,
 ): Promise<void> {
 	if (pending.continuation) {
+		// What the continuation declares again besides its chunks (it leaves
+		// out the previous capture's chunks and images).
 		const contextBytes = [...pending.upload.objects.values()]
-			.filter((object) => object.descriptor.kind !== "transcript-chunk")
+			.filter(
+				(object) =>
+					object.descriptor.kind !== "transcript-chunk" &&
+					object.descriptor.kind !== "image",
+			)
 			.reduce((sum, object) => sum + object.bytes.length, 0);
 		const plan = await planTranscriptRevisionFile({
 			path: transcriptSourcePath(configDir, pending.continuation.sourceId),

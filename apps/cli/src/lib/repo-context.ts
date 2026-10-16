@@ -160,14 +160,28 @@ export async function collectSessionRepositoryContext(input: {
 	readonly toolResults?: {
 		readonly directory: string;
 		readonly references: ToolResultReferences;
-		readonly transformText: (text: string) => string;
 	};
 	/** Claude Code session artifacts: output files of background tasks. */
 	readonly taskOutputs?: {
 		readonly directory: string;
 		readonly references: TaskOutputReferences;
-		readonly transformText: (text: string) => string;
 	};
+	/** Claude Code session artifacts: image files pasted into the session. */
+	readonly sessionImagesDirectory?: string | null;
+	/** Codex thread artifacts the rollout names literally. */
+	readonly codexThreadFiles?: {
+		readonly attachments: readonly string[];
+		readonly generatedImages: readonly string[];
+	} | null;
+	/**
+	 * Applied to saved tool outputs, task outputs and Codex text attachments
+	 * before the secret filter (the session-evidence capture passes the
+	 * transcript's slimming).
+	 */
+	readonly transformSessionArtifactText?: (
+		text: string,
+		file: { readonly rootId: string; readonly path: string },
+	) => string;
 	readonly runtime?: CaptureRuntime;
 	readonly captureReason?: CaptureReason;
 }): Promise<SessionRepositoryContextCapture> {
@@ -218,6 +232,8 @@ export async function collectSessionRepositoryContext(input: {
 		sources: userSources,
 		toolResultsDirectory: input.toolResults?.directory ?? null,
 		taskOutputsDirectory: input.taskOutputs?.directory ?? null,
+		sessionImagesDirectory: input.sessionImagesDirectory ?? null,
+		codexThreadFiles: input.codexThreadFiles ?? null,
 	});
 	const safeRoots = await resolveSafeAdditionalRoots(
 		additionalRoots,
@@ -257,10 +273,7 @@ export async function collectSessionRepositoryContext(input: {
 			},
 			parentCapture,
 			forbiddenSymlinkTargets: [configBoundary.canonicalConfigDir],
-			// One transform for both: the session-evidence capture passes the
-			// transcript's slimming to each.
-			transformToolResultText:
-				input.toolResults?.transformText ?? input.taskOutputs?.transformText,
+			transformToolResultText: input.transformSessionArtifactText,
 		},
 		createLocalContextSourceEnv(input.deadlineAt),
 	);

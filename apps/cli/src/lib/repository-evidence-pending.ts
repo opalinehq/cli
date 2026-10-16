@@ -669,7 +669,15 @@ function parsePending(
 	) {
 		throw invalidPending();
 	}
-	if (input.objects.some((object) => object.filterVersion !== FILTER_VERSION)) {
+	// Image bytes are not text the secret filter can scan: they carry no
+	// filter version.
+	if (
+		input.objects.some((object) =>
+			object.kind === "image"
+				? object.filterVersion !== null
+				: object.filterVersion !== FILTER_VERSION,
+		)
+	) {
 		throw new IncompatiblePendingFilterError(pending);
 	}
 	return pending;

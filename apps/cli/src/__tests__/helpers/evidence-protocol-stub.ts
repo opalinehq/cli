@@ -8,6 +8,7 @@ import {
 } from "../../contracts/index.js";
 import type {
 	CaptureRuntime,
+	SessionImages,
 	TaskOutputReferences,
 	ToolResultReferences,
 	UserAgentConfiguration,
@@ -30,6 +31,8 @@ export interface EvidenceStubFaults {
 	commit?: (index: number) => EvidenceStubFault;
 	/** Server-side capture switch; true answers EVIDENCE_CAPTURE_DISABLED. */
 	disabled?: () => boolean;
+	/** `cli.authStatus` without `repositoryEvidenceImages` (an older server). */
+	withoutImageCapability?: boolean;
 }
 
 export type EvidenceStubFault =
@@ -93,6 +96,7 @@ export interface CommittedManifest {
 		readonly userConfiguration?: UserAgentConfiguration;
 		readonly toolResultReferences?: ToolResultReferences;
 		readonly taskOutputReferences?: TaskOutputReferences;
+		readonly images?: SessionImages;
 		readonly captureReason?: string;
 		readonly runtime?: CaptureRuntime;
 	};
@@ -124,6 +128,8 @@ export interface EvidenceProtocolStub {
 		conflicts: number;
 	};
 	readonly transcriptUploads: string[];
+	/** Object ids whose bytes were uploaded (committed), in commit order. */
+	readonly uploadedObjectIds: string[];
 	readonly faults: EvidenceStubFaults;
 	stop(): void;
 }
@@ -142,6 +148,7 @@ export function startEvidenceProtocolStub(
 	const committed = new Map<string, CommittedEvidence>();
 	const counts = { init: 0, put: 0, commit: 0, conflicts: 0 };
 	const transcriptUploads: string[] = [];
+	const uploadedObjectIds: string[] = [];
 	const stub = startIngestStub({
 		hostname: "127.0.0.1",
 		captureBodies: false,
@@ -240,6 +247,7 @@ export function startEvidenceProtocolStub(
 					if (`sha256:${hashBytes(bytes)}` !== object.objectId)
 						return orpcError("EVIDENCE_OBJECT_MISMATCH", 409);
 					stored.set(object.objectId, new Uint8Array(bytes));
+					uploadedObjectIds.push(object.objectId);
 				}
 				const objects = new Map<string, Uint8Array>();
 				for (const descriptor of plan.objects) {
@@ -264,7 +272,12 @@ export function startEvidenceProtocolStub(
 			if (pathname === "/rpc/cli/authStatus")
 				return Response.json({
 					json: {
-						capabilities: { analysisLinkedUploads: true },
+						capabilities: {
+							analysisLinkedUploads: true,
+							...(faults.withoutImageCapability
+								? {}
+								: { repositoryEvidenceImages: true }),
+						},
 						email: "test@example.invalid",
 						id: "user-1",
 						name: "Test",
@@ -294,6 +307,7 @@ export function startEvidenceProtocolStub(
 		committed,
 		counts,
 		transcriptUploads,
+		uploadedObjectIds,
 		faults,
 		stop: () => stub.server.stop(true),
 	};

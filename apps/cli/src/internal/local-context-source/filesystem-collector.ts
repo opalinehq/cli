@@ -25,6 +25,7 @@ import {
 	SESSION_SKILL_SUPPORT_MAX_BYTES,
 	SESSION_SKILL_SUPPORT_MAX_FILES,
 	SESSION_SUPPORT_MAX_FILES,
+	SESSION_TOOL_RESULT_MAX_READ_BYTES,
 	SKILL_SUPPORT_CAP_DETAIL,
 	SUPPORT_CAP_DETAIL,
 } from "./capture-policy.js";
@@ -1306,12 +1307,18 @@ async function buildRegularFileEntry(
 						entry.absolutePath,
 						getDedicatedPoolLimits(pool, options).maxFileBytes,
 					)
-				: await fileSystem.readFileBounded(
-						entry.absolutePath,
-						pool === "general"
-							? options.limits.maxContentBytesPerFile
-							: getDedicatedPoolLimits(pool, options).maxFileBytes,
-					);
+				: pool === "tool-result"
+					? await readToolResultHead(
+							fileSystem,
+							entry.absolutePath,
+							entry.stat.size,
+						)
+					: await fileSystem.readFileBounded(
+							entry.absolutePath,
+							pool === "general"
+								? options.limits.maxContentBytesPerFile
+								: getDedicatedPoolLimits(pool, options).maxFileBytes,
+						);
 		if (!read.complete) {
 			coverage.omittedContentFiles += 1;
 			aggregate.omittedBytes += entry.stat.size;
@@ -1385,16 +1392,35 @@ async function buildRegularFileEntry(
 				},
 			};
 		}
-		const text =
+		const transformed =
 			mcp !== undefined
 				? mcp.text
 				: (pool === "tool-result" || pool === "task-output") &&
 						options.transformToolResultText
-					? options.transformToolResultText(decoded)
+					? options.transformToolResultText(decoded, {
+							rootId: root.id,
+							path: entry.path,
+						})
 					: decoded;
+		// A saved tool output is slimmed whole (so its inline images are seen)
+		// and then keeps its head up to the per-file bound.
+		const kept =
+			pool === "tool-result"
+				? keepTextHead(
+						transformed,
+						getDedicatedPoolLimits(pool, options).maxFileBytes,
+						read,
+					)
+				: { text: transformed, truncation: read.truncation };
+		const text = kept.text;
+		const truncation = kept.truncation;
+		const sourceByteLength =
+			pool === "tool-result"
+				? Math.min(read.bytes.byteLength, Buffer.byteLength(text))
+				: read.bytes.byteLength;
 		const sanitized = addSanitizedTextBlob(
 			text,
-			read.bytes.byteLength,
+			sourceByteLength,
 			blobStore,
 			mcp?.counts,
 		);
@@ -1441,7 +1467,7 @@ async function buildRegularFileEntry(
 		coverage.hashedFiles += 1;
 		coverage.hashedBytes += sanitized.storedByteLength;
 		if (pool !== "general") {
-			aggregate.poolBudgetBytes[pool] += read.bytes.byteLength;
+			aggregate.poolBudgetBytes[pool] += sourceByteLength;
 		} else {
 			coverage.generalContentBytes += sanitized.storedByteLength;
 			aggregate.contentBudgetBytes += read.bytes.byteLength;
@@ -1464,7 +1490,7 @@ async function buildRegularFileEntry(
 				bytesHashed: sanitized.storedByteLength,
 				scope: "stored",
 			},
-			content: buildAvailableContent(sanitized, blobStore, read.truncation),
+			content: buildAvailableContent(sanitized, blobStore, truncation),
 		};
 	} catch (error) {
 		pushFileSystemError(errors, root.id, entry.path, "read", error, options);
@@ -1591,8 +1617,13 @@ function getPoolLimitReason(
 	options: LocalContextCollectionOptions,
 ): Extract<FileContent, { status: "omitted" }>["reason"] | null {
 	const limits = getDedicatedPoolLimits(pool, options);
-	// A task output above the per-file bound keeps its tail instead.
-	if (pool !== "task-output" && size > limits.maxFileBytes)
+	// A task output above the per-file bound keeps its tail, a saved tool
+	// output its head.
+	if (
+		pool !== "task-output" &&
+		pool !== "tool-result" &&
+		size > limits.maxFileBytes
+	)
 		return "file-content-cap";
 	if (
 		aggregate.poolBudgetBytes[pool] + Math.min(size, limits.maxFileBytes) >
@@ -1666,6 +1697,75 @@ async function readTaskOutputTail(
 		complete: true,
 		truncation: { kept: "tail", originalByteLength: tail.fileBytes },
 	};
+}
+
+/**
+ * A saved tool output: the whole file up to SESSION_TOOL_RESULT_MAX_READ_BYTES
+ * (it is slimmed before its head is kept), else its first bytes up to the
+ * last complete line within that bound.
+ */
+async function readToolResultHead(
+	fileSystem: LocalContextFileSystem,
+	path: string,
+	size: number,
+): Promise<BoundedReadResult & { readonly truncation?: ContentTruncation }> {
+	const read = await fileSystem.readFileBounded(
+		path,
+		Math.min(Math.max(size, 1), SESSION_TOOL_RESULT_MAX_READ_BYTES),
+	);
+	if (read.complete) return read;
+	const newline = read.bytes.lastIndexOf(0x0a);
+	return {
+		bytes: read.bytes.subarray(
+			0,
+			newline >= 0 ? newline + 1 : utf8Boundary(read.bytes, read.bytes.length),
+		),
+		complete: true,
+		truncation: {
+			kept: "head",
+			originalByteLength: Math.max(size, read.bytes.byteLength + 1),
+		},
+	};
+}
+
+/**
+ * `text`, or its first bytes up to the last complete line within `maxBytes`
+ * (a single longer line is cut at a character boundary), with the truncation
+ * of the read it came from or of this cut.
+ */
+function keepTextHead(
+	text: string,
+	maxBytes: number,
+	read: BoundedReadResult & { readonly truncation?: ContentTruncation },
+): { readonly text: string; readonly truncation?: ContentTruncation } {
+	const bytes = Buffer.from(text, "utf8");
+	if (bytes.byteLength <= maxBytes)
+		return { text, truncation: read.truncation };
+	const head = bytes.subarray(0, maxBytes);
+	const newline = head.lastIndexOf(0x0a);
+	const end = newline >= 0 ? newline + 1 : utf8Boundary(head, head.length);
+	return {
+		text: head.subarray(0, end).toString("utf8"),
+		truncation: {
+			kept: "head",
+			originalByteLength:
+				read.truncation?.originalByteLength ?? read.bytes.byteLength,
+		},
+	};
+}
+
+/**
+ * The length of the longest prefix of `bytes[0, end)` that does not end
+ * inside a UTF-8 sequence.
+ */
+function utf8Boundary(bytes: Uint8Array, end: number): number {
+	let lead = end - 1;
+	while (lead >= 0 && end - lead < 4 && ((bytes[lead] ?? 0) & 0xc0) === 0x80)
+		lead -= 1;
+	if (lead < 0) return 0;
+	const byte = bytes[lead] ?? 0;
+	const length = byte >= 0xf0 ? 4 : byte >= 0xe0 ? 3 : byte >= 0xc0 ? 2 : 1;
+	return lead + length <= end ? end : lead;
 }
 
 /** The canonical symlink boundary of a root, or null when it has none. */

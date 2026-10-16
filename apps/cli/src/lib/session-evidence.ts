@@ -21,7 +21,10 @@ import {
 	isClaudeTaskOutputSweepDue,
 	TranscriptNotDeliveredError,
 } from "./claude-task-output-sweep.js";
-import { collectClaudeTaskOutputReferences } from "./claude-task-outputs.js";
+import {
+	collectClaudeTaskOutputReferences,
+	resolveClaudeSessionImagesDirectory,
+} from "./claude-task-outputs.js";
 import {
 	findToolResultReferences,
 	getClaudeToolResultsDirectory,
@@ -67,6 +70,7 @@ import {
 } from "./repository-evidence-pending.js";
 import {
 	buildRepositoryEvidenceUpload,
+	getImageDeliveryBudget,
 	getTranscriptDeliveryBudget,
 	isRetryableRepositoryEvidenceError,
 	requireRepositoryEvidenceApiKey,
@@ -79,6 +83,28 @@ import {
 	type SessionAttributionSourceStream,
 } from "./session-attribution.js";
 import {
+	hasImageBacklog,
+	type ImageBacklogKey,
+	readImageBacklogItem,
+	removeImageBacklogItem,
+	writeImageBacklogItem,
+} from "./session-image-backlog.js";
+import {
+	readDeliveredImages,
+	recordDeliveredImages,
+} from "./session-image-ledger.js";
+import {
+	createArtifactImageCollector,
+	findCodexThreadFiles,
+	getClaudeImageFileRoots,
+	getCodexImageFileRoots,
+	planSessionImages,
+	SESSION_IMAGES_MANIFEST_RESERVE_BYTES,
+	SESSION_IMAGES_MAX_BYTES_PER_CAPTURE,
+	SESSION_IMAGES_MAX_OBJECTS_PER_CAPTURE,
+	supportsRepositoryEvidenceImages,
+} from "./session-images.js";
+import {
 	continueAcceptedTranscript,
 	persistTranscriptSource,
 	transcriptSourcePath,
@@ -90,8 +116,8 @@ import {
 	type TranscriptRevisionDeliveryScope,
 } from "./transcript-revision-store.js";
 import { extractObservedSkills } from "./transcript-skills.js";
-import { slimTranscriptText } from "./transcript-slim.js";
 import { allowsInsecureEndpointFromEnv } from "./upload-endpoint.js";
+import { getUserContextLocations } from "./user-context.js";
 
 type EvidenceLifecycle = "start" | "resume" | "checkpoint" | "end";
 
@@ -110,6 +136,9 @@ const EVIDENCE_BACKGROUND_MAX_ITEMS = 200;
 // Per item in the background: one minute plus 256 KiB/s of evidence bytes.
 const EVIDENCE_BACKGROUND_ITEM_BASE_MS = 60_000;
 const EVIDENCE_BACKGROUND_ITEM_BYTES_PER_SECOND = 256 * 1024;
+// Manifest bytes kept free besides the 1 MiB headroom, for the `images` field.
+const TRANSCRIPT_MANIFEST_HEADROOM_BYTES =
+	1024 * 1024 + SESSION_IMAGES_MANIFEST_RESERVE_BYTES;
 // Evidence keeps the transcript's exact (unslimmed) bytes, so it is bounded by
 // the repository-evidence aggregate, not the 256 MiB slimmed ingest limit.
 export const EVIDENCE_TRANSCRIPT_INPUT_MAX_BYTES =
@@ -152,6 +181,11 @@ export async function captureAndUploadSessionEvidence(input: {
 	readonly requireDeliveredTranscript?: boolean;
 	/** Recorded in the manifest for a capture taken outside the hooks. */
 	readonly captureReason?: CaptureReason;
+	/** Tighter per-capture image bounds (tests). */
+	readonly imageLimits?: {
+		readonly maxBytesPerCapture?: number;
+		readonly maxObjectsPerCapture?: number;
+	};
 }): Promise<
 	{ readonly contextId: string; readonly receiptId: string } | undefined
 > {
@@ -204,6 +238,24 @@ export async function captureAndUploadSessionEvidence(input: {
 						streams,
 						transcriptPath: claudeTranscriptPath,
 					});
+		const sessionImagesDirectory =
+			claudeTranscriptPath === null
+				? null
+				: await resolveClaudeSessionImagesDirectory({
+						sessionId: request.sessionId,
+						streams,
+						transcriptPath: claudeTranscriptPath,
+					});
+		const codexHome =
+			request.source === "codex" ? getUserContextLocations().codexHome : null;
+		const codexThreadFiles =
+			codexHome === null
+				? null
+				: await findCodexThreadFiles(streams, codexHome);
+		// Saved outputs and attachments get the transcript's slimming before
+		// the secret filter, like the records that reference them; their
+		// inline images are collected on the way.
+		const artifactImages = createArtifactImageCollector();
 		contextCapture = await collectSessionRepositoryContext({
 			accountId: user.id,
 			endpoint,
@@ -223,16 +275,12 @@ export async function captureAndUploadSessionEvidence(input: {
 								streams,
 								toolResultsDirectory,
 							),
-							// Saved outputs get the transcript's slimming before the
-							// secret filter, like the records that reference them.
-							transformText: slimTranscriptText,
 						},
 					}),
-			...(taskOutputs === null
-				? {}
-				: {
-						taskOutputs: { ...taskOutputs, transformText: slimTranscriptText },
-					}),
+			...(taskOutputs === null ? {} : { taskOutputs }),
+			sessionImagesDirectory,
+			codexThreadFiles,
+			transformSessionArtifactText: artifactImages.transform,
 		});
 		const scope = {
 			actorId: user.id,
@@ -255,7 +303,9 @@ export async function captureAndUploadSessionEvidence(input: {
 		const transcriptRevision = await planTranscriptRevisionFile({
 			path: transcriptSourcePath(configDir, sourceId),
 			limits: {
-				maxDeliveryBytes: getTranscriptDeliveryBudget(contextCapture.bundle),
+				maxDeliveryBytes: getTranscriptDeliveryBudget(contextCapture.bundle, {
+					manifestHeadroomBytes: TRANSCRIPT_MANIFEST_HEADROOM_BYTES,
+				}),
 			},
 			previous,
 			scope,
@@ -266,6 +316,46 @@ export async function captureAndUploadSessionEvidence(input: {
 			(previous === undefined || transcriptRevision.resetReason !== null)
 		)
 			throw new TranscriptNotDeliveredError(request.sessionId);
+		const imageBudget = getImageDeliveryBudget(
+			contextCapture.bundle,
+			transcriptRevision,
+			{
+				maxBytes:
+					input.imageLimits?.maxBytesPerCapture ??
+					SESSION_IMAGES_MAX_BYTES_PER_CAPTURE,
+				maxObjects:
+					input.imageLimits?.maxObjectsPerCapture ??
+					SESSION_IMAGES_MAX_OBJECTS_PER_CAPTURE,
+			},
+		);
+		const images = await planSessionImages({
+			streams,
+			artifacts: artifactImages,
+			files: [
+				...getClaudeImageFileRoots({
+					toolResultsDirectory,
+					sessionImagesDirectory,
+				}),
+				...(codexHome === null || codexThreadFiles === null
+					? []
+					: getCodexImageFileRoots(codexHome, codexThreadFiles)),
+			],
+			delivered: await readDeliveredImages(configDir, {
+				endpoint,
+				organizationId: input.organizationId,
+				source: request.source,
+				sessionId: request.sessionId,
+			}),
+			isSupported: () =>
+				supportsRepositoryEvidenceImages(
+					new URL(endpoint),
+					"api-key",
+					input.credentials.token,
+				),
+			maxBytes: imageBudget.maxBytes,
+			maxObjects: imageBudget.maxObjects,
+			deadlineAt: captureDeadlineAt,
+		});
 		const firstActionAt = findFirstTranscriptTimestamp(request.content);
 		const timing = getFirstActionTiming(
 			input.lifecycle,
@@ -300,6 +390,12 @@ export async function captureAndUploadSessionEvidence(input: {
 			terminalTranscript: input.terminalTranscript,
 			transcriptLastEventAt: attribution.streams[0]?.prefix.lastEventAt ?? null,
 			transcriptRevision,
+			images:
+				images.manifest.references.length === 0 &&
+				images.manifest.skipped.length === 0 &&
+				images.manifest.omitted === 0
+					? undefined
+					: images,
 		});
 		const currentPending: PendingRepositoryEvidence = {
 			repositorySelection: {
@@ -324,6 +420,24 @@ export async function captureAndUploadSessionEvidence(input: {
 		// killed hook and is delivered by a later hook or the background process.
 		await writePendingRepositoryEvidence(currentPending, configDir);
 		hasPending = true;
+		if (isFileBackedEvidenceRequest(input.request))
+			await updateImageBacklog(
+				{
+					endpoint,
+					organizationId: input.organizationId,
+					source: request.source,
+					sessionId: request.sessionId,
+				},
+				{
+					actorId: user.id,
+					captureReason: input.captureReason,
+					configDir,
+					deferred: images.deferred,
+					projectPath: request.projectPath,
+					transcriptPath: input.request.transcriptPath,
+				},
+				input.onWarning,
+			);
 		// Elapsed hook time on the real wall clock (hookReceivedAt comes from a
 		// Date object); the deadline itself is kept on Date.now() like every
 		// other delivery deadline.
@@ -664,6 +778,22 @@ async function deliverPendingRepositoryEvidence(
 			},
 		);
 		await markPendingRepositoryCaptureAccepted(pending, configDir);
+		await recordDeliveredImages(
+			configDir,
+			{
+				endpoint: pending.endpoint,
+				organizationId: pending.upload.input.organizationId,
+				source: pending.upload.input.session.source,
+				sessionId: pending.upload.input.session.sessionId,
+			},
+			pending.upload.input.objects
+				.filter((object) => object.kind === "image")
+				.map((object) => object.sha256),
+		).catch((error: unknown) =>
+			options.onWarning?.(
+				`Could not record delivered images: ${getErrorMessage(error)}`,
+			),
+		);
 		await advanceTranscriptRevision(
 			pending.transcriptRevision,
 			getPendingDeliveryScope(pending),
@@ -713,7 +843,8 @@ async function scheduleBackgroundEvidenceDelivery(
 	// It also runs the one-time sweep of earlier sessions' task outputs.
 	if (
 		!(await hasDuePendingRepositoryEvidence(configDir, actorId, endpoint)) &&
-		!(await isClaudeTaskOutputSweepDue(configDir))
+		!(await isClaudeTaskOutputSweepDue(configDir)) &&
+		!(await hasImageBacklog(configDir))
 	)
 		return false;
 	try {
@@ -1016,6 +1147,47 @@ async function materializeEvidenceRequest(
 		};
 	} finally {
 		await cleanupStagedUpload(staged);
+	}
+}
+
+/**
+ * Keeps the session in the image backlog while its captures leave images for
+ * later, and removes it once one does not.
+ */
+async function updateImageBacklog(
+	key: ImageBacklogKey,
+	capture: {
+		readonly actorId: string;
+		readonly captureReason: CaptureReason | undefined;
+		readonly configDir: string;
+		readonly deferred: number;
+		readonly projectPath: string;
+		readonly transcriptPath: string;
+	},
+	onWarning: ((message: string) => void) | undefined,
+): Promise<void> {
+	try {
+		if (capture.deferred === 0) {
+			await removeImageBacklogItem(capture.configDir, key);
+			return;
+		}
+		const existing = await readImageBacklogItem(capture.configDir, key);
+		await writeImageBacklogItem(capture.configDir, {
+			...key,
+			version: 1,
+			actorId: capture.actorId,
+			transcriptPath: capture.transcriptPath,
+			projectPath: capture.projectPath,
+			followUps:
+				(existing?.followUps ?? 0) +
+				(capture.captureReason === "image-backlog" ? 1 : 0),
+			deferred: capture.deferred,
+			updatedAt: new Date().toISOString(),
+		});
+	} catch (error) {
+		onWarning?.(
+			`Could not record the images left for a later capture: ${getErrorMessage(error)}`,
+		);
 	}
 }
 
