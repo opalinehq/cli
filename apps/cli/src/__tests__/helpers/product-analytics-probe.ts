@@ -1,6 +1,7 @@
 import {
 	getCliDistinctId,
 	getNextCliLoginAttemptNumber,
+	getOrCreateCliInstallationId,
 	identifyCliProductAnalyticsUser,
 	resetCliProductAnalyticsIdentity,
 	shutdownCliProductAnalytics,
@@ -24,6 +25,9 @@ switch (process.argv[2]) {
 		console.log(JSON.stringify({ before, switched, loggedOut }));
 		break;
 	}
+	case "installation-id":
+		console.log(getOrCreateCliInstallationId());
+		break;
 	default:
 		throw new Error("Unknown analytics probe");
 }
