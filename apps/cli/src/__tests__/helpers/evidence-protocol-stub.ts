@@ -8,6 +8,7 @@ import {
 } from "../../contracts/index.js";
 import type {
 	CaptureRuntime,
+	TaskOutputReferences,
 	ToolResultReferences,
 	UserAgentConfiguration,
 } from "../../internal/local-context-source/index.js";
@@ -58,6 +59,10 @@ export interface CommittedManifest {
 				readonly reason?: string;
 				readonly detail?: string | null;
 				readonly secretFilter?: { readonly redactedBytes: number };
+				readonly truncation?: {
+					readonly kept: string;
+					readonly originalByteLength: number;
+				};
 			};
 			readonly hash?: {
 				readonly status: string;
@@ -87,6 +92,8 @@ export interface CommittedManifest {
 		};
 		readonly userConfiguration?: UserAgentConfiguration;
 		readonly toolResultReferences?: ToolResultReferences;
+		readonly taskOutputReferences?: TaskOutputReferences;
+		readonly captureReason?: string;
 		readonly runtime?: CaptureRuntime;
 	};
 	readonly contextIndex: {

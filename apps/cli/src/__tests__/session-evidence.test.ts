@@ -9,10 +9,12 @@ import {
 	readFile,
 	realpath,
 	rm,
+	symlink,
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { TranscriptNotDeliveredError } from "../lib/claude-task-output-sweep.js";
 import { readPendingRepositoryEvidence } from "../lib/repository-evidence-pending.js";
 import {
 	captureAndUploadSessionEvidence,
@@ -259,3 +261,191 @@ test("a hook that spent its budget spools the capture for background delivery in
 		await rm(home, { force: true, recursive: true });
 	}
 });
+
+test("carries a Claude session's task outputs, and a capture that must continue a delivered transcript sends none of it again", async () => {
+	const home = await realpath(
+		await mkdtemp(join(tmpdir(), "opaline-evidence-tasks-")),
+	);
+	const saved = {
+		config: process.env.OPALINE_CONFIG_DIR,
+		insecure: process.env.OPALINE_ALLOW_INSECURE_ENDPOINT,
+		temporary: process.env.CLAUDE_CODE_TMPDIR,
+	};
+	const stub = startEvidenceProtocolStub();
+	try {
+		const repository = join(home, "repository");
+		await mkdir(repository, { recursive: true });
+		await writeFile(join(repository, "AGENTS.md"), "Instructions\n");
+		execFileSync("git", ["init", "--quiet", repository]);
+		process.env.OPALINE_CONFIG_DIR = join(home, "config");
+		process.env.OPALINE_ALLOW_INSECURE_ENDPOINT = "1";
+		process.env.CLAUDE_CODE_TMPDIR = join(home, "tmp");
+		const uid = process.getuid?.() ?? 0;
+		const sessionId = "task-session";
+		const tasks = join(
+			home,
+			"tmp",
+			`claude-${uid}`,
+			"-repo",
+			sessionId,
+			"tasks",
+		);
+		await mkdir(tasks, { recursive: true });
+		await writeFile(join(tasks, "bg0000001.output"), "Server ready\n");
+		await symlink(join(home, "agent.jsonl"), join(tasks, "ag0000001.output"));
+		const transcriptPath = join(
+			home,
+			"projects",
+			"-repo",
+			`${sessionId}.jsonl`,
+		);
+		await mkdir(join(home, "projects", "-repo"), { recursive: true });
+		await writeFile(
+			transcriptPath,
+			`${[
+				{
+					type: "user",
+					timestamp: "2026-10-01T10:00:00.000Z",
+					message: { role: "user", content: "Start the server" },
+				},
+				{
+					type: "user",
+					timestamp: "2026-10-01T10:00:01.000Z",
+					message: {
+						role: "user",
+						content: [
+							{
+								tool_use_id: "toolu_server",
+								type: "tool_result",
+								content: `Command running in background with ID: bg0000001. Output is being written to: ${tasks}/bg0000001.output`,
+							},
+						],
+					},
+				},
+				{
+					type: "user",
+					timestamp: "2026-10-01T10:00:02.000Z",
+					message: {
+						role: "user",
+						content: `<task-notification>\n<task-id>gone00001</task-id>\n<output-file>${tasks}/gone00001.output</output-file>\n<status>failed</status>\n</task-notification>`,
+					},
+				},
+			]
+				.map((record) => JSON.stringify(record))
+				.join("\n")}\n`,
+		);
+		const credentials = {
+			authType: "api-key" as const,
+			token: "test",
+			apiBaseUrl: stub.base,
+			user: { id: "user", email: "test@example.invalid", name: "Test" },
+		};
+		const capture = (requireDeliveredTranscript: boolean) =>
+			captureAndUploadSessionEvidence({
+				backgroundDelivery: "none",
+				credentials,
+				hookReceivedAt: new Date().toISOString(),
+				lifecycle: requireDeliveredTranscript ? "checkpoint" : "end",
+				...(requireDeliveredTranscript
+					? { captureReason: "task-output-sweep" as const }
+					: {}),
+				organizationId: "org",
+				request: {
+					kind: "file",
+					metadata: {
+						projectPath: repository,
+						sessionId,
+						source: "claude_code",
+					},
+					subagentDiscovery: {
+						omittedCount: 0,
+						reason: null,
+						status: "complete",
+					},
+					subagents: [],
+					transcriptPath,
+				},
+				requireDeliveredTranscript,
+				terminalTranscript: true,
+			});
+		// Nothing was delivered yet: the capture is discarded, not spooled.
+		await expect(capture(true)).rejects.toBeInstanceOf(
+			TranscriptNotDeliveredError,
+		);
+		expect(stub.counts.init).toBe(0);
+		expect(await readPendingRepositoryEvidence(join(home, "config"))).toEqual(
+			[],
+		);
+		const first = await capture(false);
+		assert(first);
+		const delivered = stub.committed.get(first.contextId);
+		assert(delivered);
+		const localContext = delivered.manifest.localContext;
+		// A capture at the session's own time carries no reason.
+		expect(localContext.captureReason).toBeUndefined();
+		expect(localContext.taskOutputReferences).toEqual({
+			references: [
+				{
+					agentId: null,
+					recordIndex: 2,
+					taskId: "bg0000001",
+					path: "bg0000001.output",
+					toolUseId: "toolu_server",
+					source: "result",
+				},
+				{
+					agentId: null,
+					recordIndex: 3,
+					taskId: "gone00001",
+					path: "gone00001.output",
+					toolUseId: null,
+					source: "notification",
+				},
+			],
+			omitted: 0,
+			missingTaskIds: ["gone00001"],
+			missingTaskIdsOmitted: 0,
+		});
+		const output = localContext.entries.find(
+			(entry) =>
+				entry.rootId === "claude-task-outputs" &&
+				entry.path === "bg0000001.output",
+		);
+		assert(output?.content?.blobId);
+		expect(
+			new TextDecoder().decode(delivered.objects.get(output.content.blobId)),
+		).toBe("Server ready\n");
+		// An async agent's output is a symlink to its transcript: never read.
+		expect(
+			localContext.entries.some(
+				(entry) =>
+					entry.rootId === "claude-task-outputs" &&
+					entry.path === "ag0000001.output" &&
+					entry.kind !== "symlink",
+			),
+		).toBe(false);
+		const second = await capture(true);
+		assert(second);
+		const continued = stub.committed.get(second.contextId);
+		assert(continued);
+		expect(
+			continued.input.objects.filter(
+				(object) => object.kind === "transcript-chunk",
+			),
+		).toEqual([]);
+		expect(continued.input.capture.timing.lifecycle).toBe("checkpoint");
+		expect(continued.manifest.localContext.captureReason).toBe(
+			"task-output-sweep",
+		);
+	} finally {
+		stub.stop();
+		for (const [key, value] of [
+			["OPALINE_CONFIG_DIR", saved.config],
+			["OPALINE_ALLOW_INSECURE_ENDPOINT", saved.insecure],
+			["CLAUDE_CODE_TMPDIR", saved.temporary],
+		] as const)
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		await rm(home, { force: true, recursive: true });
+	}
+}, 30_000);

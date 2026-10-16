@@ -80,6 +80,10 @@ export interface LocalContextCollectionLimits {
 	readonly maxToolResultFiles: number;
 	readonly maxToolResultContentBytesPerFile: number;
 	readonly maxToolResultContentBytes: number;
+	// Background task outputs: a file above the per-file bound keeps its tail.
+	readonly maxTaskOutputFiles: number;
+	readonly maxTaskOutputContentBytesPerFile: number;
+	readonly maxTaskOutputContentBytes: number;
 }
 
 export interface LocalContextCollectionOptions {
@@ -97,8 +101,9 @@ export interface LocalContextCollectionOptions {
 	/** Symlink targets never followed into (the CLI's private config directory). */
 	readonly forbiddenSymlinkTargets?: readonly string[];
 	/**
-	 * Applied to saved tool-output text before the secret filter, so it gets
-	 * the same slimming as the transcript that references it.
+	 * Applied to saved tool-output and background task-output text before the
+	 * secret filter, so it gets the same slimming as the transcript that
+	 * references it.
 	 */
 	readonly transformToolResultText?: (text: string) => string;
 }
@@ -125,6 +130,13 @@ export interface BoundedReadResult {
 	readonly complete: boolean;
 }
 
+export interface TailReadResult {
+	/** The last `maxBytes` bytes of the file, or all of it. */
+	readonly bytes: Uint8Array;
+	/** The file's size when it was read. */
+	readonly fileBytes: number;
+}
+
 export interface BoundedHashResult {
 	readonly algorithm: "sha256";
 	readonly value: string;
@@ -143,6 +155,7 @@ export interface LocalContextFileSystem {
 		readonly complete: boolean;
 	}>;
 	readFileBounded(path: string, maxBytes: number): Promise<BoundedReadResult>;
+	readFileTail(path: string, maxBytes: number): Promise<TailReadResult>;
 	hashFileBounded(path: string, maxBytes: number): Promise<BoundedHashResult>;
 	readLink(path: string): Promise<string>;
 }
@@ -225,6 +238,16 @@ export interface SecretFilterMetadata {
 	readonly redactedBytes: number;
 }
 
+/**
+ * Content cut to the end of a file (background task outputs): the blob holds
+ * the last `sourceByteLength` bytes, from the first complete line on.
+ */
+export interface ContentTruncation {
+	readonly kept: "tail";
+	/** The file's size when it was read. */
+	readonly originalByteLength: number;
+}
+
 export type FileContent =
 	| {
 			readonly status: "available";
@@ -233,6 +256,7 @@ export type FileContent =
 			readonly storedByteLength: number;
 			readonly encoding: "utf-8";
 			readonly secretFilter: SecretFilterMetadata;
+			readonly truncation?: ContentTruncation;
 	  }
 	| {
 			readonly status: "reused";
@@ -242,6 +266,7 @@ export type FileContent =
 			readonly storedByteLength: number;
 			readonly encoding: "utf-8";
 			readonly secretFilter: SecretFilterMetadata;
+			readonly truncation?: ContentTruncation;
 	  }
 	| {
 			readonly status: "git-object";
@@ -658,6 +683,19 @@ export interface LocalContextManifest {
 	 * record (stream and 1-based JSONL line) and tool call that produced it.
 	 */
 	readonly toolResultReferences?: ToolResultReferences;
+	/**
+	 * Records of the session transcript that name a background task's output
+	 * file in the `claude-task-outputs` root, and the task ids it names whose
+	 * file was not on disk at capture time.
+	 */
+	readonly taskOutputReferences?: TaskOutputReferences;
+	/**
+	 * Why a capture was taken outside the session's own hooks. Absent for a
+	 * capture taken at the session's own time; `task-output-sweep` for the
+	 * one-time capture of an earlier session's task outputs, whose repository
+	 * and user context are from the time of the sweep.
+	 */
+	readonly captureReason?: CaptureReason;
 	/** Tool and agent versions on the capturing machine. */
 	readonly runtime?: CaptureRuntime;
 	readonly transport: {
@@ -769,6 +807,36 @@ export interface ToolResultReferences {
 	readonly references: readonly ToolResultReference[];
 	/** References beyond the manifest's bound that were not listed. */
 	readonly omitted: number;
+}
+
+export type CaptureReason = "task-output-sweep";
+
+export interface TaskOutputReference {
+	/** Claude Code's id of the background task (Bash, Monitor or agent). */
+	readonly taskId: string;
+	/** Path relative to the `claude-task-outputs` root. */
+	readonly path: string;
+	/** Subagent stream, or null for the main transcript. */
+	readonly agentId: string | null;
+	/** 1-based JSONL line of the referencing record in its stream. */
+	readonly recordIndex: number;
+	/** The tool call that started the task, when the transcript names it. */
+	readonly toolUseId: string | null;
+	/**
+	 * `result`: the tool result that started the task (or moved it to the
+	 * background); `notification`: a task notification; `read`: a Read call.
+	 */
+	readonly source: "result" | "notification" | "read";
+}
+
+export interface TaskOutputReferences {
+	readonly references: readonly TaskOutputReference[];
+	/** References beyond the manifest's bound that were not listed. */
+	readonly omitted: number;
+	/** Referenced task ids whose output file was not on disk, sorted. */
+	readonly missingTaskIds: readonly string[];
+	/** Missing task ids beyond the bound that were not listed. */
+	readonly missingTaskIdsOmitted: number;
 }
 
 export interface CaptureRuntime {

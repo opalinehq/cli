@@ -13,6 +13,7 @@ import {
 	isObservedPlugin,
 	isPluginCommandOrAgent,
 	isSessionInstructionContent,
+	isSessionTaskOutput,
 	isSessionToolResult,
 	METADATA_INCLUDE_EVIDENCE_REASON,
 	PLUGIN_SUPPORT_CAP_DETAIL,
@@ -42,6 +43,8 @@ import {
 	isHighRiskContentPath,
 } from "./path-policy.js";
 import type {
+	BoundedReadResult,
+	ContentTruncation,
 	ContextEntry,
 	ContextFileCategory,
 	ContextRegularFileEntry,
@@ -69,7 +72,12 @@ const DISCOVERY_LIMITS: ReadonlySet<string> = new Set([
 	"maxTotalEntries",
 ]);
 
-type ContentPool = "general" | "instruction" | "user-context" | "tool-result";
+type ContentPool =
+	| "general"
+	| "instruction"
+	| "user-context"
+	| "tool-result"
+	| "task-output";
 type DedicatedPool = Exclude<ContentPool, "general">;
 
 /** Session-evidence content pools with budgets of their own. */
@@ -77,6 +85,7 @@ export interface DedicatedContentPools {
 	readonly instruction: BlobStore | null;
 	readonly userContext: BlobStore | null;
 	readonly toolResult: BlobStore | null;
+	readonly taskOutput: BlobStore | null;
 }
 
 interface DedicatedPoolLimits {
@@ -193,6 +202,7 @@ export async function collectFileSystemContext(
 		instruction: null,
 		userContext: null,
 		toolResult: null,
+		taskOutput: null,
 	},
 ): Promise<FileSystemCollectionResult> {
 	const rootSpecs: readonly RootSpec[] = [
@@ -215,7 +225,12 @@ export async function collectFileSystemContext(
 		totalEnumeratedEntries: 0,
 		totalEntries: 0,
 		contentBudgetBytes: 0,
-		poolBudgetBytes: { instruction: 0, "user-context": 0, "tool-result": 0 },
+		poolBudgetBytes: {
+			instruction: 0,
+			"user-context": 0,
+			"tool-result": 0,
+			"task-output": 0,
+		},
 		hashBudgetBytes: 0,
 		inventoryBytes: 0,
 		materializedBytes: 0,
@@ -336,6 +351,7 @@ export async function collectFileSystemContext(
 		instruction: instructionStore,
 		"user-context": sessionEvidence ? pools.userContext : null,
 		"tool-result": sessionEvidence ? pools.toolResult : null,
+		"task-output": sessionEvidence ? pools.taskOutput : null,
 	};
 	const processed = new Set<string>();
 	const processFile = async (
@@ -429,7 +445,8 @@ export async function collectFileSystemContext(
 	}
 	// Then the user-context pool in rank order (memory, user commands,
 	// agents and output styles, observed skills, every other skill), then the
-	// session's saved tool outputs, each from its own budget.
+	// session's saved tool outputs and background task outputs, each from its
+	// own budget.
 	if (poolStores["user-context"] !== null) {
 		const ranked = files.flatMap((file) => {
 			if (processed.has(getFileKey(file.entry))) return [];
@@ -488,6 +505,13 @@ export async function collectFileSystemContext(
 				isSessionToolResult(file.entry.rootId)
 			)
 				await processFile(file, "tool-result");
+	if (poolStores["task-output"] !== null)
+		for (const file of files)
+			if (
+				!processed.has(getFileKey(file.entry)) &&
+				isSessionTaskOutput(file.entry.rootId)
+			)
+				await processFile(file, "task-output");
 	for (const file of files) {
 		if (processed.has(getFileKey(file.entry))) continue;
 		await processFile(file, "general");
@@ -1273,12 +1297,21 @@ async function buildRegularFileEntry(
 	}
 
 	try {
-		const read = await fileSystem.readFileBounded(
-			entry.absolutePath,
-			pool === "general"
-				? options.limits.maxContentBytesPerFile
-				: getDedicatedPoolLimits(pool, options).maxFileBytes,
-		);
+		const read: BoundedReadResult & {
+			readonly truncation?: ContentTruncation;
+		} =
+			pool === "task-output"
+				? await readTaskOutputTail(
+						fileSystem,
+						entry.absolutePath,
+						getDedicatedPoolLimits(pool, options).maxFileBytes,
+					)
+				: await fileSystem.readFileBounded(
+						entry.absolutePath,
+						pool === "general"
+							? options.limits.maxContentBytesPerFile
+							: getDedicatedPoolLimits(pool, options).maxFileBytes,
+					);
 		if (!read.complete) {
 			coverage.omittedContentFiles += 1;
 			aggregate.omittedBytes += entry.stat.size;
@@ -1355,7 +1388,8 @@ async function buildRegularFileEntry(
 		const text =
 			mcp !== undefined
 				? mcp.text
-				: pool === "tool-result" && options.transformToolResultText
+				: (pool === "tool-result" || pool === "task-output") &&
+						options.transformToolResultText
 					? options.transformToolResultText(decoded)
 					: decoded;
 		const sanitized = addSanitizedTextBlob(
@@ -1430,7 +1464,7 @@ async function buildRegularFileEntry(
 				bytesHashed: sanitized.storedByteLength,
 				scope: "stored",
 			},
-			content: buildAvailableContent(sanitized, blobStore),
+			content: buildAvailableContent(sanitized, blobStore, read.truncation),
 		};
 	} catch (error) {
 		pushFileSystemError(errors, root.id, entry.path, "read", error, options);
@@ -1456,6 +1490,7 @@ function buildAvailableContent(
 		{ status: "available" }
 	>,
 	blobStore: BlobStore,
+	truncation: ContentTruncation | undefined,
 ): FileContent {
 	if (result.reused && blobStore.parentCaptureId !== null) {
 		return {
@@ -1466,6 +1501,7 @@ function buildAvailableContent(
 			storedByteLength: result.storedByteLength,
 			encoding: "utf-8",
 			secretFilter: result.secretFilter,
+			...(truncation === undefined ? {} : { truncation }),
 		};
 	}
 	return {
@@ -1475,6 +1511,7 @@ function buildAvailableContent(
 		storedByteLength: result.storedByteLength,
 		encoding: "utf-8",
 		secretFilter: result.secretFilter,
+		...(truncation === undefined ? {} : { truncation }),
 	};
 }
 
@@ -1554,8 +1591,13 @@ function getPoolLimitReason(
 	options: LocalContextCollectionOptions,
 ): Extract<FileContent, { status: "omitted" }>["reason"] | null {
 	const limits = getDedicatedPoolLimits(pool, options);
-	if (size > limits.maxFileBytes) return "file-content-cap";
-	if (aggregate.poolBudgetBytes[pool] + size > limits.maxTotalBytes) {
+	// A task output above the per-file bound keeps its tail instead.
+	if (pool !== "task-output" && size > limits.maxFileBytes)
+		return "file-content-cap";
+	if (
+		aggregate.poolBudgetBytes[pool] + Math.min(size, limits.maxFileBytes) >
+		limits.maxTotalBytes
+	) {
 		coverage.limitsReached.add(limits.bytesLimit);
 		return "total-content-cap";
 	}
@@ -1588,7 +1630,42 @@ function getDedicatedPoolLimits(
 				filesLimit: "maxToolResultFiles",
 				bytesLimit: "maxToolResultContentBytes",
 			};
+		case "task-output":
+			return {
+				maxFileBytes: options.limits.maxTaskOutputContentBytesPerFile,
+				maxTotalBytes: options.limits.maxTaskOutputContentBytes,
+				filesLimit: "maxTaskOutputFiles",
+				bytesLimit: "maxTaskOutputContentBytes",
+			};
 	}
+}
+
+/**
+ * A background task's output: the whole file, or its last `maxBytes` bytes
+ * from the first complete line on, so the kept text never starts inside a
+ * line (or a UTF-8 sequence) the secret filter would see only in part.
+ */
+async function readTaskOutputTail(
+	fileSystem: LocalContextFileSystem,
+	path: string,
+	maxBytes: number,
+): Promise<BoundedReadResult & { readonly truncation?: ContentTruncation }> {
+	const tail = await fileSystem.readFileTail(path, maxBytes);
+	if (tail.bytes.byteLength >= tail.fileBytes)
+		return { bytes: tail.bytes, complete: true };
+	const newline = tail.bytes.indexOf(0x0a);
+	let start = newline + 1;
+	if (newline < 0)
+		while (
+			start < tail.bytes.byteLength &&
+			((tail.bytes[start] ?? 0) & 0xc0) === 0x80
+		)
+			start += 1;
+	return {
+		bytes: tail.bytes.subarray(start),
+		complete: true,
+		truncation: { kept: "tail", originalByteLength: tail.fileBytes },
+	};
 }
 
 /** The canonical symlink boundary of a root, or null when it has none. */
