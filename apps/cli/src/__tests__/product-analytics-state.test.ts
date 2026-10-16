@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -101,6 +101,85 @@ test("account switching and logout start separate anonymous identities", async (
 		.object({ before: z.string(), switched: z.string(), loggedOut: z.string() })
 		.parse(JSON.parse(output));
 	expect(new Set(Object.values(ids)).size).toBe(3);
+});
+
+const UUID =
+	/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const OPT_OUTS = [{ POSTHOG_ENABLED: "false" }, { DO_NOT_TRACK: "1" }] as const;
+
+test("the installation id is kept between processes with analytics off, without writing analytics state", async () => {
+	for (const optOut of OPT_OUTS) {
+		const configDir = await mkdtemp(join(root, "installation-off-"));
+		const first = (await runProbe("installation-id", configDir, optOut)).trim();
+		expect(first).toMatch(UUID);
+		expect((await runProbe("installation-id", configDir, optOut)).trim()).toBe(
+			first,
+		);
+		expect(existsSync(join(configDir, "product-analytics.json"))).toBe(false);
+		const file = join(configDir, "installation-id.json");
+		expect(JSON.parse(await readFile(file, "utf8"))).toEqual({
+			version: 1,
+			installationId: first,
+		});
+		if (process.platform !== "win32")
+			expect((await stat(file)).mode & 0o777).toBe(0o600);
+	}
+});
+
+test("with analytics on, the same id is kept in both files and reused", async () => {
+	const configDir = await mkdtemp(join(root, "installation-on-"));
+	const first = (await runProbe("installation-id", configDir)).trim();
+	expect(first).toMatch(UUID);
+	expect(
+		JSON.parse(
+			await readFile(join(configDir, "product-analytics.json"), "utf8"),
+		).cli_installation_id,
+	).toBe(first);
+	// Turning analytics off later keeps the installation's identity.
+	expect(
+		(await runProbe("installation-id", configDir, OPT_OUTS[0])).trim(),
+	).toBe(first);
+});
+
+test("an id an earlier release kept in the analytics state is reused, whether or not analytics is on", async () => {
+	const legacy = "6f1c2b9e-3d4a-4b5c-8d6e-7f8091a2b3c4";
+	for (const environment of [{}, ...OPT_OUTS]) {
+		const configDir = await mkdtemp(join(root, "installation-legacy-"));
+		const statePath = join(configDir, "product-analytics.json");
+		const original = JSON.stringify({ cli_installation_id: legacy });
+		await writeFile(statePath, original);
+		expect(
+			(await runProbe("installation-id", configDir, environment)).trim(),
+		).toBe(legacy);
+		expect(await readFile(statePath, "utf8")).toBe(original);
+	}
+});
+
+test("concurrent first runs agree on one installation id", async () => {
+	const configDir = await mkdtemp(join(root, "installation-race-"));
+	const ids = await Promise.all(
+		Array.from({ length: 6 }, () =>
+			runProbe("installation-id", configDir, OPT_OUTS[0]),
+		),
+	);
+	expect(new Set(ids.map((id) => id.trim())).size).toBe(1);
+});
+
+test("a corrupt installation id file is replaced once, and an unwritable directory still yields an id", async () => {
+	const configDir = await mkdtemp(join(root, "installation-corrupt-"));
+	await writeFile(join(configDir, "installation-id.json"), "{not json");
+	const replaced = (
+		await runProbe("installation-id", configDir, OPT_OUTS[0])
+	).trim();
+	expect(replaced).toMatch(UUID);
+	expect(
+		(await runProbe("installation-id", configDir, OPT_OUTS[0])).trim(),
+	).toBe(replaced);
+	const unwritable = join(root, "installation-file-instead-of-directory");
+	await writeFile(unwritable, "cannot create a directory here");
+	expect(
+		(await runProbe("installation-id", unwritable, OPT_OUTS[0])).trim(),
+	).toMatch(UUID);
 });
 
 async function runProbe(

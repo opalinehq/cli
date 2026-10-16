@@ -1,5 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	linkSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { ORPCError } from "@orpc/client";
 import { PostHog } from "posthog-node";
@@ -30,6 +38,14 @@ type CliCapturePayload<Name extends ProductAnalyticsEventName> = Omit<
 >;
 
 const ANALYTICS_STATE_FILE = "product-analytics.json";
+// The installation's id outside the analytics state, so it is kept whether or
+// not analytics is enabled. Never sent to the analytics service unless
+// analytics is enabled.
+const INSTALLATION_ID_FILE = "installation-id.json";
+const InstallationIdFileSchema = z.object({
+	version: z.literal(1),
+	installationId: z.string().uuid(),
+});
 
 let client: PostHog | null | undefined;
 const ephemeralInstallationId = randomUUID();
@@ -141,18 +157,81 @@ export function getPlatformOs(): ProductAnalyticsPlatformOs {
 	}
 }
 
+/**
+ * This installation's stable id. Repository evidence scopes repository,
+ * worktree and transcript identities by it, so it must not change between
+ * processes: with a new id per process every capture would resend the whole
+ * transcript and start a new repository spool. Kept in its own file whether
+ * or not analytics is enabled; the id an earlier release kept in the
+ * analytics state is reused. Only when analytics is enabled is it written to
+ * the analytics state (and sent with analytics events), as before. If the
+ * configuration directory is not writable, the id lasts for this process.
+ */
 export function getOrCreateCliInstallationId() {
-	if (!getProductAnalyticsConfig()) return ephemeralInstallationId;
 	const state = readAnalyticsState();
-	if (typeof state.cli_installation_id === "string") {
-		return state.cli_installation_id;
-	}
-	const cliInstallationId = ephemeralInstallationId;
-	writeAnalyticsState({
-		...state,
-		cli_installation_id: cliInstallationId,
-	});
+	const cliInstallationId =
+		typeof state.cli_installation_id === "string"
+			? state.cli_installation_id
+			: getOrCreateStoredInstallationId();
+	if (
+		getProductAnalyticsConfig() &&
+		state.cli_installation_id !== cliInstallationId
+	)
+		writeAnalyticsState({
+			...state,
+			cli_installation_id: cliInstallationId,
+		});
 	return cliInstallationId;
+}
+
+function getOrCreateStoredInstallationId(): string {
+	const path = join(getConfigDir(), INSTALLATION_ID_FILE);
+	const stored = readStoredInstallationId(path);
+	if (stored !== undefined) return stored;
+	const temporary = `${path}.${randomUUID()}.tmp`;
+	try {
+		mkdirSync(getConfigDir(), { recursive: true, mode: 0o700 });
+		writeFileSync(
+			temporary,
+			JSON.stringify({ version: 1, installationId: ephemeralInstallationId }),
+			{ flag: "wx", mode: 0o600 },
+		);
+		try {
+			// Publishes the complete file only if no other process did first.
+			linkSync(temporary, path);
+		} catch (error) {
+			if (!isErrorCode(error, "EEXIST")) throw error;
+			const winner = readStoredInstallationId(path);
+			if (winner !== undefined) return winner;
+			// An unreadable file is replaced.
+			renameSync(temporary, path);
+		}
+		return ephemeralInstallationId;
+	} catch {
+		debugLog("installation id could not be saved");
+		return ephemeralInstallationId;
+	} finally {
+		try {
+			rmSync(temporary, { force: true });
+		} catch {
+			// The directory itself may be unusable; nothing was written then.
+		}
+	}
+}
+
+function readStoredInstallationId(path: string): string | undefined {
+	try {
+		const parsed = InstallationIdFileSchema.safeParse(
+			JSON.parse(readFileSync(path, "utf8")),
+		);
+		return parsed.success ? parsed.data.installationId : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function isErrorCode(error: unknown, code: string): boolean {
+	return error instanceof Error && "code" in error && error.code === code;
 }
 
 export function trackCliFirstRun(options: {

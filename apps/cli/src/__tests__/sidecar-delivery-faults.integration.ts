@@ -439,6 +439,67 @@ describe("sidecar delivery under faults", () => {
 		}
 	});
 
+	test("successive hooks of one session continue its transcript revision with analytics off", async () => {
+		const stub = startEvidenceProtocolStub();
+		try {
+			const workspace = await createWorkspace(stub, ["alpha"]);
+			const sessionId = "continued-session";
+			// Each hook is its own process, with product analytics disabled.
+			expect(
+				(await runHook(workspace, "codex", "alpha", sessionId)).exitCode,
+			).toBe(0);
+			const first = only(stub);
+			await writeTranscript(workspace, "codex", "alpha", sessionId, 128 * 1024);
+			expect(
+				(
+					await runHook(workspace, "codex", "alpha", sessionId, {
+						transcriptWritten: true,
+					})
+				).exitCode,
+			).toBe(0);
+			await waitFor(async () => stub.committed.size === 2, 30_000);
+			const second = [...stub.committed.values()].find(
+				(capture) => capture !== first,
+			);
+			assert(second);
+			const revision = (capture: CommittedEvidence) =>
+				capture.manifest.transcriptRevision as unknown as {
+					readonly revisionId: string;
+					readonly parentRevisionId: string | undefined;
+					readonly generation: number;
+					readonly chunks: readonly {
+						readonly sha256: string;
+						readonly startByte: number;
+					}[];
+					readonly watermark: { readonly byteOffset: number };
+				};
+			// The second capture sends only the bytes after the first one's.
+			expect(revision(second).parentRevisionId).toBe(
+				revision(first).revisionId,
+			);
+			expect(revision(second).generation).toBe(revision(first).generation);
+			const firstChunks = revision(first).chunks;
+			expect(revision(second).chunks.slice(0, firstChunks.length)).toEqual(
+				firstChunks,
+			);
+			const sent = second.input.objects
+				.filter((object) => object.kind === "transcript-chunk")
+				.map((object) => object.sha256);
+			expect(sent.length).toBeGreaterThan(0);
+			for (const chunk of firstChunks) expect(sent).not.toContain(chunk.sha256);
+			expect(
+				revision(second).chunks.find((chunk) => chunk.sha256 === sent[0])
+					?.startByte,
+			).toBe(revision(first).watermark.byteOffset);
+			expect(second.input.repository.local).toEqual(
+				first.input.repository.local,
+			);
+			await expectNothingDropped(workspace, stub);
+		} finally {
+			stub.stop();
+		}
+	});
+
 	test("carries the session's saved tool outputs, linked to their records, and runtime versions", async () => {
 		const stub = startEvidenceProtocolStub();
 		try {
@@ -1074,8 +1135,8 @@ async function expectNothingDropped(
 		pending.map((item) => item.upload.input.capture.contextId),
 	);
 	const spoolRoot = join(workspace.configDir, "repo-context-spool", "v2");
-	// Grouped by repository root: with product analytics disabled (as in these
-	// tests) every CLI process gets a new installation ID and spool binding.
+	// Grouped by repository root: captures of one repository may belong to
+	// several spool bindings (for example after a workspace change).
 	const records: {
 		readonly repository: string;
 		readonly captureId: string;
