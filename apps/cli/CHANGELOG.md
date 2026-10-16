@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.14.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.13.0...opaline-cli@0.14.0) (2026-10-16)
+
+
+### Features
+
+* **cli:** capture Claude Code background task outputs ([#513](https://github.com/opalinehq/cli/issues/513)) ([e9026b1](https://github.com/opalinehq/cli/commit/e9026b1f0916fcaf2dce0c809949e55df69654da))
+
+
+### Bug Fixes
+
+* **cli:** keep the installation id when product analytics is off ([#514](https://github.com/opalinehq/cli/issues/514)) ([fb1b276](https://github.com/opalinehq/cli/commit/fb1b276f78abba9093b146747cb632fa10dcba47))
+
 ## [0.13.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.12.3...opaline-cli@0.13.0) (2026-10-13)
 
 
