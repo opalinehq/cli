@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.14.0...opaline-cli@0.15.0) (2026-10-16)
+
+
+### Features
+
+* **cli:** capture session images as repository evidence image objects ([#515](https://github.com/opalinehq/cli/issues/515)) ([40088f8](https://github.com/opalinehq/cli/commit/40088f88b7db645d92fe90175a6906d9ba32d586))
+
 ## [0.14.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.13.0...opaline-cli@0.14.0) (2026-10-16)
 
 
