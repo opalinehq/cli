@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SESSION_TASK_OUTPUT_MAX_FILE_BYTES } from "../internal/local-context-source/capture-policy.js";
 import {
 	collectLocalContextBundle,
 	createLocalContextSourceEnv,
@@ -430,10 +431,10 @@ describe("capturing a session's task outputs", () => {
 			join(tasks, "small0001.output"),
 			`${"compiled module\n".repeat(20)}token=${secret}\n`,
 		);
-		// 300 KiB: the first lines are cut, the cut never lands inside a line
+		// 1.25 MiB: the first lines are cut, the cut never lands inside a line
 		// or a UTF-8 sequence, and the errors at the end are kept.
 		const head = "first line of the log\n";
-		const filler = "server listening — ready ✓\n".repeat(11_000);
+		const filler = "server listening — ready ✓\n".repeat(44_000);
 		const tail = "Error: EADDRINUSE: address already in use :::3000\n";
 		await writeFile(join(tasks, "large0001.output"), `${head}${filler}${tail}`);
 		await writeFile(join(tasks, "rerooted", "moved0001.output"), "moved\n");
@@ -473,7 +474,9 @@ describe("capturing a session's task outputs", () => {
 		expect(large.text.endsWith(tail)).toBe(true);
 		expect(large.text.startsWith("server listening — ready ✓\n")).toBe(true);
 		expect(large.text).not.toContain(head);
-		expect(Buffer.byteLength(large.text)).toBeLessThanOrEqual(256 * 1024);
+		expect(Buffer.byteLength(large.text)).toBeLessThanOrEqual(
+			SESSION_TASK_OUTPUT_MAX_FILE_BYTES,
+		);
 		expect(large.size).toBe(original);
 		// Symlinks (async agents' outputs) are listed, never read or followed.
 		for (const path of ["agent0001.output", "escape"]) {

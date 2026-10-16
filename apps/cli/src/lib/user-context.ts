@@ -9,10 +9,13 @@ import {
 } from "../internal/local-context-source/agent-configuration.js";
 import {
 	CLAUDE_PROJECT_MEMORY_ROOT_ID,
+	CLAUDE_SESSION_IMAGES_ROOT_ID,
 	CLAUDE_TASK_OUTPUTS_ROOT_ID,
 	CLAUDE_TOOL_RESULTS_ROOT_ID,
 	CLAUDE_USER_EXTENSION_DIRECTORIES,
 	CLAUDE_USER_HOME_ROOT_ID,
+	CODEX_ATTACHMENTS_ROOT_ID,
+	CODEX_GENERATED_IMAGES_ROOT_ID,
 } from "../internal/local-context-source/capture-policy.js";
 import type {
 	AdditionalContextRoot,
@@ -247,6 +250,16 @@ export async function resolveUserContextRoots(input: {
 	readonly toolResultsDirectory?: string | null;
 	/** `<tmp>/claude-<uid>/<project>/<session>/tasks` of that session. */
 	readonly taskOutputsDirectory?: string | null;
+	/** `<tmp>/claude-<uid>/<project>/<session>/images` of that session. */
+	readonly sessionImagesDirectory?: string | null;
+	/**
+	 * Files below `$CODEX_HOME/attachments` and `$CODEX_HOME/generated_images`
+	 * that the captured Codex thread names literally, root-relative.
+	 */
+	readonly codexThreadFiles?: {
+		readonly attachments: readonly string[];
+		readonly generatedImages: readonly string[];
+	} | null;
 }): Promise<readonly AdditionalContextRoot[]> {
 	const { home, codexHome } = input.locations;
 	const claudeDirectory = join(home, ".claude");
@@ -397,6 +410,34 @@ export async function resolveUserContextRoots(input: {
 			label: "Output of this session's background tasks",
 			origin: "user",
 			scope: "custom",
+		});
+	if (input.sessionImagesDirectory)
+		roots.push({
+			absolutePath: input.sessionImagesDirectory,
+			id: CLAUDE_SESSION_IMAGES_ROOT_ID,
+			label: "Images pasted into this session",
+			origin: "user",
+			scope: "custom",
+		});
+	// Only the files the thread names: both directories hold every thread's.
+	const codexFiles = input.codexThreadFiles;
+	if (codexFiles && codexFiles.attachments.length > 0)
+		roots.push({
+			absolutePath: join(codexHome, "attachments"),
+			id: CODEX_ATTACHMENTS_ROOT_ID,
+			label: "Attachments of this Codex thread",
+			origin: "user",
+			scope: "custom",
+			include: codexFiles.attachments.map(tree),
+		});
+	if (codexFiles && codexFiles.generatedImages.length > 0)
+		roots.push({
+			absolutePath: join(codexHome, "generated_images"),
+			id: CODEX_GENERATED_IMAGES_ROOT_ID,
+			label: "Images Codex generated in this thread",
+			origin: "user",
+			scope: "custom",
+			include: codexFiles.generatedImages.map(tree),
 		});
 	if (homeIncludes.length > 0)
 		roots.push({

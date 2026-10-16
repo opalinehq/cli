@@ -48,6 +48,8 @@ const CliUserSchema = z.object({
 			transcriptSlimming: z.literal(true).optional(),
 			/** The server accepts live session updates (`liveSession.*`). */
 			liveSessions: z.literal(true).optional(),
+			/** Repository evidence accepts `image` objects and the `images` manifest field. */
+			repositoryEvidenceImages: z.literal(true).optional(),
 		})
 		.optional(),
 });

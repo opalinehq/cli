@@ -48,14 +48,36 @@ interface Stream {
  * `<session id>.jsonl`, the platform has no user id, or the per-user
  * directory or `tasks` itself is not a plain directory of this user.
  */
-export async function resolveClaudeTaskOutputsDirectory(input: {
+export async function resolveClaudeTaskOutputsDirectory(
+	input: ClaudeSessionTemporaryDirectoryInput,
+): Promise<string | null> {
+	return resolveClaudeSessionTemporaryDirectory(input, "tasks");
+}
+
+/**
+ * `<tmp>/claude-<uid>/<project dir>/<session id>/images`, where Claude Code
+ * keeps the image files pasted into the session, located like the tasks
+ * directory (see resolveClaudeTaskOutputsDirectory).
+ */
+export async function resolveClaudeSessionImagesDirectory(
+	input: ClaudeSessionTemporaryDirectoryInput,
+): Promise<string | null> {
+	return resolveClaudeSessionTemporaryDirectory(input, "images");
+}
+
+export interface ClaudeSessionTemporaryDirectoryInput {
 	readonly transcriptPath: string;
 	readonly sessionId: string;
 	readonly streams: readonly Stream[];
 	readonly env?: NodeJS.ProcessEnv;
 	readonly uid?: number | null;
 	readonly temporaryDirectory?: string;
-}): Promise<string | null> {
+}
+
+async function resolveClaudeSessionTemporaryDirectory(
+	input: ClaudeSessionTemporaryDirectoryInput,
+	leaf: "tasks" | "images",
+): Promise<string | null> {
 	const { sessionId, transcriptPath } = input;
 	if (basename(transcriptPath) !== `${sessionId}.jsonl`) return null;
 	if (!SEGMENT_PATTERN.test(sessionId) || sessionId.startsWith("."))
@@ -70,12 +92,12 @@ export async function resolveClaudeTaskOutputsDirectory(input: {
 		input.temporaryDirectory ?? tmpdir(),
 	]);
 	const directory =
-		findReferencedDirectory(input.streams, sessionId, uid, bases) ??
+		findReferencedDirectory(input.streams, sessionId, uid, bases, leaf) ??
 		join(
 			await getClaudeTemporaryRoot(env, uid),
 			basename(dirname(transcriptPath)),
 			sessionId,
-			"tasks",
+			leaf,
 		);
 	// Another user may own a pre-created directory in a shared /tmp; only a
 	// plain directory of this user (or one not created yet) is collected.
@@ -145,7 +167,7 @@ export async function collectClaudeTaskOutputReferences(
 }
 
 /**
- * The most often named `<base>/claude-<uid>/<project dir>/<session id>/tasks`
+ * The most often named `<base>/claude-<uid>/<project dir>/<session id>/<leaf>`
  * of the transcript, for a known base.
  */
 function findReferencedDirectory(
@@ -153,11 +175,12 @@ function findReferencedDirectory(
 	sessionId: string,
 	uid: number,
 	bases: ReadonlySet<string>,
+	leaf: "tasks" | "images",
 ): string | null {
-	// Linear: each `/<session id>/tasks/` is matched backwards to the start
+	// Linear: each `/<session id>/<leaf>/` is matched backwards to the start
 	// of its path (a regex scanning forwards from every `/` would be
 	// quadratic in long tokens such as base64 payloads).
-	const needle = `/${sessionId}/tasks/`;
+	const needle = `/${sessionId}/${leaf}/`;
 	const owner = new RegExp(`/claude-${uid}/([^/]{1,255})$`, "u");
 	const counts = new Map<string, number>();
 	for (const stream of streams) {
@@ -186,7 +209,7 @@ function findReferencedDirectory(
 				continue;
 			const base = path.slice(0, match.index);
 			if (!bases.has(base)) continue;
-			const directory = `${base}/claude-${uid}/${slug}/${sessionId}/tasks`;
+			const directory = `${base}/claude-${uid}/${slug}/${sessionId}/${leaf}`;
 			counts.set(directory, (counts.get(directory) ?? 0) + 1);
 		}
 	}

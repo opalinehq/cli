@@ -150,6 +150,49 @@ export async function rememberTranscriptSlimmingCapability(
 	}
 }
 
+const EVIDENCE_IMAGES_CAPABILITY = "repositoryEvidenceImages";
+
+/** Positive answers only, like the analysis capability. */
+export function hasCachedEvidenceImagesCapability(
+	endpoint: URL,
+	authType: "api-key" | "bearer",
+	token: string,
+): boolean {
+	try {
+		const path = getEvidenceImagesCapabilityPath(
+			getCapabilityKey(endpoint, authType, token),
+		);
+		return (
+			existsSync(path) &&
+			readFileSync(path, "utf8").trim() === EVIDENCE_IMAGES_CAPABILITY
+		);
+	} catch {
+		return false;
+	}
+}
+
+export async function rememberEvidenceImagesCapability(
+	endpoint: URL,
+	authType: "api-key" | "bearer",
+	token: string,
+): Promise<void> {
+	try {
+		await writePrivateFile(
+			getEvidenceImagesCapabilityPath(
+				getCapabilityKey(endpoint, authType, token),
+			),
+			`${EVIDENCE_IMAGES_CAPABILITY}\n`,
+			getConfigDir(),
+		);
+	} catch {
+		// The preflight simply runs again next time.
+	}
+}
+
+function getEvidenceImagesCapabilityPath(key: string): string {
+	return join(getConfigDir(), "upload-capabilities", `${key}.images`);
+}
+
 function getSlimmingCapabilityPath(key: string): string {
 	return join(getConfigDir(), "upload-capabilities", `${key}.slimming`);
 }

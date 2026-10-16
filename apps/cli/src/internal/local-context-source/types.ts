@@ -103,9 +103,12 @@ export interface LocalContextCollectionOptions {
 	/**
 	 * Applied to saved tool-output and background task-output text before the
 	 * secret filter, so it gets the same slimming as the transcript that
-	 * references it.
+	 * references it. `file` names the root and root-relative path read.
 	 */
-	readonly transformToolResultText?: (text: string) => string;
+	readonly transformToolResultText?: (
+		text: string,
+		file: { readonly rootId: string; readonly path: string },
+	) => string;
 }
 
 export interface ParentCaptureReference {
@@ -239,11 +242,13 @@ export interface SecretFilterMetadata {
 }
 
 /**
- * Content cut to the end of a file (background task outputs): the blob holds
- * the last `sourceByteLength` bytes, from the first complete line on.
+ * Content cut to a part of a file. `tail` (background task outputs): the blob
+ * holds the last `sourceByteLength` bytes, from the first complete line on.
+ * `head` (saved tool outputs): the first `sourceByteLength` bytes, up to the
+ * last complete line.
  */
 export interface ContentTruncation {
-	readonly kept: "tail";
+	readonly kept: "head" | "tail";
 	/** The file's size when it was read. */
 	readonly originalByteLength: number;
 }
@@ -690,6 +695,14 @@ export interface LocalContextManifest {
 	 */
 	readonly taskOutputReferences?: TaskOutputReferences;
 	/**
+	 * The session's images not yet confirmed by a commit for this session:
+	 * where each is (`references`), with bytes as `image` objects of this
+	 * capture, or listed in `skipped` with the reason they are not. Images an
+	 * earlier commit confirmed are not listed again. Set when the capture is
+	 * built for delivery.
+	 */
+	readonly images?: SessionImages;
+	/**
 	 * Why a capture was taken outside the session's own hooks. Absent for a
 	 * capture taken at the session's own time; `task-output-sweep` for the
 	 * one-time capture of an earlier session's task outputs, whose repository
@@ -809,7 +822,57 @@ export interface ToolResultReferences {
 	readonly omitted: number;
 }
 
-export type CaptureReason = "task-output-sweep";
+/**
+ * `task-output-sweep`: the one-time capture of an earlier session's task
+ * outputs. `image-backlog`: a capture that only continues delivering the
+ * session's images that earlier captures had no room for.
+ */
+export type CaptureReason = "task-output-sweep" | "image-backlog";
+
+export interface SessionImageReference {
+	/** Hex SHA-256 of the decoded bytes; the `image` object is `sha256:<hex>`. */
+	readonly sha256: string;
+	readonly mediaType: string;
+	readonly bytes: number;
+	/**
+	 * `inline`: base64 in a transcript record, which the session upload slims
+	 * to an `opaline-image-omitted` marker. `file`: in a file of a capture
+	 * root: an image file, or a saved tool output, task output or Codex text
+	 * attachment whose stored (slimmed) text has the marker instead.
+	 */
+	readonly source: "inline" | "file";
+	/** Root-relative path of the file (`file` only). */
+	readonly path?: string;
+	/** The file's capture root (`file` only). */
+	readonly rootId?: string;
+	/** Subagent stream, or null for the main transcript (and for files). */
+	readonly agentId: string | null;
+	/** 1-based JSONL line of the record holding the marker (`inline` only). */
+	readonly recordIndex: number | null;
+}
+
+export type SessionImageSkipReason =
+	/** Over this capture's image budget; a later capture uploads it. */
+	| "deferred"
+	/** Larger than one image object may be. */
+	| "too-large"
+	/** A binary file that is not an image. */
+	| "unsupported-media-type"
+	/** The file could not be read as a regular file. */
+	| "unreadable"
+	/** The server does not accept `image` objects yet. */
+	| "server-unsupported";
+
+export interface SessionImages {
+	readonly references: readonly SessionImageReference[];
+	/** References and skipped images beyond the manifest's bound. */
+	readonly omitted: number;
+	/** Images (one entry per hash) whose bytes are not in this upload. */
+	readonly skipped: readonly {
+		readonly sha256: string;
+		readonly reason: SessionImageSkipReason;
+	}[];
+}
 
 export interface TaskOutputReference {
 	/** Claude Code's id of the background task (Bash, Monitor or agent). */
