@@ -65,7 +65,7 @@ Usage analytics are separate from session uploads. Official releases include Pos
 
 | Event | Included information |
 | --- | --- |
-| First run | CLI version, operating system, and command name. |
+| First run | CLI version, operating system, command name, and whether the command runs in CI, in an interactive terminal, or without saved CLI state. |
 | Login attempt and result | CLI version, operating system, and authentication outcome. |
 | Automatic-upload setup result | CLI version, operating system, setup outcome, selected repository count, total local session count, and an anonymous list of session counts per repository, grouped by agent and destination workspace. |
 
@@ -73,7 +73,7 @@ An anonymous local identifier links activity to your Opaline account after login
 
 Setup counts describe the selected local sessions, including previously uploaded ones; they do not measure successful uploads. Duplicate discoveries within a repository count once. Counts are snapshots, not values to sum across repeated setup events or agents sharing a repository. The upload picker measures selected repositories even when opened through the legacy `enable` or `disable` names.
 
-`doctor` and hook invocations do not emit first-run events. Analytics failures do not prevent CLI commands from running. Source builds are unconfigured by default unless explicitly supplied with PostHog configuration.
+`help`, `doctor`, and hook invocations do not emit first-run events. Analytics failures do not prevent CLI commands from running. Source builds are unconfigured by default unless explicitly supplied with PostHog configuration.
 
 ### Opt out
 

@@ -103,6 +103,64 @@ test("account switching and logout start separate anonymous identities", async (
 	expect(new Set(Object.values(ids)).size).toBe(3);
 });
 
+test("first run reports CI, interactive, and ephemeral state", async () => {
+	const FirstRunSchema = z.object({
+		batch: z.array(
+			z.object({
+				event: z.string(),
+				properties: z.object({
+					is_ci: z.boolean(),
+					is_interactive: z.boolean(),
+					is_ephemeral: z.boolean(),
+				}),
+			}),
+		),
+	});
+	const received: z.infer<typeof FirstRunSchema>["batch"] = [];
+	const collector = Bun.serve({
+		port: 0,
+		hostname: "127.0.0.1",
+		async fetch(request) {
+			const body = new Uint8Array(await request.arrayBuffer());
+			const json =
+				request.headers.get("content-encoding") === "gzip"
+					? Bun.gunzipSync(body)
+					: body;
+			received.push(
+				...FirstRunSchema.parse(JSON.parse(new TextDecoder().decode(json)))
+					.batch,
+			);
+			return Response.json({ status: 1 });
+		},
+	});
+	try {
+		const host = { POSTHOG_HOST: `http://127.0.0.1:${collector.port}` };
+		const saved = await mkdtemp(join(root, "first-run-saved-"));
+		await runProbe("first-run", saved, { ...host, CI: "true" });
+		const unwritable = join(root, "first-run-file-instead-of-directory");
+		await writeFile(unwritable, "cannot create a directory here");
+		await runProbe("first-run", unwritable, { ...host, CI: "" });
+	} finally {
+		await collector.stop(true);
+	}
+	expect(
+		received.map(({ event, properties }) => ({ event, ...properties })),
+	).toEqual([
+		{
+			event: "CLI First Run",
+			is_ci: true,
+			is_interactive: false,
+			is_ephemeral: false,
+		},
+		{
+			event: "CLI First Run",
+			is_ci: false,
+			is_interactive: false,
+			is_ephemeral: true,
+		},
+	]);
+});
+
 const UUID =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const OPT_OUTS = [{ POSTHOG_ENABLED: "false" }, { DO_NOT_TRACK: "1" }] as const;
