@@ -10,7 +10,12 @@ import {
 
 switch (process.argv[2]) {
 	case "first-run":
-		trackCliFirstRun({ commandName: "help", isAuthenticated: false });
+		trackCliFirstRun({
+			commandName: "upload",
+			isAuthenticated: false,
+			isCi: process.env.CI === "true",
+			isInteractive: false,
+		});
 		break;
 	case "login-attempt":
 		console.log(getNextCliLoginAttemptNumber());

@@ -22,13 +22,9 @@ export async function runCli(
 		await run(app, commandArgs, { process });
 		return;
 	}
-	if (
-		shouldOfferCliUpdate(
-			commandArgs,
-			Boolean(process.stdin.isTTY && process.stdout.isTTY),
-			Boolean(process.env.CI),
-		)
-	) {
+	const isInteractive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+	const isCi = Boolean(process.env.CI);
+	if (shouldOfferCliUpdate(commandArgs, isInteractive, isCi)) {
 		try {
 			if (await offerCliUpdate(args)) return;
 		} catch (error) {
@@ -46,13 +42,16 @@ export async function runCli(
 		if (
 			commandName !== "doctor" &&
 			commandName !== "hooks" &&
-			commandName !== "update"
+			commandName !== "update" &&
+			commandName !== "help"
 		) {
 			try {
 				const credentials = loadCredentials();
 				trackCliFirstRun({
 					commandName,
 					isAuthenticated: credentials !== null,
+					isCi,
+					isInteractive,
 					userId: credentials?.user?.id,
 				});
 			} catch {

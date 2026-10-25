@@ -104,6 +104,9 @@ const CliFirstRunEventSchema = RequiredCommonSchema.extend({
 	platform_os: ProductAnalyticsPlatformOsSchema,
 	command_name: ProductAnalyticsCliCommandNameSchema,
 	is_authenticated: z.boolean(),
+	is_ci: z.boolean(),
+	is_interactive: z.boolean(),
+	is_ephemeral: z.boolean(),
 }).strict();
 
 const CliLoginStartedEventSchema = RequiredCommonSchema.extend({
