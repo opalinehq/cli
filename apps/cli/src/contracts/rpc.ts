@@ -1,6 +1,10 @@
 import { oc } from "@orpc/contract";
 import { z } from "zod";
 import {
+	AskBridgeConnectInputSchema,
+	AskBridgeConnectionSchema,
+} from "./ask.js";
+import {
 	IngestSessionInputSchema,
 	IngestSessionOutputSchema,
 	REDACTION_BUDGET_EXCEEDED_CODE,
@@ -86,6 +90,11 @@ const OrganizationSchema = z.object({
 });
 
 export const contract = {
+	ask: {
+		bridgeConnect: oc
+			.input(AskBridgeConnectInputSchema)
+			.output(AskBridgeConnectionSchema),
+	},
 	me: oc.output(UserSchema),
 	cli: {
 		reportUploadFailures: oc

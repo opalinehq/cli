@@ -55,6 +55,7 @@
 		"@orpc/client": "^1.13.5",
 		"@orpc/contract": "^1.13.5",
 		"@stricli/core": "^1.2.5",
+		"convex": "1.46.0",
 		"posthog-node": "5.46.1",
 		"p-map": "^7.0.4",
 		"smol-toml": "^1.6.0",
