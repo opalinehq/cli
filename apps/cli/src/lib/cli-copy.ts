@@ -30,15 +30,13 @@ export const DEFAULT_CLI_COPY = {
 	discarded: "Unsaved changes discarded.",
 	whoamiLoggedOut: "Not logged in. Run `opaline login` to authenticate.",
 	logoutSuccess: "Logged out successfully.",
-	askOfferTitle: "Turn on Ask?",
-	askOfferBody:
-		"Claude Code {version} answers your Opaline questions, on your plan.",
-	askTurnOn: "Turn on Ask",
-	askNotNow: "Not now",
-	askOn: "Ask is on",
-	askFirstQuestion: "Ask at {url}",
-	askClaudeLogin: "Log in to Claude Code {version} to use Ask.",
-	askClaudeLoginNext: "Run `claude`, then `opaline ask on`.",
+	askConnectTitle: "Connect with your Claude Code / Codex subscription",
+	askConnectSubtitle: "Use your subscription to analyze your sessions.",
+	askConnect: "Connect",
+	askLater: "Later",
+	askConnected: "Connected {agents}",
+	askNeedsAgent:
+		"Install or log in to Claude Code or Codex, then run `opaline ask on`.",
 };
 
 export type CliCopyKey = keyof typeof DEFAULT_CLI_COPY;

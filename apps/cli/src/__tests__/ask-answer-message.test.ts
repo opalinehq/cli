@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { basename, dirname } from "node:path";
 import { PassThrough } from "node:stream";
 import { getFunctionName } from "convex/server";
+import type { AgentProcess, SpawnAgent } from "../lib/ask/agent-process.js";
+import { agentFor } from "../lib/ask/agent-selection.js";
 import {
 	type AnswerDependencies,
 	answerMessage,
@@ -16,13 +18,13 @@ import {
 	createAskBackend,
 } from "../lib/ask/ask-convex.js";
 import {
-	type AgentProcess,
 	CLAUDE_NOT_INSTALLED_ERROR,
 	runClaude,
-	type SpawnAgent,
 } from "../lib/ask/claude-runner.js";
 import { NOT_LOGGED_IN_ERROR } from "../lib/ask/claude-stream.js";
+import { CODEX_MCP_TOKEN_ENV, runCodex } from "../lib/ask/codex-runner.js";
 import { PendingQueue } from "../lib/ask/pending-queue.js";
+import type { ProviderState } from "../lib/ask/providers.js";
 
 const MESSAGE_ID = "message-1";
 const MCP_TOKEN = "mcp-secret-token";
@@ -64,6 +66,7 @@ class FakeClaude extends EventEmitter implements AgentProcess {
 }
 
 interface SpawnCall {
+	readonly command: string;
 	readonly args: readonly string[];
 	readonly cwd: string;
 	readonly env: NodeJS.ProcessEnv;
@@ -74,12 +77,15 @@ interface SpawnCall {
 function fakeSpawn(behave: (child: FakeClaude) => void) {
 	const calls: SpawnCall[] = [];
 	const children: FakeClaude[] = [];
-	const spawnAgent: SpawnAgent = (_command, args, options) => {
-		const configPath = args[args.indexOf("--mcp-config") + 1] ?? "";
+	const spawnAgent: SpawnAgent = (command, args, options) => {
+		const configPath = args.includes("--mcp-config")
+			? args[args.indexOf("--mcp-config") + 1]
+			: undefined;
 		calls.push({
+			command,
 			args,
 			...options,
-			mcpConfig: readFileSync(configPath, "utf8"),
+			mcpConfig: configPath ? readFileSync(configPath, "utf8") : "",
 			workingDirectoryEntries: readdirSync(options.cwd),
 		});
 		const child = new FakeClaude();
@@ -118,14 +124,24 @@ function fakeConvex(claimResult: ClaimedMessage | null) {
 	};
 }
 
+const BOTH_READY: ProviderState[] = [
+	{ kind: "claude", version: "2.1.316", ready: true },
+	{ kind: "codex", version: "0.156.0", ready: true },
+];
+
 function dependencies(
 	convex: ReturnType<typeof fakeConvex>,
 	spawnAgent: SpawnAgent,
 	stopSignal: AbortSignal = new AbortController().signal,
+	providers: ProviderState[] = BOTH_READY,
 ): AnswerDependencies {
 	return {
 		backend: convex.backend,
-		runAgent: (job, options) => runClaude(job, { ...options, spawnAgent }),
+		selectAgent: async (provider) =>
+			agentFor(provider, providers, {
+				claude: (job, options) => runClaude(job, { ...options, spawnAgent }),
+				codex: (job, options) => runCodex(job, { ...options, spawnAgent }),
+			}),
 		mcpAccess: async () => ({
 			mcpUrl: "https://opaline.test/mcp",
 			mcpToken: MCP_TOKEN,
@@ -303,6 +319,50 @@ test("a resume whose session is gone on this computer reruns once in a fresh ses
 	expect(combinedProgress(convex).agentSessionId).toBe("new-session");
 	expect(convex.calls("ask:finish")).toEqual([
 		{ messageId: MESSAGE_ID, status: "done" },
+	]);
+});
+
+test("a Codex question runs Codex with the Opaline token in its environment, and a provider that is not ready fails without starting anything", async () => {
+	const convex = fakeConvex({ ...CLAIMED, provider: "codex" });
+	const codex = fakeSpawn((child) => {
+		child.print(
+			{ type: "thread.started", thread_id: "thread-7" },
+			{
+				type: "item.completed",
+				item: { id: "item_0", type: "agent_message", text: "Seven." },
+			},
+			{ type: "turn.completed", usage: {} },
+		);
+		child.exit(0);
+	});
+	expect(
+		await answerMessage(MESSAGE_ID, dependencies(convex, codex.spawnAgent)),
+	).toEqual({ status: "done" });
+	const [call] = codex.calls;
+	expect(call?.command).toBe("codex");
+	expect(call?.args.slice(0, 2)).toEqual(["exec", "--json"]);
+	expect(call?.args).toContain("--ignore-user-config");
+	expect(call?.args.join(" ")).not.toContain(MCP_TOKEN);
+	expect(call?.env[CODEX_MCP_TOKEN_ENV]).toBe(MCP_TOKEN);
+	expect(codex.children[0]?.prompt).toBe(CLAIMED.prompt);
+	expect(combinedProgress(convex).agentSessionId).toBe("thread-7");
+
+	const loggedOut = fakeConvex({ ...CLAIMED, provider: "codex" });
+	const nothing = fakeSpawn(() => {});
+	await answerMessage(
+		MESSAGE_ID,
+		dependencies(loggedOut, nothing.spawnAgent, undefined, [
+			BOTH_READY[0] as ProviderState,
+			{ kind: "codex", version: "0.156.0", ready: false },
+		]),
+	);
+	expect(nothing.calls).toHaveLength(0);
+	expect(loggedOut.calls("ask:finish")).toEqual([
+		{
+			messageId: MESSAGE_ID,
+			status: "failed",
+			error: "Codex is not logged in on this computer — run `codex login`",
+		},
 	]);
 });
 

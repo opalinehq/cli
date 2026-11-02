@@ -4,7 +4,11 @@ import { cliMessage } from "../cli-messages.js";
 import type { Credentials } from "../credentials.js";
 import { debugLog } from "../debug.js";
 import { bridgeConnectFor, isAskUnavailable } from "./bridge-connect.js";
-import { detectClaude, type ProviderState } from "./providers.js";
+import {
+	AGENT_NAMES,
+	detectProviders,
+	type ProviderState,
+} from "./providers.js";
 import {
 	type AskServiceWorkspace,
 	askServicePlatform,
@@ -12,31 +16,31 @@ import {
 	isAskServiceInstalled,
 } from "./service.js";
 
-export type AskOfferResult =
+export type AgentConnectResult =
 	| "not-shown"
-	| "claude-login"
-	| "declined"
-	| "turned-on"
+	| "connected"
+	| "later"
+	| "needs-agent"
 	| "install-failed";
 
-export interface AskOfferScreens {
-	offer(version: string): Promise<boolean>;
-	askOn(url: string): void;
-	claudeLogin(version: string): void;
+export interface AgentConnectScreens {
+	offer(): Promise<boolean>;
+	connected(agents: string): void;
+	needsAgent(): void;
 	installFailed(error: string): void;
 }
 
-export interface AskOfferDependencies {
+export interface AgentConnectDependencies {
 	readonly interactive: boolean;
 	readonly serviceSupported: boolean;
 	readonly serviceInstalled: () => Promise<boolean>;
-	readonly detectClaude: () => Promise<ProviderState>;
+	readonly detectProviders: () => Promise<ProviderState[]>;
 	readonly connect: () => Promise<AskBridgeConnection>;
 	readonly install: (workspace: AskServiceWorkspace) => Promise<void>;
-	readonly screens: AskOfferScreens;
+	readonly screens: AgentConnectScreens;
 }
 
-export async function offerAskAfterUpload(input: {
+export async function connectAgentsAfterUpload(input: {
 	readonly credentials: Credentials | undefined;
 	readonly apiBaseUrl: string;
 	readonly organizationId: string | undefined;
@@ -44,11 +48,11 @@ export async function offerAskAfterUpload(input: {
 	const { credentials, organizationId } = input;
 	if (!credentials || !organizationId) return;
 	try {
-		await offerAsk({
+		await connectAgents({
 			interactive: isInteractiveTerminal(),
 			serviceSupported: askServicePlatform() !== undefined,
 			serviceInstalled: isAskServiceInstalled,
-			detectClaude: () => detectClaude(),
+			detectProviders: () => detectProviders(),
 			connect: async () =>
 				(
 					await bridgeConnectFor({
@@ -58,12 +62,65 @@ export async function offerAskAfterUpload(input: {
 					})
 				)(),
 			install: installAskService,
-			screens: clackAskScreens,
+			screens: clackAgentScreens,
 		});
 	} catch (error) {
-		debugLog("ask offer failed", {
+		debugLog("agent connect failed", {
 			message: error instanceof Error ? error.message : String(error),
 		});
+	}
+}
+
+export async function connectAgents(
+	dependencies: AgentConnectDependencies,
+): Promise<AgentConnectResult> {
+	if (!dependencies.interactive || !dependencies.serviceSupported)
+		return "not-shown";
+	if (await dependencies.serviceInstalled()) return "not-shown";
+	const connection = await askConnection(dependencies);
+	if (!connection) return "not-shown";
+	const ready = (await dependencies.detectProviders()).filter(
+		(provider) => provider.ready,
+	);
+	if (ready.length === 0) {
+		dependencies.screens.needsAgent();
+		return "needs-agent";
+	}
+	if (!(await dependencies.screens.offer())) return "later";
+	try {
+		await dependencies.install({
+			slug: connection.workspace.slug,
+			name: connection.workspace.name,
+		});
+	} catch (error) {
+		dependencies.screens.installFailed(
+			error instanceof Error ? error.message : String(error),
+		);
+		return "install-failed";
+	}
+	dependencies.screens.connected(describeAgents(ready));
+	return "connected";
+}
+
+export function describeAgents(providers: readonly ProviderState[]): string {
+	return providers
+		.map((provider) =>
+			[AGENT_NAMES[provider.kind], provider.version].filter(Boolean).join(" "),
+		)
+		.join(" and ");
+}
+
+async function askConnection(
+	dependencies: AgentConnectDependencies,
+): Promise<AskBridgeConnection | undefined> {
+	try {
+		return await dependencies.connect();
+	} catch (error) {
+		debugLog("agent connect skipped", {
+			unavailable: isAskUnavailable(error),
+			message: error instanceof Error ? error.message : String(error),
+		});
+		return undefined;
 	}
 }
 
@@ -73,82 +130,26 @@ function isInteractiveTerminal(): boolean {
 	);
 }
 
-export async function offerAsk(
-	dependencies: AskOfferDependencies,
-): Promise<AskOfferResult> {
-	if (!dependencies.interactive || !dependencies.serviceSupported)
-		return "not-shown";
-	if (await dependencies.serviceInstalled()) return "not-shown";
-	const claude = await dependencies.detectClaude();
-	if (!claude.version) return "not-shown";
-	const connection = await askConnection(dependencies);
-	if (!connection) return "not-shown";
-	const workspace = {
-		slug: connection.workspace.slug,
-		name: connection.workspace.name,
-	};
-	if (!claude.ready) {
-		dependencies.screens.claudeLogin(claude.version);
-		return "claude-login";
-	}
-	if (!(await dependencies.screens.offer(claude.version))) return "declined";
-	try {
-		await dependencies.install(workspace);
-	} catch (error) {
-		dependencies.screens.installFailed(
-			error instanceof Error ? error.message : String(error),
-		);
-		return "install-failed";
-	}
-	dependencies.screens.askOn(connection.askUrl);
-	return "turned-on";
-}
-
-async function askConnection(
-	dependencies: AskOfferDependencies,
-): Promise<AskBridgeConnection | undefined> {
-	try {
-		return await dependencies.connect();
-	} catch (error) {
-		debugLog("ask offer skipped", {
-			unavailable: isAskUnavailable(error),
-			message: error instanceof Error ? error.message : String(error),
-		});
-		return undefined;
-	}
-}
-
-export const clackAskScreens: AskOfferScreens = {
-	async offer(version) {
+export const clackAgentScreens: AgentConnectScreens = {
+	async offer() {
 		const choice = await p.select({
-			message: [
-				cliMessage("askOfferTitle"),
-				dim(cliMessage("askOfferBody", { version })),
-			].join("\n"),
+			message: `${cliMessage("askConnectTitle")}\n${dim(cliMessage("askConnectSubtitle"))}`,
 			options: [
-				{ value: "on", label: cliMessage("askTurnOn") },
-				{ value: "later", label: cliMessage("askNotNow") },
+				{ value: "connect", label: cliMessage("askConnect") },
+				{ value: "later", label: cliMessage("askLater") },
 			],
-			initialValue: "on",
+			initialValue: "connect",
 		});
-		return !p.isCancel(choice) && choice === "on";
+		return !p.isCancel(choice) && choice === "connect";
 	},
-	askOn(url) {
-		p.log.success(cliMessage("askOn"));
-		p.log.info(cliMessage("askFirstQuestion", { url }));
+	connected(agents) {
+		p.log.success(cliMessage("askConnected", { agents }));
 	},
-	claudeLogin(version) {
-		p.log.warn(
-			[
-				cliMessage("askClaudeLogin", { version }),
-				cliMessage("askClaudeLoginNext"),
-			].join("\n"),
-		);
+	needsAgent() {
+		p.log.warn(cliMessage("askNeedsAgent"));
 	},
 	installFailed(error) {
-		p.log.warn(
-			`Could not turn on Ask: ${error}\nTry again with \`opaline ask on\`.`,
-		);
+		p.log.warn(`Could not connect: ${error}. Run \`opaline ask on\` to retry.`);
 	},
 };
 

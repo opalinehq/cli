@@ -4,7 +4,14 @@ import {
 	bridgeConnectFor,
 	describeAskError,
 } from "../../lib/ask/bridge-connect.js";
-import { detectClaude, type ProviderState } from "../../lib/ask/providers.js";
+import { describeAgents } from "../../lib/ask/onboarding.js";
+import {
+	AGENT_NAMES,
+	detectClaude,
+	detectCodex,
+	detectProviders,
+	type ProviderState,
+} from "../../lib/ask/providers.js";
 import {
 	ASK_SERVICE_UNSUPPORTED_MESSAGE,
 	askServicePlatform,
@@ -12,6 +19,7 @@ import {
 	readAskServiceStatus,
 	removeAskService,
 } from "../../lib/ask/service.js";
+import { cliMessage } from "../../lib/cli-messages.js";
 import { loadCredentials } from "../../lib/credentials.js";
 
 async function turnOn(flags: {
@@ -23,8 +31,8 @@ async function turnOn(flags: {
 	}
 	const credentials = loadCredentials();
 	if (!credentials) return new Error("Run `opaline login` first.");
-	const claudeProblem = describeClaudeProblem(await detectClaude());
-	if (claudeProblem) return new Error(claudeProblem);
+	const ready = (await detectProviders()).filter((provider) => provider.ready);
+	if (ready.length === 0) return new Error(cliMessage("askNeedsAgent"));
 	const apiBaseUrl = askApiBase(credentials);
 	try {
 		const connect = await bridgeConnectFor({
@@ -34,8 +42,8 @@ async function turnOn(flags: {
 		});
 		const { workspace, askUrl } = await connect();
 		await installAskService({ slug: workspace.slug, name: workspace.name });
-		console.log(`Ask is on for ${workspace.name}.`);
-		console.log(`Ask your first question at ${askUrl}`);
+		console.log(cliMessage("askConnected", { agents: describeAgents(ready) }));
+		console.log(`Ask is on for ${workspace.name}: ${askUrl}`);
 	} catch (error) {
 		return new Error(describeAskError(error, apiBaseUrl));
 	}
@@ -49,16 +57,18 @@ async function turnOff(): Promise<undefined> {
 }
 
 async function printStatus(): Promise<undefined> {
-	const [service, claude] = await Promise.all([
+	const [service, claude, codex] = await Promise.all([
 		readAskServiceStatus(),
 		detectClaude(),
+		detectCodex(),
 	]);
 	console.log(`Background service: ${describeService(service)}`);
 	if (service.workspace)
 		console.log(
 			`Workspace: ${service.workspace.name} (${service.workspace.slug})`,
 		);
-	console.log(`Claude Code: ${describeClaude(claude)}`);
+	for (const agent of [claude, codex])
+		console.log(`${AGENT_NAMES[agent.kind]}: ${describeAgentState(agent)}`);
 	if (service.installed) console.log(`Log: ${service.logPath}`);
 }
 
@@ -70,17 +80,9 @@ function describeService(
 	return service.running ? "on, running" : "on, not running";
 }
 
-function describeClaude(claude: ProviderState): string {
-	if (!claude.version) return "not installed";
-	return `${claude.version}, ${claude.ready ? "logged in" : "not logged in"}`;
-}
-
-function describeClaudeProblem(claude: ProviderState): string | undefined {
-	if (!claude.version)
-		return "Claude Code is not installed. Install it, run `claude` once, then `opaline ask on`.";
-	if (!claude.ready)
-		return "Claude Code is not logged in. Run `claude` once, then `opaline ask on`.";
-	return undefined;
+function describeAgentState(agent: ProviderState): string {
+	if (!agent.version) return "not installed";
+	return `${agent.version}, ${agent.ready ? "logged in" : "not logged in"}`;
 }
 
 export const askOnCommand = buildCommand({

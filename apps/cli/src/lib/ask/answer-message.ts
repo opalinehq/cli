@@ -1,5 +1,5 @@
-import type { AgentJob, AgentOutcome, RunAgent } from "./claude-runner.js";
-import { SESSION_NOT_FOUND_ERROR } from "./claude-stream.js";
+import { SESSION_NOT_FOUND_ERROR } from "./agent-event.js";
+import type { AgentJob, AgentOutcome, RunAgent } from "./agent-process.js";
 import { ProgressBuffer, type ProgressPatch } from "./progress-buffer.js";
 
 export type AskProvider = "claude" | "codex";
@@ -36,7 +36,9 @@ export interface McpAccess {
 
 export interface AnswerDependencies {
 	readonly backend: AskBackend;
-	readonly runAgent: RunAgent;
+	readonly selectAgent: (
+		provider: AskProvider,
+	) => Promise<{ readonly run: RunAgent } | { readonly error: string }>;
 	readonly mcpAccess: () => Promise<McpAccess>;
 	readonly stopSignal: AbortSignal;
 	readonly flushIntervalMs?: number;
@@ -49,8 +51,6 @@ export type AnswerResult =
 	| { readonly status: "failed"; readonly error: string };
 
 export const BRIDGE_STOPPED_ERROR = "The bridge stopped";
-export const UNSUPPORTED_PROVIDER_ERROR =
-	"This bridge can only answer with Claude Code";
 
 const DEFAULT_FLUSH_INTERVAL_MS = 300;
 
@@ -62,20 +62,23 @@ export async function answerMessage(
 	const claimed = await backend.claim(messageId);
 	if (!claimed) return { status: "not-claimed" };
 	dependencies.onClaimed?.(claimed);
-	if (claimed.provider !== "claude") {
-		await backend.finish({
-			messageId,
-			status: "failed",
-			error: UNSUPPORTED_PROVIDER_ERROR,
-		});
-		return { status: "failed", error: UNSUPPORTED_PROVIDER_ERROR };
+	const agent = await dependencies.selectAgent(claimed.provider);
+	if ("error" in agent) {
+		await backend.finish({ messageId, status: "failed", error: agent.error });
+		return { status: "failed", error: agent.error };
 	}
 	const cancel = new AbortController();
 	const unwatch = backend.watchStatus(messageId, (status) => {
 		if (status === "cancelled") cancel.abort();
 	});
 	try {
-		return await runClaimedMessage(messageId, claimed, cancel, dependencies);
+		return await runClaimedMessage(
+			messageId,
+			claimed,
+			agent.run,
+			cancel,
+			dependencies,
+		);
 	} finally {
 		unwatch();
 	}
@@ -84,12 +87,19 @@ export async function answerMessage(
 async function runClaimedMessage(
 	messageId: string,
 	claimed: ClaimedMessage,
+	runAgent: RunAgent,
 	cancel: AbortController,
 	dependencies: AnswerDependencies,
 ): Promise<AnswerResult> {
 	const signal = AbortSignal.any([cancel.signal, dependencies.stopSignal]);
 	const progress = startProgressReporter(messageId, dependencies);
-	const outcome = await runAgentSafely(claimed, signal, progress, dependencies);
+	const outcome = await runAgentSafely(
+		claimed,
+		runAgent,
+		signal,
+		progress,
+		dependencies,
+	);
 	await progress.stop();
 	if (cancel.signal.aborted) return { status: "cancelled" };
 	const finish = finishFor(outcome, dependencies.stopSignal);
@@ -100,6 +110,7 @@ async function runClaimedMessage(
 
 async function runAgentSafely(
 	claimed: ClaimedMessage,
+	runAgent: RunAgent,
 	signal: AbortSignal,
 	progress: ProgressReporter,
 	dependencies: AnswerDependencies,
@@ -107,7 +118,7 @@ async function runAgentSafely(
 	try {
 		const access = await dependencies.mcpAccess();
 		const run = (job: Pick<AgentJob, "prompt" | "resumeSessionId">) =>
-			dependencies.runAgent(
+			runAgent(
 				{ ...job, mcpUrl: access.mcpUrl, mcpToken: access.mcpToken },
 				{ signal, onEvent: (event) => progress.buffer.add(event) },
 			);

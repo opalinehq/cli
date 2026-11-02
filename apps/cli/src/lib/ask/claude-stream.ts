@@ -1,23 +1,12 @@
-export type ToolState = "running" | "done" | "error";
-
-export type AgentEvent =
-	| { readonly kind: "session"; readonly sessionId: string }
-	| { readonly kind: "text"; readonly text: string }
-	| {
-			readonly kind: "tool";
-			readonly id: string;
-			readonly name: string;
-			readonly state: ToolState;
-	  }
-	| { readonly kind: "result"; readonly ok: true }
-	| { readonly kind: "result"; readonly ok: false; readonly error: string };
+import {
+	type AgentEvent,
+	firstLineOf,
+	isRecord,
+	parseJsonObject,
+	SESSION_NOT_FOUND_ERROR,
+} from "./agent-event.js";
 
 const OPALINE_TOOL_PREFIX = "mcp__opaline__";
-const MAX_ERROR_LENGTH = 300;
-
-export const SESSION_NOT_FOUND_ERROR =
-	"Claude Code could not find this conversation on this computer";
-
 export const NOT_LOGGED_IN_ERROR =
 	"Claude Code is not logged in — run `claude` once";
 
@@ -46,7 +35,7 @@ export function describeClaudeFailure(output: string): string | undefined {
 	if (!text) return undefined;
 	if (looksLikeLoginProblem(text)) return NOT_LOGGED_IN_ERROR;
 	if (/no conversation found/iu.test(text)) return SESSION_NOT_FOUND_ERROR;
-	return shorten(text);
+	return firstLineOf(text);
 }
 
 function sessionEvents(message: Record<string, unknown>): AgentEvent[] {
@@ -150,24 +139,4 @@ function looksLikeLoginProblem(text: string): boolean {
 	return /not logged in|please run \/login|invalid api key|oauth token has expired/iu.test(
 		text,
 	);
-}
-
-function shorten(text: string): string {
-	const firstLine = text.split("\n").find((line) => line.trim()) ?? text;
-	return firstLine.length > MAX_ERROR_LENGTH
-		? `${firstLine.slice(0, MAX_ERROR_LENGTH - 1)}…`
-		: firstLine;
-}
-
-function parseJsonObject(line: string): Record<string, unknown> | undefined {
-	try {
-		const value: unknown = JSON.parse(line);
-		return isRecord(value) ? value : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
 }

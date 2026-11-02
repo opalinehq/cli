@@ -5,6 +5,7 @@ import type { UploadManagerTheme } from "../src/lib/upload-manager-theme.js";
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const DEMO_CLAUDE_VERSION = "2.1.316";
+const DEMO_CODEX_VERSION = "0.156.0";
 export const DEMO_ORGANIZATIONS = [
 	"Opaline",
 	"Personal projects",
@@ -77,26 +78,29 @@ export function renderFlowPreview(
 		);
 		line("◆", message("saveReturn"));
 		line("└", "", 2);
-	} else if (screen === "ask-offer") {
-		line("◆", message("askOfferTitle"));
-		note(message("askOfferBody", { version: DEMO_CLAUDE_VERSION }));
+	} else if (screen === "connect-offer") {
+		line("◆", message("askConnectTitle"));
+		note(message("askConnectSubtitle"));
 		for (const [index, label] of [
-			message("askTurnOn"),
-			message("askNotNow"),
+			message("askConnect"),
+			message("askLater"),
 		].entries()) {
 			choices.push({ line: lines.length, index, label });
 			line(index === choice ? "●" : "○", label, index === choice ? 32 : 2);
 		}
 		line("└", "", 2);
-	} else if (screen === "ask-on") {
-		line("◆", message("askOn"), 32);
+	} else if (screen === "connected") {
+		line("◇", message("askConnectTitle"), 32);
+		note(message("askConnect"));
 		line(
-			"●",
-			message("askFirstQuestion", { url: `${PRODUCTION_API_BASE}/acme/ask` }),
+			"◆",
+			message("askConnected", {
+				agents: `Claude Code ${DEMO_CLAUDE_VERSION} and Codex ${DEMO_CODEX_VERSION}`,
+			}),
+			32,
 		);
-	} else if (screen === "ask-claude-login") {
-		line("▲", message("askClaudeLogin", { version: DEMO_CLAUDE_VERSION }), 33);
-		line("│", message("askClaudeLoginNext"), 2);
+	} else if (screen === "needs-agent") {
+		line("▲", message("askNeedsAgent"), 33);
 	} else if (screen === "closed") line("└", message("closed"), 2);
 	else if (screen === "whoami") line("●", identity());
 	else if (screen === "signed-out") line("●", message("whoamiLoggedOut"));

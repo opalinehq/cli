@@ -263,7 +263,7 @@ function bindControls() {
 				)
 					choice = (choice + (event.key === "ArrowDown" ? 1 : 2)) % 3;
 				else if (
-					currentScreen === "ask-offer" &&
+					currentScreen === "connect-offer" &&
 					["ArrowDown", "ArrowUp"].includes(event.key)
 				)
 					choice = (choice + 1) % 2;
@@ -857,9 +857,9 @@ function advanceFlow() {
 		"save-error": "pending",
 		"signed-out": "login",
 		closed: "repositories",
-		"ask-offer": choice === 0 ? "ask-on" : "saved",
-		"ask-on": "saved",
-		"ask-claude-login": "saved",
+		"connect-offer": choice === 0 ? "connected" : "saved",
+		connected: "saved",
+		"needs-agent": "saved",
 	};
 	changeScreen(next[currentScreen] ?? "repositories", false);
 	if (currentScreen === "saving") startPlayback("save");

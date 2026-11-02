@@ -5,7 +5,7 @@ import type { AgentAdapter } from "../internal/agent-adapters/index.js";
 import { describeSavedCredentialsApiBaseRisk } from "../lib/api-base.js";
 import { createApiClient } from "../lib/api-client.js";
 import { getApiBaseOverride, getDefaultApiBase } from "../lib/api-target.js";
-import { offerAskAfterUpload } from "../lib/ask/onboarding.js";
+import { connectAgentsAfterUpload } from "../lib/ask/onboarding.js";
 import { verifyAuth } from "../lib/auth.js";
 import { loadAutoUploadConfig } from "../lib/auto-upload-config.js";
 import { cliMessage } from "../lib/cli-messages.js";
@@ -291,7 +291,9 @@ export async function runUpload(
 				? [state.completion.url]
 				: state.completion.dashboards.map((dashboard) => dashboard.url))
 				p.log.info(url);
-			await offerAskAfterUpload(askOfferInput(guided, askOrganizationId));
+			await connectAgentsAfterUpload(
+				agentConnectInput(guided, askOrganizationId),
+			);
 			return;
 		}
 		p.outro(
@@ -306,10 +308,10 @@ export async function runUpload(
 	}
 }
 
-function askOfferInput(
+function agentConnectInput(
 	guided: GuidedUpload | undefined,
 	organizationId: string | undefined,
-): Parameters<typeof offerAskAfterUpload>[0] {
+): Parameters<typeof connectAgentsAfterUpload>[0] {
 	const credentials = guided?.credentials ?? loadCredentials() ?? undefined;
 	const apiBaseUrl =
 		guided?.apiBase ??

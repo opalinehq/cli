@@ -2,6 +2,7 @@ import { buildCommand } from "@stricli/core";
 import { ConvexClient } from "convex/browser";
 import pkg from "../../../package.json" with { type: "json" };
 import type { AskBridgeConnection } from "../../contracts/ask.js";
+import { agentFor } from "../../lib/ask/agent-selection.js";
 import {
 	type AnswerResult,
 	answerMessage,
@@ -17,12 +18,18 @@ import {
 } from "../../lib/ask/bridge-connect.js";
 import { BridgeSession } from "../../lib/ask/bridge-session.js";
 import { runClaude } from "../../lib/ask/claude-runner.js";
+import { runCodex } from "../../lib/ask/codex-runner.js";
 import { deviceName } from "../../lib/ask/device-name.js";
 import { PendingQueue } from "../../lib/ask/pending-queue.js";
-import { detectClaude, type ProviderState } from "../../lib/ask/providers.js";
+import {
+	AGENT_NAMES,
+	detectProviders,
+	type ProviderState,
+} from "../../lib/ask/providers.js";
 import { type Credentials, loadCredentials } from "../../lib/credentials.js";
 
 const HEARTBEAT_INTERVAL_MS = 15_000;
+const RUNNERS = { claude: runClaude, codex: runCodex };
 
 interface AskFlags {
 	readonly workspace?: string;
@@ -57,9 +64,16 @@ async function runBridge(
 	const stop = new AbortController();
 	printConnected(session.current, credentials);
 
-	const heartbeat = startHeartbeat(backend);
+	const providers = new ProviderMonitor();
+	const heartbeat = startHeartbeat(backend, providers);
 	const queue = new PendingQueue(
-		(messageId) => answerAndReport(messageId, backend, session, stop.signal),
+		(messageId) =>
+			answerAndReport(messageId, {
+				backend,
+				session,
+				providers,
+				stopSignal: stop.signal,
+			}),
 		stop.signal,
 		(error) => warn(`Could not take a question: ${message(error)}`),
 	);
@@ -81,30 +95,60 @@ async function runBridge(
 
 async function answerAndReport(
 	messageId: string,
-	backend: BridgeBackend,
-	session: BridgeSession,
-	stopSignal: AbortSignal,
+	bridge: {
+		readonly backend: BridgeBackend;
+		readonly session: BridgeSession;
+		readonly providers: ProviderMonitor;
+		readonly stopSignal: AbortSignal;
+	},
 ): Promise<void> {
 	const result = await answerMessage(messageId, {
-		backend,
-		runAgent: runClaude,
-		mcpAccess: session.mcpAccess,
-		stopSignal,
-		onClaimed: () => console.log("Answering a question…"),
+		backend: bridge.backend,
+		selectAgent: async (provider) =>
+			agentFor(provider, await bridge.providers.current(), RUNNERS),
+		mcpAccess: bridge.session.mcpAccess,
+		stopSignal: bridge.stopSignal,
+		onClaimed: (claimed) =>
+			console.log(
+				`Answering a question with ${AGENT_NAMES[claimed.provider]}…`,
+			),
 		onWarning: warn,
 	});
 	printAnswerResult(result);
 }
 
-function startHeartbeat(backend: BridgeBackend): { stop(): void } {
-	let providers: Promise<ProviderState[]> = detectProviders();
+class ProviderMonitor {
+	private detected: Promise<ProviderState[]> = detectAndReport();
+
+	current(): Promise<ProviderState[]> {
+		return this.detected;
+	}
+
+	refresh(): void {
+		this.detected = detectAndReport();
+	}
+}
+
+async function detectAndReport(): Promise<ProviderState[]> {
+	const providers = await detectProviders();
+	if (!providers.some((provider) => provider.ready))
+		warn(
+			"Neither Claude Code nor Codex is ready. Install or log in to one of them.",
+		);
+	return providers;
+}
+
+function startHeartbeat(
+	backend: BridgeBackend,
+	providers: ProviderMonitor,
+): { stop(): void } {
 	const name = deviceName();
 	const beat = async () => {
 		try {
 			await backend.heartbeat({
 				name: await name,
 				cliVersion: pkg.version,
-				providers: await providers,
+				providers: await providers.current(),
 			});
 		} catch (error) {
 			warn(`Heartbeat failed: ${message(error)}`);
@@ -112,23 +156,16 @@ function startHeartbeat(backend: BridgeBackend): { stop(): void } {
 	};
 	void beat();
 	const timer = setInterval(() => void beat(), HEARTBEAT_INTERVAL_MS);
-	const redetect = setInterval(() => {
-		providers = detectProviders();
-	}, 10 * HEARTBEAT_INTERVAL_MS);
+	const redetect = setInterval(
+		() => providers.refresh(),
+		10 * HEARTBEAT_INTERVAL_MS,
+	);
 	return {
 		stop: () => {
 			clearInterval(timer);
 			clearInterval(redetect);
 		},
 	};
-}
-
-async function detectProviders(): Promise<ProviderState[]> {
-	const claude = await detectClaude();
-	if (!claude.version) warn("Claude Code is not installed.");
-	else if (!claude.ready)
-		warn("Claude Code is not logged in — run `claude` once.");
-	return [claude];
 }
 
 function waitForStopSignal(): Promise<void> {

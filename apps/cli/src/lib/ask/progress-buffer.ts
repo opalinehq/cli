@@ -1,4 +1,4 @@
-import type { AgentEvent, ToolState } from "./claude-stream.js";
+import type { AgentEvent, ToolState } from "./agent-event.js";
 
 export interface AskTool {
 	readonly id: string;
