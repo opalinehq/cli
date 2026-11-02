@@ -6,6 +6,10 @@ export function getSessionsDashboardUrl(
 	return getWebUrl(endpoint, path);
 }
 
+export function getAskUrl(endpoint: string, workspaceSlug: string): string {
+	return getWebUrl(endpoint, `/${encodeURIComponent(workspaceSlug)}/ask`);
+}
+
 export function getSetupContinueUrl(endpoint: string): string {
 	return getWebUrl(endpoint, "/welcome");
 }

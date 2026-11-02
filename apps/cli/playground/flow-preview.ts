@@ -4,6 +4,7 @@ import { cliMessage } from "../src/lib/cli-messages.js";
 import type { UploadManagerTheme } from "../src/lib/upload-manager-theme.js";
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const DEMO_CLAUDE_VERSION = "2.1.316";
 export const DEMO_ORGANIZATIONS = [
 	"Opaline",
 	"Personal projects",
@@ -32,6 +33,10 @@ export function renderFlowPreview(
 		const wrapped = wrap(text, columns - 5);
 		for (const [index, part] of wrapped.entries())
 			lines.push(` ${index === 0 ? color(symbol, code) : muted("│")}  ${part}`);
+	};
+	const note = (text: string) => {
+		for (const part of wrap(text, columns - 5))
+			lines.push(` ${muted("│")}  ${muted(part)}`);
 	};
 	const spin = (text: string) =>
 		line(SPINNER[frame % SPINNER.length] ?? "⠋", text);
@@ -72,6 +77,27 @@ export function renderFlowPreview(
 		);
 		line("◆", message("saveReturn"));
 		line("└", "", 2);
+	} else if (screen === "ask-offer") {
+		line("◆", message("askOfferTitle"));
+		note(message("askOfferBody", { version: DEMO_CLAUDE_VERSION }));
+		note(message("askOfferOff"));
+		for (const [index, label] of [
+			message("askTurnOn"),
+			message("askNotNow"),
+		].entries()) {
+			choices.push({ line: lines.length, index, label });
+			line(index === choice ? "●" : "○", label, index === choice ? 32 : 2);
+		}
+		line("└", "", 2);
+	} else if (screen === "ask-on") {
+		line("◆", message("askOn"), 32);
+		line(
+			"●",
+			message("askFirstQuestion", { url: `${PRODUCTION_API_BASE}/acme/ask` }),
+		);
+	} else if (screen === "ask-claude-login") {
+		line("▲", message("askClaudeLogin", { version: DEMO_CLAUDE_VERSION }), 33);
+		line("│", message("askClaudeLoginNext"), 2);
 	} else if (screen === "closed") line("└", message("closed"), 2);
 	else if (screen === "whoami") line("●", identity());
 	else if (screen === "signed-out") line("●", message("whoamiLoggedOut"));

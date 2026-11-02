@@ -1,10 +1,10 @@
 import { buildRouteMap } from "@stricli/core";
-import { askCommand } from "./ask.js";
+import { askRunCommand } from "../ask/run.js";
 import { listSessionsCommand } from "./list-sessions.js";
 
 export const devRouteMap = buildRouteMap({
 	routes: {
-		ask: askCommand,
+		ask: askRunCommand,
 		"list-sessions": listSessionsCommand,
 	},
 	docs: {

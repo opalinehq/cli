@@ -1,5 +1,6 @@
 import { buildApplication, buildRouteMap } from "@stricli/core";
 import pkg from "../package.json" with { type: "json" };
+import { askRouteMap } from "./commands/ask/index.js";
 import { connectCommand } from "./commands/connect.js";
 import { devRouteMap } from "./commands/dev/index.js";
 import { doctorCommand } from "./commands/doctor.js";
@@ -27,6 +28,7 @@ const routes = buildRouteMap({
 		"set-org": setOrgCommand,
 		hooks: hooksRouteMap,
 		dev: devRouteMap,
+		ask: askRouteMap,
 	},
 	defaultCommand: "upload",
 	docs: {
@@ -34,6 +36,7 @@ const routes = buildRouteMap({
 		hideRoute: {
 			hooks: true,
 			dev: true,
+			ask: true,
 			connect: true,
 			import: true,
 			enable: true,

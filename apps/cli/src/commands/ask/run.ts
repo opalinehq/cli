@@ -1,11 +1,8 @@
 import { hostname } from "node:os";
-import { ORPCError } from "@orpc/client";
 import { buildCommand } from "@stricli/core";
 import { ConvexClient } from "convex/browser";
 import pkg from "../../../package.json" with { type: "json" };
 import type { AskBridgeConnection } from "../../contracts/ask.js";
-import { createApiClient } from "../../lib/api-client.js";
-import { getApiBaseOverride } from "../../lib/api-target.js";
 import {
 	type AnswerResult,
 	answerMessage,
@@ -14,10 +11,13 @@ import {
 	type BridgeBackend,
 	createAskBackend,
 } from "../../lib/ask/ask-convex.js";
+import {
+	askApiBase,
+	bridgeConnectFor,
+	describeAskError,
+} from "../../lib/ask/bridge-connect.js";
 import { BridgeSession } from "../../lib/ask/bridge-session.js";
-import { resolveBridgeOrganizationId } from "../../lib/ask/bridge-workspace.js";
 import { runClaude } from "../../lib/ask/claude-runner.js";
-import { loadDeviceId } from "../../lib/ask/device-id.js";
 import { PendingQueue } from "../../lib/ask/pending-queue.js";
 import { detectClaude, type ProviderState } from "../../lib/ask/providers.js";
 import { type Credentials, loadCredentials } from "../../lib/credentials.js";
@@ -31,32 +31,20 @@ interface AskFlags {
 async function runAsk(flags: AskFlags): Promise<undefined | Error> {
 	const credentials = loadCredentials();
 	if (!credentials) return new Error("Run `opaline login` first.");
-	const apiBaseUrl = getApiBaseOverride() ?? credentials.apiBaseUrl;
+	const apiBaseUrl = askApiBase(credentials);
 	try {
-		const session = await openSession(credentials, apiBaseUrl, flags.workspace);
+		const connect = await bridgeConnectFor({
+			credentials,
+			apiBaseUrl,
+			workspaceSlug: flags.workspace,
+		});
+		const session = await BridgeSession.open(connect, (error) =>
+			warn(`Could not renew the Opaline connection: ${message(error)}`),
+		);
 		await runBridge(session, credentials);
 	} catch (error) {
-		return new Error(describeStartupError(error, apiBaseUrl));
+		return new Error(describeAskError(error, apiBaseUrl));
 	}
-}
-
-async function openSession(
-	credentials: Credentials,
-	apiBaseUrl: string,
-	workspaceSlug: string | undefined,
-): Promise<BridgeSession> {
-	const api = createApiClient({ ...credentials, apiBaseUrl });
-	const organizationId = await resolveBridgeOrganizationId({
-		slug: workspaceSlug,
-		credentials,
-		listOrganizations: () => api.listMyOrganizations(),
-	});
-	const deviceId = await loadDeviceId();
-	return BridgeSession.open(
-		() => api.ask.bridgeConnect({ organizationId, deviceId }),
-		(error) =>
-			warn(`Could not renew the Opaline connection: ${message(error)}`),
-	);
 }
 
 async function runBridge(
@@ -169,16 +157,6 @@ function printAnswerResult(result: AnswerResult): void {
 	if (result.status === "cancelled") console.log("Cancelled.");
 }
 
-function describeStartupError(error: unknown, apiBaseUrl: string): string {
-	if (error instanceof ORPCError && error.code === "FORBIDDEN")
-		return "Ask is not turned on for this workspace, or you are not a member of it.";
-	if (error instanceof ORPCError && error.code === "PRECONDITION_FAILED")
-		return "Ask is not available on this Opaline server yet.";
-	if (error instanceof TypeError && error.message === "fetch failed")
-		return `Could not reach Opaline at ${apiBaseUrl}.`;
-	return message(error);
-}
-
 function warn(text: string): void {
 	console.error(text);
 }
@@ -187,7 +165,7 @@ function message(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-export const askCommand = buildCommand({
+export const askRunCommand = buildCommand({
 	loader: async () => ({ default: runAsk }),
 	parameters: {
 		flags: {

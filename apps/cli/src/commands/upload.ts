@@ -5,10 +5,12 @@ import type { AgentAdapter } from "../internal/agent-adapters/index.js";
 import { describeSavedCredentialsApiBaseRisk } from "../lib/api-base.js";
 import { createApiClient } from "../lib/api-client.js";
 import { getApiBaseOverride, getDefaultApiBase } from "../lib/api-target.js";
+import { offerAskAfterUpload } from "../lib/ask/onboarding.js";
 import { verifyAuth } from "../lib/auth.js";
 import { loadAutoUploadConfig } from "../lib/auto-upload-config.js";
 import { cliMessage } from "../lib/cli-messages.js";
 import { loadCredentials } from "../lib/credentials.js";
+import { getAskUrl } from "../lib/dashboard-url.js";
 import type { GuidedUpload } from "../lib/guided-upload.js";
 import { getProjectOrgId } from "../lib/project-config.js";
 import {
@@ -98,6 +100,7 @@ export async function runUpload(
 		let uploadedThisRun = 0;
 		let skippedBeforeRun: number | undefined;
 		const uploadedWorkspaces = new Set<string | undefined>();
+		let askOrganizationId: string | undefined;
 		while (
 			(await promptUploadManager(
 				repositories,
@@ -228,6 +231,11 @@ export async function runUpload(
 									uploadedWorkspaces.add(
 										repo.uploadedOrganizationId ?? repo.organizationId,
 									);
+								askOrganizationId =
+									destination.defaultOrganizationId ??
+									[...uploadedWorkspaces].find(
+										(id): id is string => id !== undefined,
+									);
 								const completion = getUploadCompletion(
 									config.endpoint,
 									hasPreviousUploads ?? false,
@@ -284,6 +292,7 @@ export async function runUpload(
 				? [state.completion.url]
 				: state.completion.dashboards.map((dashboard) => dashboard.url))
 				p.log.info(url);
+			await offerAskAfterUpload(askOfferInput(guided, askOrganizationId));
 			return;
 		}
 		p.outro(
@@ -296,6 +305,25 @@ export async function runUpload(
 	} finally {
 		screen.close();
 	}
+}
+
+function askOfferInput(
+	guided: GuidedUpload | undefined,
+	organizationId: string | undefined,
+): Parameters<typeof offerAskAfterUpload>[0] {
+	const credentials = guided?.credentials ?? loadCredentials() ?? undefined;
+	const apiBaseUrl =
+		guided?.apiBase ??
+		getApiBaseOverride() ??
+		credentials?.apiBaseUrl ??
+		getDefaultApiBase();
+	return {
+		credentials,
+		apiBaseUrl,
+		organizationId,
+		askUrl: (slug) =>
+			guided ? guided.askUrl(slug) : getAskUrl(`${apiBaseUrl}/rpc`, slug),
+	};
 }
 
 function getManagerUploadConfig(

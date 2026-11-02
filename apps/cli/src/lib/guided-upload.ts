@@ -105,6 +105,12 @@ export function createGuidedUpload(
 			finished = true;
 			connection.stop();
 		},
+		askUrl(workspaceSlug: string): string {
+			return new URL(
+				`/${encodeURIComponent(workspaceSlug)}/ask`,
+				connection.browserOrigin,
+			).toString();
+		},
 		completionLink(completion: UploadCompletion): UploadCompletion {
 			if (completion.kind === "sessions") return completion;
 			const url = new URL("/welcome", connection.browserOrigin);

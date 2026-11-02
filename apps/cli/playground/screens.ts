@@ -164,6 +164,51 @@ export const SCREENS: Screen[] = [
 		],
 	},
 	{
+		id: "ask-offer",
+		label: "Ask offer",
+		group: "Ask",
+		command: "opaline upload",
+		description:
+			"Shown after uploads when Claude Code is installed and logged in and Ask is on for the workspace. Use ↑↓ and Enter.",
+		manager: false,
+		loading: false,
+		copy: [
+			{ key: "askOfferTitle", label: "Title" },
+			{ key: "askOfferBody", label: "Body" },
+			{ key: "askOfferOff", label: "Turning it off" },
+			{ key: "askTurnOn", label: "Turn on action" },
+			{ key: "askNotNow", label: "Decline action" },
+		],
+	},
+	{
+		id: "ask-on",
+		label: "Ask is on",
+		group: "Ask",
+		command: "opaline upload",
+		description:
+			"The background service is installed and running. The link opens Ask in the uploaded workspace.",
+		manager: false,
+		loading: false,
+		copy: [
+			{ key: "askOn", label: "Status" },
+			{ key: "askFirstQuestion", label: "First question link" },
+		],
+	},
+	{
+		id: "ask-claude-login",
+		label: "Claude Code needs login",
+		group: "Ask",
+		command: "opaline upload",
+		description:
+			"Claude Code is installed but not logged in, and Ask is on for the workspace. No prompt; the upload flow ends here.",
+		manager: false,
+		loading: false,
+		copy: [
+			{ key: "askClaudeLogin", label: "Status" },
+			{ key: "askClaudeLoginNext", label: "Next step" },
+		],
+	},
+	{
 		id: "empty",
 		label: "No repositories",
 		group: "Edge cases",
