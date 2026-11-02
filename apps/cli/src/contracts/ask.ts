@@ -14,6 +14,7 @@ export const AskBridgeConnectionSchema = z.object({
 	mcpUrl: z.string().url(),
 	mcpToken: z.string(),
 	mcpTokenExpiresAt: z.number().int(),
+	askUrl: z.string().url(),
 	workspace: z.object({ id: z.string(), slug: z.string(), name: z.string() }),
 });
 

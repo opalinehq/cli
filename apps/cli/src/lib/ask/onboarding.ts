@@ -33,7 +33,6 @@ export interface AskOfferDependencies {
 	readonly detectClaude: () => Promise<ProviderState>;
 	readonly connect: () => Promise<AskBridgeConnection>;
 	readonly install: (workspace: AskServiceWorkspace) => Promise<void>;
-	readonly askUrl: (workspaceSlug: string) => string;
 	readonly screens: AskOfferScreens;
 }
 
@@ -41,7 +40,6 @@ export async function offerAskAfterUpload(input: {
 	readonly credentials: Credentials | undefined;
 	readonly apiBaseUrl: string;
 	readonly organizationId: string | undefined;
-	readonly askUrl: (workspaceSlug: string) => string;
 }): Promise<void> {
 	const { credentials, organizationId } = input;
 	if (!credentials || !organizationId) return;
@@ -60,7 +58,6 @@ export async function offerAskAfterUpload(input: {
 					})
 				)(),
 			install: installAskService,
-			askUrl: input.askUrl,
 			screens: clackAskScreens,
 		});
 	} catch (error) {
@@ -84,8 +81,12 @@ export async function offerAsk(
 	if (await dependencies.serviceInstalled()) return "not-shown";
 	const claude = await dependencies.detectClaude();
 	if (!claude.version) return "not-shown";
-	const workspace = await askWorkspace(dependencies);
-	if (!workspace) return "not-shown";
+	const connection = await askConnection(dependencies);
+	if (!connection) return "not-shown";
+	const workspace = {
+		slug: connection.workspace.slug,
+		name: connection.workspace.name,
+	};
 	if (!claude.ready) {
 		dependencies.screens.claudeLogin(claude.version);
 		return "claude-login";
@@ -99,16 +100,15 @@ export async function offerAsk(
 		);
 		return "install-failed";
 	}
-	dependencies.screens.askOn(dependencies.askUrl(workspace.slug));
+	dependencies.screens.askOn(connection.askUrl);
 	return "turned-on";
 }
 
-async function askWorkspace(
+async function askConnection(
 	dependencies: AskOfferDependencies,
-): Promise<AskServiceWorkspace | undefined> {
+): Promise<AskBridgeConnection | undefined> {
 	try {
-		const { workspace } = await dependencies.connect();
-		return { slug: workspace.slug, name: workspace.name };
+		return await dependencies.connect();
 	} catch (error) {
 		debugLog("ask offer skipped", {
 			unavailable: isAskUnavailable(error),

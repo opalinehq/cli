@@ -1,4 +1,3 @@
-import { hostname } from "node:os";
 import { buildCommand } from "@stricli/core";
 import { ConvexClient } from "convex/browser";
 import pkg from "../../../package.json" with { type: "json" };
@@ -18,6 +17,7 @@ import {
 } from "../../lib/ask/bridge-connect.js";
 import { BridgeSession } from "../../lib/ask/bridge-session.js";
 import { runClaude } from "../../lib/ask/claude-runner.js";
+import { deviceName } from "../../lib/ask/device-name.js";
 import { PendingQueue } from "../../lib/ask/pending-queue.js";
 import { detectClaude, type ProviderState } from "../../lib/ask/providers.js";
 import { type Credentials, loadCredentials } from "../../lib/credentials.js";
@@ -98,10 +98,11 @@ async function answerAndReport(
 
 function startHeartbeat(backend: BridgeBackend): { stop(): void } {
 	let providers: Promise<ProviderState[]> = detectProviders();
+	const name = deviceName();
 	const beat = async () => {
 		try {
 			await backend.heartbeat({
-				name: hostname(),
+				name: await name,
 				cliVersion: pkg.version,
 				providers: await providers,
 			});

@@ -10,7 +10,6 @@ import { verifyAuth } from "../lib/auth.js";
 import { loadAutoUploadConfig } from "../lib/auto-upload-config.js";
 import { cliMessage } from "../lib/cli-messages.js";
 import { loadCredentials } from "../lib/credentials.js";
-import { getAskUrl } from "../lib/dashboard-url.js";
 import type { GuidedUpload } from "../lib/guided-upload.js";
 import { getProjectOrgId } from "../lib/project-config.js";
 import {
@@ -321,8 +320,6 @@ function askOfferInput(
 		credentials,
 		apiBaseUrl,
 		organizationId,
-		askUrl: (slug) =>
-			guided ? guided.askUrl(slug) : getAskUrl(`${apiBaseUrl}/rpc`, slug),
 	};
 }
 

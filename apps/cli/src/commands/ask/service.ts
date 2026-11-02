@@ -13,7 +13,6 @@ import {
 	removeAskService,
 } from "../../lib/ask/service.js";
 import { loadCredentials } from "../../lib/credentials.js";
-import { getAskUrl } from "../../lib/dashboard-url.js";
 
 async function turnOn(flags: {
 	workspace?: string;
@@ -33,12 +32,10 @@ async function turnOn(flags: {
 			apiBaseUrl,
 			workspaceSlug: flags.workspace,
 		});
-		const { workspace } = await connect();
+		const { workspace, askUrl } = await connect();
 		await installAskService({ slug: workspace.slug, name: workspace.name });
 		console.log(`Ask is on for ${workspace.name}.`);
-		console.log(
-			`Ask your first question at ${getAskUrl(`${apiBaseUrl}/rpc`, workspace.slug)}`,
-		);
+		console.log(`Ask your first question at ${askUrl}`);
 	} catch (error) {
 		return new Error(describeAskError(error, apiBaseUrl));
 	}

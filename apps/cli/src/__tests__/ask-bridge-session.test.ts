@@ -12,6 +12,7 @@ function connection(n: number, now: number): AskBridgeConnection {
 		mcpUrl: "https://opaline.test/mcp",
 		mcpToken: `mcp-${n}`,
 		mcpTokenExpiresAt: now + 60 * MINUTE,
+		askUrl: "https://opaline.test/w/ask",
 		workspace: { id: "w", slug: "w", name: "W" },
 	};
 }

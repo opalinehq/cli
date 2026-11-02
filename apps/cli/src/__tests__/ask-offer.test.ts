@@ -11,6 +11,7 @@ const CONNECTION: AskBridgeConnection = {
 	mcpUrl: "https://opaline.test/mcp",
 	mcpToken: "m",
 	mcpTokenExpiresAt: 0,
+	askUrl: "https://opaline.test/acme/ask",
 	workspace: { id: "w1", slug: "acme", name: "Acme" },
 };
 const READY: ProviderState = {
@@ -33,7 +34,6 @@ function setup(
 		install: async (workspace) => {
 			installed.push(workspace.slug);
 		},
-		askUrl: (slug) => `https://opaline.test/${slug}/ask`,
 		screens: {
 			offer: async (version) => {
 				shown.push(`offer ${version}`);
