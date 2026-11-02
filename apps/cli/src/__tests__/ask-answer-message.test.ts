@@ -262,6 +262,50 @@ test("stopping the bridge mid-answer kills Claude Code and fails the message as 
 	]);
 });
 
+test("a resume whose session is gone on this computer reruns once in a fresh session with the full prompt", async () => {
+	const convex = fakeConvex({
+		...CLAIMED,
+		prompt: "Earlier: …\n\nQuestion: and yesterday?",
+		resumeSessionId: "gone-session",
+		resumePrompt: "and yesterday?",
+	});
+	const claude = fakeSpawn((child) => {
+		if (child === claude.children[0]) {
+			child.print({
+				type: "result",
+				subtype: "error_during_execution",
+				is_error: true,
+				session_id: "gone-session",
+				errors: ["No conversation found with session ID: gone-session"],
+			});
+			child.exit(1);
+			return;
+		}
+		child.print(
+			{ type: "system", subtype: "init", session_id: "new-session" },
+			{ type: "result", subtype: "success", is_error: false },
+		);
+		child.exit(0);
+	});
+
+	const result = await answerMessage(
+		MESSAGE_ID,
+		dependencies(convex, claude.spawnAgent),
+	);
+
+	expect(result).toEqual({ status: "done" });
+	expect(claude.children.map((child) => child.prompt)).toEqual([
+		"and yesterday?",
+		"Earlier: …\n\nQuestion: and yesterday?",
+	]);
+	expect(claude.calls[0]?.args).toContain("gone-session");
+	expect(claude.calls[1]?.args).not.toContain("--resume");
+	expect(combinedProgress(convex).agentSessionId).toBe("new-session");
+	expect(convex.calls("ask:finish")).toEqual([
+		{ messageId: MESSAGE_ID, status: "done" },
+	]);
+});
+
 test("a missing claude binary and a logged-out claude fail with errors a member can act on", async () => {
 	const missing = fakeConvex(CLAIMED);
 	const notInstalled = fakeSpawn((child) =>

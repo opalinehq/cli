@@ -1,4 +1,5 @@
-import type { AgentOutcome, RunAgent } from "./claude-runner.js";
+import type { AgentJob, AgentOutcome, RunAgent } from "./claude-runner.js";
+import { SESSION_NOT_FOUND_ERROR } from "./claude-stream.js";
 import { ProgressBuffer, type ProgressPatch } from "./progress-buffer.js";
 
 export type AskProvider = "claude" | "codex";
@@ -9,6 +10,7 @@ export interface ClaimedMessage {
 	readonly prompt: string;
 	readonly provider: AskProvider;
 	readonly resumeSessionId?: string;
+	readonly resumePrompt?: string;
 }
 
 export type FinishInput = {
@@ -104,15 +106,21 @@ async function runAgentSafely(
 ): Promise<AgentOutcome> {
 	try {
 		const access = await dependencies.mcpAccess();
-		return await dependencies.runAgent(
-			{
-				prompt: claimed.prompt,
-				resumeSessionId: claimed.resumeSessionId,
-				mcpUrl: access.mcpUrl,
-				mcpToken: access.mcpToken,
-			},
-			{ signal, onEvent: (event) => progress.buffer.add(event) },
-		);
+		const run = (job: Pick<AgentJob, "prompt" | "resumeSessionId">) =>
+			dependencies.runAgent(
+				{ ...job, mcpUrl: access.mcpUrl, mcpToken: access.mcpToken },
+				{ signal, onEvent: (event) => progress.buffer.add(event) },
+			);
+		const fresh = { prompt: claimed.prompt };
+		if (!claimed.resumeSessionId || !claimed.resumePrompt)
+			return await run(fresh);
+		const resumed = await run({
+			prompt: claimed.resumePrompt,
+			resumeSessionId: claimed.resumeSessionId,
+		});
+		return isMissingSession(resumed) && !signal.aborted
+			? await run(fresh)
+			: resumed;
 	} catch (error) {
 		if (signal.aborted) return { status: "stopped" };
 		return {
@@ -120,6 +128,12 @@ async function runAgentSafely(
 			error: error instanceof Error ? error.message : String(error),
 		};
 	}
+}
+
+function isMissingSession(outcome: AgentOutcome): boolean {
+	return (
+		outcome.status === "failed" && outcome.error === SESSION_NOT_FOUND_ERROR
+	);
 }
 
 function finishFor(

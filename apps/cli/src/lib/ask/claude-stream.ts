@@ -15,6 +15,9 @@ export type AgentEvent =
 const OPALINE_TOOL_PREFIX = "mcp__opaline__";
 const MAX_ERROR_LENGTH = 300;
 
+export const SESSION_NOT_FOUND_ERROR =
+	"Claude Code could not find this conversation on this computer";
+
 export const NOT_LOGGED_IN_ERROR =
 	"Claude Code is not logged in — run `claude` once";
 
@@ -42,8 +45,7 @@ export function describeClaudeFailure(output: string): string | undefined {
 	const text = output.trim();
 	if (!text) return undefined;
 	if (looksLikeLoginProblem(text)) return NOT_LOGGED_IN_ERROR;
-	if (/no conversation found/iu.test(text))
-		return "Claude Code could not find this conversation on this computer";
+	if (/no conversation found/iu.test(text)) return SESSION_NOT_FOUND_ERROR;
 	return shorten(text);
 }
 
@@ -98,14 +100,28 @@ function resultEvent(message: Record<string, unknown>): AgentEvent {
 	if (message.is_error !== true && message.subtype === "success")
 		return { kind: "result", ok: true };
 	const detail =
-		typeof message.result === "string" && message.result.trim()
-			? message.result
-			: describeResultSubtype(message.subtype);
+		resultText(message) ??
+		firstError(message) ??
+		describeResultSubtype(message.subtype);
 	return {
 		kind: "result",
 		ok: false,
 		error: describeClaudeFailure(detail) ?? describeResultSubtype(undefined),
 	};
+}
+
+function resultText(message: Record<string, unknown>): string | undefined {
+	return typeof message.result === "string" && message.result.trim()
+		? message.result
+		: undefined;
+}
+
+function firstError(message: Record<string, unknown>): string | undefined {
+	if (!Array.isArray(message.errors)) return undefined;
+	return message.errors.find(
+		(error): error is string =>
+			typeof error === "string" && error.trim() !== "",
+	);
 }
 
 function describeResultSubtype(subtype: unknown): string {
