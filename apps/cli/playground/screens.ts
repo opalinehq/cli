@@ -175,7 +175,6 @@ export const SCREENS: Screen[] = [
 		copy: [
 			{ key: "askOfferTitle", label: "Title" },
 			{ key: "askOfferBody", label: "Body" },
-			{ key: "askOfferOff", label: "Turning it off" },
 			{ key: "askTurnOn", label: "Turn on action" },
 			{ key: "askNotNow", label: "Decline action" },
 		],

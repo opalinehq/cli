@@ -124,7 +124,6 @@ export const clackAskScreens: AskOfferScreens = {
 			message: [
 				cliMessage("askOfferTitle"),
 				dim(cliMessage("askOfferBody", { version })),
-				dim(cliMessage("askOfferOff")),
 			].join("\n"),
 			options: [
 				{ value: "on", label: cliMessage("askTurnOn") },

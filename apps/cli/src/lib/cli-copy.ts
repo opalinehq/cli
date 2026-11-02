@@ -30,16 +30,15 @@ export const DEFAULT_CLI_COPY = {
 	discarded: "Unsaved changes discarded.",
 	whoamiLoggedOut: "Not logged in. Run `opaline login` to authenticate.",
 	logoutSuccess: "Logged out successfully.",
-	askOfferTitle: "Ask Opaline, answered by Claude Code on this computer",
+	askOfferTitle: "Turn on Ask?",
 	askOfferBody:
-		"Claude Code {version} is ready. Questions you ask on opaline.so run here, on your own Claude plan, with only Opaline's read-only tools.",
-	askOfferOff: "Turn it off any time with `opaline ask off`.",
+		"Claude Code {version} answers your Opaline questions, on your plan.",
 	askTurnOn: "Turn on Ask",
 	askNotNow: "Not now",
 	askOn: "Ask is on",
-	askFirstQuestion: "Ask your first question at {url}",
-	askClaudeLogin: "Claude Code {version} is installed but not logged in.",
-	askClaudeLoginNext: "Run `claude` once to log in, then `opaline ask on`.",
+	askFirstQuestion: "Ask at {url}",
+	askClaudeLogin: "Log in to Claude Code {version} to use Ask.",
+	askClaudeLoginNext: "Run `claude`, then `opaline ask on`.",
 };
 
 export type CliCopyKey = keyof typeof DEFAULT_CLI_COPY;

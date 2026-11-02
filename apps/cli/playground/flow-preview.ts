@@ -80,7 +80,6 @@ export function renderFlowPreview(
 	} else if (screen === "ask-offer") {
 		line("◆", message("askOfferTitle"));
 		note(message("askOfferBody", { version: DEMO_CLAUDE_VERSION }));
-		note(message("askOfferOff"));
 		for (const [index, label] of [
 			message("askTurnOn"),
 			message("askNotNow"),
