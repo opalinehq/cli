@@ -149,7 +149,9 @@ export const clackAgentScreens: AgentConnectScreens = {
 		p.log.warn(cliMessage("askNeedsAgent"));
 	},
 	installFailed(error) {
-		p.log.warn(`Could not connect: ${error}. Run \`opaline ask on\` to retry.`);
+		p.log.warn(
+			`Could not connect: ${error}. Run \`opaline connect sub\` to retry.`,
+		);
 	},
 };
 

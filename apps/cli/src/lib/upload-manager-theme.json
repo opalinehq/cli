@@ -49,6 +49,6 @@
 		"askConnect": "Connect",
 		"askLater": "Later",
 		"askConnected": "Connected {agents}",
-		"askNeedsAgent": "Install or log in to Claude Code or Codex, then run `opaline ask on`."
+		"askNeedsAgent": "Install or log in to Claude Code or Codex, then run `opaline connect sub`."
 	}
 }

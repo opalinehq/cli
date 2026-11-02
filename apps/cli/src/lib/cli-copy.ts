@@ -36,7 +36,7 @@ export const DEFAULT_CLI_COPY = {
 	askLater: "Later",
 	askConnected: "Connected {agents}",
 	askNeedsAgent:
-		"Install or log in to Claude Code or Codex, then run `opaline ask on`.",
+		"Install or log in to Claude Code or Codex, then run `opaline connect sub`.",
 };
 
 export type CliCopyKey = keyof typeof DEFAULT_CLI_COPY;
