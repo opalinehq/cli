@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.15.0...opaline-cli@0.16.0) (2026-11-07)
+
+
+### Features
+
+* **cli:** opaline sql, pull and count for agents to compute on session data ([#521](https://github.com/opalinehq/cli/issues/521)) ([ceb48d0](https://github.com/opalinehq/cli/commit/ceb48d008d468eb38e00a33a8823f5ca33e590e7))
+
 ## [0.15.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.14.0...opaline-cli@0.15.0) (2026-10-16)
 
 
