@@ -1,13 +1,16 @@
 import { buildApplication, buildRouteMap } from "@stricli/core";
 import pkg from "../package.json" with { type: "json" };
 import { connectCommand } from "./commands/connect.js";
+import { countCommand } from "./commands/count.js";
 import { devRouteMap } from "./commands/dev/index.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { hooksRouteMap } from "./commands/hooks/index.js";
 import { importCommand } from "./commands/import.js";
 import { loginCommand } from "./commands/login.js";
 import { logoutCommand } from "./commands/logout.js";
+import { pullCommand } from "./commands/pull.js";
 import { setOrgCommand } from "./commands/set-org.js";
+import { sqlCommand } from "./commands/sql.js";
 import { updateCommand } from "./commands/update.js";
 import { uploadCommand } from "./commands/upload.js";
 import { whoamiCommand } from "./commands/whoami.js";
@@ -21,6 +24,9 @@ const routes = buildRouteMap({
 		upload: uploadCommand,
 		update: updateCommand,
 		import: importCommand,
+		pull: pullCommand,
+		count: countCommand,
+		sql: sqlCommand,
 		enable: uploadCommand,
 		disable: uploadCommand,
 		doctor: doctorCommand,

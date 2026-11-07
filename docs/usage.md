@@ -94,6 +94,9 @@ Opaline does not guess when more than one global installation is present. Window
 | `npx opaline@latest whoami` | Show the authenticated user and local upload failures. |
 | `npx opaline@latest doctor` | Run read-only authentication, API, configuration, version, and hook diagnostics. |
 | `npx opaline@latest update` | Review the latest release and update supported persistent installations. |
+| `npx opaline@latest sql "<SELECT ...>" --out rows.jsonl` | Export every row of one read-only query over the Opaline views. |
+| `npx opaline@latest pull --repo <repo> --from <day> --to <day>` | Copy a slice of sessions and their runs, calls, git, CI and setup rows to local files. |
+| `npx opaline@latest count --pattern <regex>` | Count matching calls, prompts or sessions in the latest pull, with a definition. |
 | `npx opaline@latest --help` | Show command help. |
 | `npx opaline@latest --version` | Print the CLI version. |
 
@@ -117,6 +120,19 @@ opaline import "$CODEX_THREAD_ID" --analysis <analysis id>
 ```
 
 Pass a Codex thread id, a Claude Code session id or a transcript path. The CLI uploads the chat into the analysis's workspace (no `--org`), with a Codex thread's parent chat and every subagent thread spawned in that chat (`--no-related` uploads only the given thread). It also records a marker for seven days, so the Codex turn-complete hook (or the Claude Code SessionEnd hook) uploads the chat again after the agent's answer and after follow-up turns, even where automatic uploads are off; subagents spawned in later turns are picked up then. Importing the same chat for another analysis links it to both, and each later upload carries each analysis id. These uploads never capture repository evidence. The command prints one line, or one JSON object with `--json`, and exits non-zero if the server does not support analysis uploads or refuses the analysis.
+
+### Data for agents: sql, pull and count
+
+The Opaline MCP answers questions with bounded results. When a result is too large to page through, it names the command that fetches all of it:
+
+```bash
+opaline sql "SELECT session_id, count() AS calls FROM calls GROUP BY session_id" --out rows.jsonl
+opaline pull --repo acme/widgets --from 2026-10-01 --to 2026-10-31
+opaline pull --pattern fc_1a2b3c4d5e --repo acme/widgets --from 2026-10-01 --to 2026-10-31
+opaline count --pattern "no matches found" --in output
+```
+
+`sql` streams the rows to `<file>.partial` and renames it when the query finished (`.jsonl` or `.csv`). `pull` writes `sessions/<session_id>.jsonl` (every stored record of each session) plus one `.jsonl` file per table and `MANIFEST.json` under `~/.cache/opaline/pulls/<workspace>/`, replaces that directory on every pull, and records it in `~/.cache/opaline/pulls/LAST`. `count` runs locally on the latest pull (or `--pull <dir>`). `sql` and `pull` take `--workspace <slug>` and need a server that supports data export (they say so otherwise). Pulled files hold full session content: treat the cache directory like the transcripts themselves.
 
 `enable` and `disable` are aliases for the repository picker. Open it and confirm your selections to change automatic uploads. `set-org` remains available to change the workspace associated with a project.
 

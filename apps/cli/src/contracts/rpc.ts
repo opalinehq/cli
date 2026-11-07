@@ -1,5 +1,12 @@
-import { oc } from "@orpc/contract";
+import { eventIterator, oc } from "@orpc/contract";
 import { z } from "zod";
+import {
+	CliDataPullPlanInputSchema,
+	CliDataPullPlanOutputSchema,
+	CliDataPullTableInputSchema,
+	CliDataSqlInputSchema,
+	DataChunkSchema,
+} from "./cli-data.js";
 import {
 	IngestSessionInputSchema,
 	IngestSessionOutputSchema,
@@ -50,6 +57,7 @@ const CliUserSchema = z.object({
 			liveSessions: z.literal(true).optional(),
 			/** Repository evidence accepts `image` objects and the `images` manifest field. */
 			repositoryEvidenceImages: z.literal(true).optional(),
+			dataExport: z.literal(true).optional(),
 		})
 		.optional(),
 });
@@ -102,6 +110,17 @@ export const contract = {
 		sessionUploadStatus: oc
 			.input(CliSessionUploadStatusInputSchema)
 			.output(CliSessionUploadStatusOutputSchema),
+		data: {
+			sql: oc
+				.input(CliDataSqlInputSchema)
+				.output(eventIterator(DataChunkSchema)),
+			pullPlan: oc
+				.input(CliDataPullPlanInputSchema)
+				.output(CliDataPullPlanOutputSchema),
+			pullTable: oc
+				.input(CliDataPullTableInputSchema)
+				.output(eventIterator(DataChunkSchema)),
+		},
 	},
 	listMyOrganizations: oc.output(z.array(OrganizationSchema)),
 	ingestSession: oc

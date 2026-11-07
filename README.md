@@ -76,6 +76,7 @@ The server can temporarily pause repository-evidence capture without pausing ses
 | `npx opaline@latest whoami` | Show your account and upload failures. |
 | `npx opaline@latest doctor` | Check authentication, connection, and hooks. |
 | `npx opaline@latest update` | Review and update supported persistent installations. |
+| `npx opaline@latest pull --repo <repo> --from <day> --to <day>` | Copy sessions to local files for an agent to compute on (also `sql`, `count`). |
 | `npx opaline@latest --help` | Show available commands and options. |
 
 Prefer a shorter command? [Install globally](docs/usage.md#optional-global-install) to use `opaline` directly.
