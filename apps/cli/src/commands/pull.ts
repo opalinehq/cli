@@ -6,6 +6,7 @@ import {
 	connectDataApi,
 	createProgress,
 	errorMessage,
+	resolveWorkspace,
 } from "../lib/data-export.js";
 import {
 	checkPullOptions,
@@ -52,8 +53,9 @@ async function runPullCommand(flags: PullFlags): Promise<undefined | Error> {
 			flags.sessions !== undefined
 				? callerPath(flags.sessions, cwd)
 				: undefined;
+		const workspace = await resolveWorkspace(flags.workspace, cwd);
 		options = {
-			...(flags.workspace !== undefined ? { workspace: flags.workspace } : {}),
+			...(workspace !== undefined ? { workspace } : {}),
 			...(flags.repo !== undefined ? { repo: flags.repo } : {}),
 			...(flags.from !== undefined ? { from: flags.from } : {}),
 			...(flags.to !== undefined ? { to: flags.to } : {}),

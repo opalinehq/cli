@@ -12,7 +12,9 @@ import {
 import { describeSavedCredentialsApiBaseRisk } from "./api-base.js";
 import { createApiClient } from "./api-client.js";
 import { getApiBaseOverride } from "./api-target.js";
+import { loadAutoUploadConfig } from "./auto-upload-config.js";
 import { loadCredentials } from "./credentials.js";
+import { getDefaultProjectOrgId, getProjectOrgId } from "./project-config.js";
 
 export interface DataApi {
 	sql(input: CliDataSqlInput): Promise<AsyncIterable<unknown>>;
@@ -115,6 +117,24 @@ async function* guard(
 	}
 }
 
+export async function resolveWorkspace(
+	flag: string | undefined,
+	cwd: string,
+): Promise<string | undefined> {
+	if (flag !== undefined) return flag;
+	const project = await getProjectOrgId(cwd).catch(() => undefined);
+	if (project !== undefined) return project;
+	let configured: string | undefined;
+	try {
+		configured = loadAutoUploadConfig()?.defaultOrganizationId;
+	} catch {
+		configured = undefined;
+	}
+	return configured || getDefaultProjectOrgId();
+}
+
+const CHOOSE_ORGANIZATION = /choose an organization/iu;
+
 export function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -142,6 +162,8 @@ export function describeDataError(error: unknown, apiBase: string): string {
 	if (error instanceof ORPCError) {
 		if (error.status === 401)
 			return "Session expired or invalid. Run `opaline login` to re-authenticate.";
+		if (CHOOSE_ORGANIZATION.test(error.message))
+			return "You are in more than one workspace. Pass --workspace <slug> (the slugs list_workspaces shows), or run `opaline set-org` to save a default.";
 		return error.message || String(error.code);
 	}
 	const message = error instanceof Error ? error.message : String(error);

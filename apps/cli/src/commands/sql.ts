@@ -3,6 +3,7 @@ import {
 	callerPath,
 	connectDataApi,
 	errorMessage,
+	resolveWorkspace,
 } from "../lib/data-export.js";
 import { formatSqlSummary, runSql, sqlFormatOf } from "../lib/sql-export.js";
 
@@ -31,13 +32,12 @@ async function runSqlCommand(
 	const api = await connectDataApi();
 	if (api instanceof Error) return api;
 	try {
+		const workspace = await resolveWorkspace(flags.workspace, process.cwd());
 		const result = await runSql(
 			{
 				query,
 				out,
-				...(flags.workspace !== undefined
-					? { workspace: flags.workspace }
-					: {}),
+				...(workspace !== undefined ? { workspace } : {}),
 			},
 			api,
 		);

@@ -13,6 +13,8 @@ import type { CliDataSqlInput } from "../contracts/cli-data.js";
 import {
 	checkDataExport,
 	type DataApi,
+	describeDataError,
+	resolveWorkspace,
 	LineSplitter,
 	withErrorContext,
 } from "../lib/data-export.js";
@@ -144,6 +146,18 @@ describe("opaline sql", () => {
 });
 
 describe("data export capability and errors", () => {
+	test("an ambiguous workspace names --workspace, and a flag wins over saved defaults", async () => {
+		expect(
+			describeDataError(
+				new ORPCError("BAD_REQUEST", {
+					message: "Choose an organization with --org or opaline set-org",
+				}),
+				"https://opaline.so",
+			),
+		).toContain("--workspace <slug>");
+		expect(await resolveWorkspace("acme", tmpdir())).toBe("acme");
+	});
+
 	const statusClient = (status: () => Promise<unknown>) => ({
 		cli: {
 			authStatus: status as () => Promise<{
