@@ -377,7 +377,13 @@ describe("opaline pull", () => {
 	test("--pattern writes pattern.json and names the directory after the pattern", async () => {
 		const plan = planOf([session("s1", { records: 1, bytes: 10 })], {
 			scope: { repository: null, from: "2026-10-08", to: "2026-11-06" },
-			pattern: { id: "fc_1a2b3c4d5e", kind: "failed_command", runs: [] },
+			pattern: {
+				id: "fc_1a2b3c4d5e",
+				scope: { repository: null, from: "2026-10-08", to: "2026-11-06" },
+				pattern: { kind: "failing_call" },
+				sessions: ["s1"],
+				runs: [],
+			},
 		});
 		const { api, plans } = fakeApi(plan, { records: () => [record("s1", 1)] });
 		const result = await runPull({ pattern: "fc_1a2b3c4d5e" }, envOf(api));
@@ -396,8 +402,9 @@ describe("opaline pull", () => {
 		).toEqual({
 			id: "fc_1a2b3c4d5e",
 			scope: { repository: null, from: "2026-10-08", to: "2026-11-06" },
+			pattern: { kind: "failing_call" },
 			sessions: ["s1"],
-			pattern: { id: "fc_1a2b3c4d5e", kind: "failed_command", runs: [] },
+			runs: [],
 		});
 	});
 

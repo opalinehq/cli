@@ -655,12 +655,7 @@ export async function runPull(
 		};
 		if (options.pattern !== undefined) {
 			const text = `${JSON.stringify(
-				{
-					id: options.pattern,
-					scope,
-					sessions: sessionIds,
-					pattern: plan.pattern,
-				},
+				plan.pattern ?? { id: options.pattern, scope, sessions: sessionIds },
 				null,
 				1,
 			)}\n`;
