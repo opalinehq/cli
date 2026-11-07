@@ -14,7 +14,10 @@ import {
 	INGEST_AGGREGATE_CONTENT_MAX_BYTES,
 	INGEST_MAX_SUBAGENT_COUNT,
 } from "../contracts/ingest.js";
-import { discoverClaudeSubagentFiles } from "../internal/agent-adapters/index.js";
+import {
+	claudeCodeAdapter,
+	discoverClaudeSubagentFiles,
+} from "../internal/agent-adapters/index.js";
 import { MAX_RAW_TRANSCRIPT_BYTES } from "../lib/filtered-upload-staging.js";
 
 const fixtureRoots: string[] = [];
@@ -55,6 +58,71 @@ describe("Claude subagent discovery", () => {
 			{
 				agentId: "child-native",
 				path: await realpath(join(childDir, "agent-child-native.jsonl")),
+			},
+		]);
+	});
+
+	test("uploads referenced, unreferenced and nested subagents of the session only", async () => {
+		const root = await createFixtureRoot();
+		const sessionId = "session-with-subagents";
+		const childDir = join(root, sessionId, "subagents");
+		await mkdir(childDir, { recursive: true });
+		const record = (fields: Record<string, unknown>) =>
+			`${JSON.stringify({
+				timestamp: "2026-11-01T10:00:00.000Z",
+				type: "assistant",
+				...fields,
+			})}\n`;
+		const transcriptPath = join(root, `${sessionId}.jsonl`);
+		await Promise.all([
+			writeFile(
+				transcriptPath,
+				record({ sessionId, type: "user" }) +
+					record({ sessionId, toolUseResult: { agentId: "referenced" } }),
+			),
+			writeFile(
+				join(childDir, "agent-referenced.jsonl"),
+				record({
+					agentId: "referenced",
+					sessionId,
+					toolUseResult: { agentId: "nested" },
+				}),
+			),
+			writeFile(
+				join(childDir, "agent-nested.jsonl"),
+				record({ agentId: "nested", sessionId }),
+			),
+			writeFile(
+				join(childDir, "agent-from-skill.jsonl"),
+				record({ agentId: "from-skill", sessionId }),
+			),
+			writeFile(
+				join(childDir, "agent-from-skill.meta.json"),
+				JSON.stringify({ agentType: "general-purpose" }),
+			),
+			writeFile(
+				join(root, "agent-other-session.jsonl"),
+				record({ agentId: "other-session", sessionId: "another-session" }),
+			),
+		]);
+
+		const request = await claudeCodeAdapter.buildUploadRequest(
+			{ projectPath: "/repo", sessionId, transcriptPath },
+			{ gitInfo: {}, uploadMode: "manual" },
+		);
+
+		expect(request.subagents).toEqual([
+			{
+				agentId: "referenced",
+				path: await realpath(join(childDir, "agent-referenced.jsonl")),
+			},
+			{
+				agentId: "from-skill",
+				path: await realpath(join(childDir, "agent-from-skill.jsonl")),
+			},
+			{
+				agentId: "nested",
+				path: await realpath(join(childDir, "agent-nested.jsonl")),
 			},
 		]);
 	});
