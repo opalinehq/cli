@@ -307,6 +307,7 @@ export async function runCli(
 			POSTHOG_ENABLED: "false",
 			// Hook tests opt in to the detached live session follower.
 			OPALINE_LIVE_SESSIONS: "0",
+			OPALINE_SESSION_INVENTORY: "0",
 			...options.env,
 		},
 		stdin: "pipe",

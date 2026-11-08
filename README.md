@@ -64,6 +64,8 @@ Known secret patterns are filtered before upload, but **filtering cannot guarant
 
 The CLI also sends limited usage analytics, including version, operating system, setup results, and repository/session counts. These events exclude transcript content, repository names, and local paths. Anonymous activity is linked to your account after sign-in.
 
+To let answers say which sessions they miss, the CLI also sends the workspace a session inventory: for each session it would upload under your settings, the session id, agent, line counts, byte sizes and start and change times, never content, paths or repository names. Set `OPALINE_SESSION_INVENTORY=0` to turn it off.
+
 See [data handling](docs/data-handling.md) for the full disclosure and persistent opt-out settings.
 
 The server can temporarily pause repository-evidence capture without pausing session uploads or changing their project identity and workspace binding. Normal Git metadata lookups continue; only repository-context collection, spool writes and evidence delivery stop. The CLI stores the pause in `repository-evidence-pause.json` under its config directory, leaves other pending captures untouched, and resumes after expiry (24 hours by default, bounded to 1 hour–7 days). Invalid markers are ignored and removed; persistence failures warn without preventing rejected-capture cleanup. `opaline doctor` reports an active pause.

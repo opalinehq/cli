@@ -20,6 +20,7 @@ import {
 	type RepositoryChange,
 	saveRepositoryChanges,
 } from "../lib/repository-upload.js";
+import { startSessionInventoryInBackground } from "../lib/session-inventory.js";
 import { getUploadCompletion } from "../lib/upload-completion.js";
 import { allowsInsecureEndpointFromEnv } from "../lib/upload-endpoint.js";
 import {
@@ -207,6 +208,7 @@ export async function runUpload(
 								() => {},
 								signal,
 							);
+							startSessionInventoryInBackground({ force: true });
 							uploadedThisRun += summary.succeeded;
 							skippedBeforeRun ??=
 								targets.reduce((count, repo) => count + repo.sessionCount, 0) -

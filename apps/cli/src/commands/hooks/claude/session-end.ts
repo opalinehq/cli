@@ -29,6 +29,7 @@ import {
 	resolveUploadRepositoryIdentity,
 } from "../../../lib/repository-discovery.js";
 import { captureAndUploadSessionEvidence } from "../../../lib/session-evidence.js";
+import { startSessionInventoryInBackground } from "../../../lib/session-inventory.js";
 import {
 	inferSessionRepository,
 	withSessionRepository,
@@ -254,6 +255,7 @@ async function runSessionEnd(): Promise<undefined | Error> {
 			`Opaline Claude Code hook failed: ${error instanceof Error ? error.message : String(error)}\n`,
 		);
 	} finally {
+		startSessionInventoryInBackground();
 		await disposeLogging();
 	}
 }

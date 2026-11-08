@@ -35,6 +35,10 @@ import {
 	RepositoryEvidenceInitInputSchema,
 	RepositoryEvidenceInitOutputSchema,
 } from "./repository-evidence.js";
+import {
+	SessionInventoryInputSchema,
+	SessionInventoryOutputSchema,
+} from "./session-inventory.js";
 import { ReportUploadFailuresInputSchema } from "./upload-failure.js";
 
 const UserSchema = z.object({
@@ -58,6 +62,7 @@ const CliUserSchema = z.object({
 			/** Repository evidence accepts `image` objects and the `images` manifest field. */
 			repositoryEvidenceImages: z.literal(true).optional(),
 			dataExport: z.literal(true).optional(),
+			sessionInventory: z.literal(true).optional(),
 		})
 		.optional(),
 });
@@ -110,6 +115,9 @@ export const contract = {
 		sessionUploadStatus: oc
 			.input(CliSessionUploadStatusInputSchema)
 			.output(CliSessionUploadStatusOutputSchema),
+		sessionInventory: oc
+			.input(SessionInventoryInputSchema)
+			.output(SessionInventoryOutputSchema),
 		data: {
 			sql: oc
 				.input(CliDataSqlInputSchema)

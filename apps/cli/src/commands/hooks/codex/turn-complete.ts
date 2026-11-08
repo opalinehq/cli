@@ -34,6 +34,7 @@ import {
 	resolveUploadRepositoryIdentity,
 } from "../../../lib/repository-discovery.js";
 import { captureAndUploadSessionEvidence } from "../../../lib/session-evidence.js";
+import { startSessionInventoryInBackground } from "../../../lib/session-inventory.js";
 import {
 	inferSessionRepository,
 	withSessionRepository,
@@ -244,6 +245,7 @@ async function runTurnComplete(
 			`Opaline Codex hook failed: ${error instanceof Error ? error.message : String(error)}\n`,
 		);
 	} finally {
+		startSessionInventoryInBackground();
 		await forwarded;
 		await disposeLogging();
 	}
