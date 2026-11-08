@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { writeFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -92,6 +93,15 @@ function session(sessionId: string) {
 	};
 }
 
+function transcriptOnDisk(sessionId: string): string {
+	const path = join(
+		process.env.OPALINE_CONFIG_DIR ?? tmpdir(),
+		`${sessionId}.jsonl`,
+	);
+	writeFileSync(path, "{}\n");
+	return path;
+}
+
 function pendingEntry(sessionId: string, jobId: string) {
 	return {
 		error: "Still processing on the server",
@@ -99,7 +109,7 @@ function pendingEntry(sessionId: string, jobId: string) {
 		projectPath: "/test/project",
 		sessionId,
 		source: "claude_code" as const,
-		transcriptPath: `/sessions/${sessionId}.jsonl`,
+		transcriptPath: transcriptOnDisk(sessionId),
 	};
 }
 
@@ -685,7 +695,7 @@ describe("failed uploads recorded by 0.11", () => {
 			sessionId,
 			source: "claude_code",
 			status: "permanent",
-			transcriptPath: `/repo/${sessionId}.jsonl`,
+			transcriptPath: transcriptOnDisk(sessionId),
 		});
 		await writeFile(
 			join(process.env.OPALINE_CONFIG_DIR ?? "", "failed-uploads.json"),
@@ -728,6 +738,82 @@ describe("failed uploads recorded by 0.11", () => {
 			"legacy-skip": "retryable",
 			"huge-skip": "permanent",
 			"no-timestamps": "permanent",
+		});
+	});
+});
+
+describe("failed uploads whose transcript is gone", () => {
+	test("a retryable upload becomes permanent and says why; pending and permanent entries keep theirs", async () => {
+		const directory = process.env.OPALINE_CONFIG_DIR ?? "";
+		const gone = join(directory, "deleted-worktree.jsonl");
+		const entry = (
+			sessionId: string,
+			status: "permanent" | "retryable" | "pending",
+			transcriptPath: string,
+			error: string,
+		) => ({
+			error,
+			failedAt: "2026-10-04T16:07:05.023Z",
+			projectPath: "/repo",
+			sessionId,
+			source: "claude_code",
+			status,
+			transcriptPath,
+			...(status === "pending" ? { jobId: `job-${sessionId}` } : {}),
+		});
+		await writeFile(
+			join(directory, "failed-uploads.json"),
+			JSON.stringify({
+				failures: [
+					entry(
+						"present",
+						"retryable",
+						transcriptOnDisk("present"),
+						"server busy",
+					),
+					entry(
+						"gone",
+						"retryable",
+						gone,
+						`ENOENT: no such file or directory, open '${gone}'`,
+					),
+					entry(
+						"gone-pending",
+						"pending",
+						gone,
+						"Still processing on the server",
+					),
+					entry(
+						"gone-permanent",
+						"permanent",
+						gone,
+						"This transcript has no timestamped user/assistant messages.",
+					),
+				],
+			}),
+		);
+
+		const failures = Object.fromEntries(
+			(await loadFailedUploads()).map((failure) => [
+				failure.sessionId,
+				{ status: failure.status, error: failure.error },
+			]),
+		);
+
+		expect(failures).toEqual({
+			present: { status: "retryable", error: "server busy" },
+			gone: {
+				status: "permanent",
+				error: `Not retried: the transcript is no longer at ${gone}, so this session cannot be uploaded.`,
+			},
+			"gone-pending": {
+				status: "pending",
+				error: "Still processing on the server",
+			},
+			"gone-permanent": {
+				status: "permanent",
+				error: "This transcript has no timestamped user/assistant messages.",
+			},
 		});
 	});
 });
