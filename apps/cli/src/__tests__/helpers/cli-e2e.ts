@@ -240,6 +240,7 @@ export async function runBuiltCli(
 			HOME: options.home,
 			USERPROFILE: options.home,
 			OPALINE_CONFIG_DIR: options.configDir,
+			OPALINE_SESSION_INVENTORY: "0",
 			POSTHOG_ENABLED: "false",
 			...options.env,
 		},
