@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.16.0...opaline-cli@0.17.0) (2026-11-08)
+
+
+### Features
+
+* **cli:** report which sessions on this machine Opaline may upload ([#523](https://github.com/opalinehq/cli/issues/523)) ([5723983](https://github.com/opalinehq/cli/commit/57239834e92a636bf5d3fcca3472c0317c958871))
+
 ## [0.16.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.15.0...opaline-cli@0.16.0) (2026-11-07)
 
 
