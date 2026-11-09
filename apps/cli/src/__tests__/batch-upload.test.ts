@@ -163,6 +163,8 @@ describe("batchUpload", () => {
 	});
 
 	test("normalizes legacy failures as retryable and persists dispositions", async () => {
+		const legacyTranscript = join(configDir, "legacy.jsonl");
+		await writeFile(legacyTranscript, "{}\n");
 		await writeFile(
 			join(configDir, "failed-uploads.json"),
 			JSON.stringify({
@@ -172,7 +174,7 @@ describe("batchUpload", () => {
 						failedAt: "2026-07-31T10:00:00.000Z",
 						projectPath: "/project",
 						sessionId: "legacy",
-						transcriptPath: "/sessions/legacy.jsonl",
+						transcriptPath: legacyTranscript,
 					},
 				],
 			}),

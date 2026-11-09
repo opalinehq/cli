@@ -415,3 +415,50 @@ test("whoami surfaces local retryable and permanent upload status", async () => 
 		await rm(fixture.home, { recursive: true, force: true });
 	}
 }, 30_000);
+
+test("whoami leaves out failures whose transcript is gone, and upload --retry still lists them", async () => {
+	const fixture = await createCliFixture("claude_code");
+	try {
+		await rm(join(fixture.home, ".rudel", "credentials.json"));
+		const gone = join(fixture.home, "deleted-worktree", "gone.jsonl");
+		await writeFile(
+			join(fixture.home, ".rudel", "failed-uploads.json"),
+			JSON.stringify({
+				failures: [
+					{
+						error: "network",
+						failedAt: "2026-08-02T10:00:00.000Z",
+						projectPath: fixture.projectPath,
+						sessionId: "present",
+						status: "retryable",
+						transcriptPath: fixture.transcriptPath,
+					},
+					{
+						error: `ENOENT: no such file or directory, open '${gone}'`,
+						failedAt: "2026-08-02T10:00:00.000Z",
+						projectPath: fixture.projectPath,
+						sessionId: "gone",
+						status: "retryable",
+						transcriptPath: gone,
+					},
+				],
+			}),
+		);
+
+		const whoami = await runCli(["whoami"], fixture);
+		expect(whoami.exitCode).toBe(0);
+		expect(whoami.stdout).toContain(
+			"Local upload status: 1 retryable failure(s), 0 permanent failure(s)",
+		);
+
+		const retry = await runCli(["upload", "--retry", "--dry-run"], fixture);
+		expect(retry.stdout).toContain(
+			"Found 2 failed upload(s): 1 retryable, 1 permanent",
+		);
+		expect(retry.stdout).toContain(
+			`gone: Not retried: the transcript is no longer at ${gone}`,
+		);
+	} finally {
+		await rm(fixture.home, { recursive: true, force: true });
+	}
+}, 30_000);

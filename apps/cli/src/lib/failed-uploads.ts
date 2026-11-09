@@ -76,14 +76,28 @@ export async function loadFailedUploads(): Promise<FailedUpload[]> {
 		if (!existsSync(path)) return [];
 		await ensurePrivateFile(path, getConfigDir());
 		const data = JSON.parse(readFileSync(path, "utf-8")) as FailedUploadsData;
-		return data.failures.map((f) => ({
-			...f,
-			source: normalizeSource(f.source),
-			status: normalizeStatus(f),
-		}));
+		return data.failures.map((f) => {
+			const failure = { ...f, source: normalizeSource(f.source) };
+			const status = normalizeStatus(failure);
+			if (status === "retryable" && isTranscriptGone(failure))
+				return {
+					...failure,
+					status: "permanent" as const,
+					error: `Not retried: the transcript is no longer at ${failure.transcriptPath}, so this session cannot be uploaded.`,
+				};
+			return { ...failure, status };
+		});
 	} catch {
 		return [];
 	}
+}
+
+export function isTranscriptGone(failure: FailedUpload): boolean {
+	return (
+		typeof failure.transcriptPath === "string" &&
+		failure.transcriptPath !== "" &&
+		!existsSync(failure.transcriptPath)
+	);
 }
 
 function normalizeStatus(failure: FailedUpload): FailedUpload["status"] {

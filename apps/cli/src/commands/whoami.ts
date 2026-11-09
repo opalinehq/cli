@@ -2,10 +2,12 @@ import * as p from "@clack/prompts";
 import { buildCommand } from "@stricli/core";
 import { describeSavedCredentialsApiBaseRisk } from "../lib/api-base.js";
 import { verifyAuth } from "../lib/auth.js";
-import { loadFailedUploads } from "../lib/failed-uploads.js";
+import { isTranscriptGone, loadFailedUploads } from "../lib/failed-uploads.js";
 
 async function runWhoami(): Promise<undefined | Error> {
-	const failedUploads = await loadFailedUploads();
+	const failedUploads = (await loadFailedUploads()).filter(
+		(failure) => failure.status === "pending" || !isTranscriptGone(failure),
+	);
 	if (failedUploads.length > 0) {
 		const count = (status: (typeof failedUploads)[number]["status"]) =>
 			failedUploads.filter((failure) => failure.status === status).length;
