@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.1](https://github.com/opalinehq/cli/compare/opaline-cli@0.17.0...opaline-cli@0.17.1) (2026-11-09)
+
+
+### Bug Fixes
+
+* **cli:** a failed upload whose transcript is gone is no longer retryable ([#525](https://github.com/opalinehq/cli/issues/525)) ([2ee15bf](https://github.com/opalinehq/cli/commit/2ee15bf4ab89fd073bffef2cc41d3aafcfe1d7ea))
+
 ## [0.17.0](https://github.com/opalinehq/cli/compare/opaline-cli@0.16.0...opaline-cli@0.17.0) (2026-11-08)
 
 
