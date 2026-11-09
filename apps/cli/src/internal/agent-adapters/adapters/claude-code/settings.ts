@@ -236,10 +236,11 @@ function reconcileHook(
 }
 
 function getHookCommand(event: ClaudeHookEvent): string {
-	const argv = getPersistentHookCommand(["hooks", "claude", HOOKS[event]]);
+	const args = ["hooks", "claude", HOOKS[event]];
+	const argv = getPersistentHookCommand(args);
 	return argv[0] === "opaline" || argv[0] === "rudel"
 		? `${argv[0]} hooks claude ${HOOKS[event]}`
-		: `${argv.slice(0, 2).map(quoteHookArgument).join(" ")} hooks claude ${HOOKS[event]}`;
+		: `${argv.slice(0, -args.length).map(quoteHookArgument).join(" ")} hooks claude ${HOOKS[event]}`;
 }
 
 function hasOwnedHook(

@@ -9,6 +9,7 @@ import { importCommand } from "./commands/import.js";
 import { loginCommand } from "./commands/login.js";
 import { logoutCommand } from "./commands/logout.js";
 import { pullCommand } from "./commands/pull.js";
+import { reposRouteMap } from "./commands/repos.js";
 import { setOrgCommand } from "./commands/set-org.js";
 import { sqlCommand } from "./commands/sql.js";
 import { updateCommand } from "./commands/update.js";
@@ -22,6 +23,7 @@ const routes = buildRouteMap({
 		logout: logoutCommand,
 		whoami: whoamiCommand,
 		upload: uploadCommand,
+		repos: reposRouteMap,
 		update: updateCommand,
 		import: importCommand,
 		pull: pullCommand,
@@ -41,6 +43,7 @@ const routes = buildRouteMap({
 			hooks: true,
 			dev: true,
 			connect: true,
+			repos: true,
 			import: true,
 			enable: true,
 			disable: true,

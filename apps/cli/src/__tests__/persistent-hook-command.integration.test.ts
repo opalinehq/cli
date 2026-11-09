@@ -214,6 +214,124 @@ appendFileSync(record, JSON.stringify(args) + '\\n');`;
 	expect(unavailable.stderr).toContain("not authenticated");
 }, 30_000);
 
+test("switching between a Node run and a desktop app run replaces the published hooks", async () => {
+	const home = await mkdtemp(join(tmpdir(), "opaline desktop's home "));
+	directories.push(home);
+	const cache = join(home, "runner cache");
+	await mkdir(cache);
+	await mkdir(join(home, ".claude"));
+	await mkdir(join(home, ".codex"));
+	const settingsPath = join(home, ".claude", "settings.json");
+	const codexPath = join(home, ".codex", "config.toml");
+	await writeFile(
+		settingsPath,
+		JSON.stringify({
+			hooks: {
+				SessionEnd: [
+					{
+						matcher: "",
+						hooks: [{ type: "command", command: "echo keep-me" }],
+					},
+				],
+			},
+		}),
+	);
+	await writeFile(codexPath, 'model = "gpt-5"\n');
+	const installer = join(cache, "installer.ts");
+	await writeFile(
+		installer,
+		`import { addHook } from ${JSON.stringify(resolve(import.meta.dir, "../internal/agent-adapters/adapters/claude-code/settings.ts"))};
+import { installHook } from ${JSON.stringify(resolve(import.meta.dir, "../internal/agent-adapters/adapters/codex/config.ts"))};
+if (process.argv[2] === "electron") process.versions.electron = "39.0.0";
+addHook(); installHook();`,
+	);
+	for (const entry of [resolve(import.meta.dir, "../bin/cli.ts"), installer]) {
+		await run(
+			[
+				process.execPath,
+				"build",
+				entry,
+				"--outdir",
+				cache,
+				"--target=node",
+				"--define=OPALINE_BUNDLED_ANALYTICS=null",
+			],
+			process.env,
+		);
+	}
+	await writeFile(join(cache, "package.json"), '{"type":"module"}');
+	const env = {
+		...process.env,
+		HOME: home,
+		USERPROFILE: home,
+		OPALINE_CONFIG_DIR: join(home, ".rudel"),
+		POSTHOG_ENABLED: "false",
+	};
+	const foundNode = Bun.which("node");
+	assert(foundNode);
+	const node = await realpath(foundNode);
+	const durablePath = join(home, ".rudel", "runtime", "cli.js");
+	const nodeHook = [node, durablePath];
+	const appHook = ["/usr/bin/env", "ELECTRON_RUN_AS_NODE=1", node, durablePath];
+	const read = async () => {
+		const settings = z
+			.object({
+				hooks: z.record(
+					z.array(
+						z.object({ hooks: z.array(z.object({ command: z.string() })) }),
+					),
+				),
+			})
+			.parse(JSON.parse(await readFile(settingsPath, "utf8")));
+		const commands = (event: string) =>
+			(settings.hooks[event] ?? []).flatMap((entry) =>
+				entry.hooks.map((hook) => hook.command),
+			);
+		return {
+			sessionEnd: commands("SessionEnd"),
+			sessionStart: commands("SessionStart"),
+			notify: parse(await readFile(codexPath, "utf8")).notify,
+		};
+	};
+	const quoted = (argv: string[], suffix: string) =>
+		`${argv.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(" ")} ${suffix}`;
+	const expectHooks = async (launcher: string[]) => {
+		const hooks = await read();
+		expect(hooks.sessionEnd).toEqual([
+			"echo keep-me",
+			quoted(launcher, "hooks claude session-end"),
+		]);
+		expect(hooks.sessionStart).toEqual([
+			quoted(launcher, "hooks claude session-start"),
+		]);
+		expect(hooks.notify).toEqual([
+			...launcher,
+			"hooks",
+			"codex",
+			"turn-complete",
+		]);
+		return hooks;
+	};
+
+	await run([node, join(cache, "installer.js")], env);
+	await expectHooks(nodeHook);
+	await run([node, join(cache, "installer.js"), "electron"], env);
+	const app = await expectHooks(appHook);
+	await run([node, join(cache, "installer.js"), "electron"], env);
+	await expectHooks(appHook);
+	await run([node, join(cache, "installer.js")], env);
+	await expectHooks(nodeHook);
+	await rm(cache, { recursive: true, force: true });
+	const claude = app.sessionEnd.at(-1);
+	assert(claude);
+	await run(["sh", "-c", claude], env, "{}");
+	const notify = z.array(z.string()).parse(app.notify);
+	await run([...notify, '{"type":"unrelated-event"}'], env);
+	expect((await run([...appHook, "--version"], env)).stdout.trim()).toMatch(
+		/^\d+\.\d+\.\d+$/u,
+	);
+}, 30_000);
+
 async function run(command: string[], env: NodeJS.ProcessEnv, stdin = "") {
 	const child = Bun.spawn(command, {
 		env,

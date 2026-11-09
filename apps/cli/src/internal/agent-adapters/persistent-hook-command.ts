@@ -26,7 +26,16 @@ export function getPersistentHookCommand(args: readonly string[]): string[] {
 		throw new Error("Could not find the CLI bundle for automatic uploads.");
 	const target = getPersistentCliPath();
 	writePersistentCli(source, target);
-	return [process.execPath, target, ...args];
+	return [...getRuntimeLauncher(), target, ...args];
+}
+
+const ELECTRON_LAUNCHER = ["/usr/bin/env", "ELECTRON_RUN_AS_NODE=1"] as const;
+
+export function getRuntimeLauncher(
+	versions: NodeJS.ProcessVersions = process.versions,
+	execPath: string = process.execPath,
+): string[] {
+	return versions.electron ? [...ELECTRON_LAUNCHER, execPath] : [execPath];
 }
 
 // Callers reconciling existing installations hold the configuration lock. Keep
@@ -75,10 +84,15 @@ export function isPersistentHookCommand(
 	command: readonly string[],
 	args: readonly string[],
 ): boolean {
+	const runtime = command.length - args.length - 1;
+	const launcher =
+		runtime === 1 ||
+		(runtime === 3 &&
+			ELECTRON_LAUNCHER.every((part, index) => command[index] === part));
 	return (
-		command.length === args.length + 2 &&
-		command[1] === getPersistentCliPath() &&
-		args.every((arg, index) => command[index + 2] === arg)
+		launcher &&
+		command[runtime] === getPersistentCliPath() &&
+		args.every((arg, index) => command[runtime + 1 + index] === arg)
 	);
 }
 

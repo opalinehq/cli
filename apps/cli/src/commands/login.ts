@@ -1,3 +1,4 @@
+import { setTimeout as delay } from "node:timers/promises";
 import * as p from "@clack/prompts";
 import { buildCommand } from "@stricli/core";
 import {
@@ -50,8 +51,8 @@ function describeDeviceFlowFailure(body: unknown, fallback: string): string {
 	return supplied ? sanitizeForTerminalDisplay(supplied) : fallback;
 }
 
-async function sleep(ms: number): Promise<void> {
-	await new Promise((resolve) => setTimeout(resolve, ms));
+async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	await delay(ms, undefined, { signal });
 }
 
 /**
@@ -87,9 +88,13 @@ export function buildVerificationUrl(
 	}
 }
 
-async function requestDeviceCode(apiBase: string): Promise<DeviceCodeResponse> {
+async function requestDeviceCode(
+	apiBase: string,
+	signal?: AbortSignal,
+): Promise<DeviceCodeResponse> {
 	const response = await fetch(`${apiBase}/api/auth/device/code`, {
 		method: "POST",
+		signal,
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({
 			client_id: DEVICE_CLIENT_ID,
@@ -114,6 +119,7 @@ async function requestDeviceCode(apiBase: string): Promise<DeviceCodeResponse> {
 async function pollForAccessToken(
 	apiBase: string,
 	device: DeviceCodeResponse,
+	signal?: AbortSignal,
 ): Promise<string> {
 	const hardDeadline = Date.now() + POLL_SAFETY_TIMEOUT_MS;
 	const deviceDeadline = Date.now() + device.expires_in * 1000;
@@ -123,6 +129,7 @@ async function pollForAccessToken(
 	while (Date.now() < deadline) {
 		const response = await fetch(`${apiBase}/api/auth/device/token`, {
 			method: "POST",
+			signal,
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
 				grant_type: "urn:ietf:params:oauth:grant-type:device_code",
@@ -143,13 +150,13 @@ async function pollForAccessToken(
 			: "";
 
 		if (errorCode === "authorization_pending") {
-			await sleep(intervalMs);
+			await sleep(intervalMs, signal);
 			continue;
 		}
 
 		if (errorCode === "slow_down") {
 			intervalMs += 1_000;
-			await sleep(intervalMs);
+			await sleep(intervalMs, signal);
 			continue;
 		}
 
@@ -202,6 +209,8 @@ export async function runLogin(
 		readonly browserOrigin: string;
 		readonly registerDevice: (deviceCode: string) => Promise<unknown>;
 		readonly readUploadHistory?: (hasPreviousUploads: boolean) => void;
+		readonly onVerificationUrl?: (url: string) => void;
+		readonly signal?: AbortSignal;
 	},
 ): Promise<undefined | Error> {
 	let openedBrowser = false;
@@ -226,7 +235,8 @@ export async function runLogin(
 		});
 	};
 
-	p.intro("opaline login");
+	const headless = connection?.onVerificationUrl !== undefined;
+	if (!headless) p.intro("opaline login");
 
 	const existing = loadCredentials();
 	if (existing && !connection) {
@@ -266,9 +276,10 @@ export async function runLogin(
 
 	let deviceCode: DeviceCodeResponse;
 	try {
-		deviceCode = await requestDeviceCode(apiBase);
+		deviceCode = await requestDeviceCode(apiBase, connection?.signal);
 	} catch (error) {
-		captureLoginFailure("device_code_request", error);
+		if (!connection?.signal?.aborted)
+			captureLoginFailure("device_code_request", error);
 		return error instanceof Error ? error : new Error(String(error));
 	}
 	// The verification URL is server-controlled. Validate it before it reaches the
@@ -296,41 +307,51 @@ export async function runLogin(
 		verifyUrl = connectedUrl.toString();
 	}
 
-	p.log.info(`If the browser doesn't open, visit:\n${verifyUrl}`);
+	connection?.onVerificationUrl?.(verifyUrl);
+	if (!headless)
+		p.log.info(`If the browser doesn't open, visit:\n${verifyUrl}`);
 	// `user_code` is server-controlled and printed raw to the terminal, so it is
 	// an ANSI/OSC injection vector even though the URL beside it is safe.
-	p.log.info(`User code: ${sanitizeForTerminalDisplay(deviceCode.user_code)}`);
+	if (!headless)
+		p.log.info(
+			`User code: ${sanitizeForTerminalDisplay(deviceCode.user_code)}`,
+		);
 
 	if (!flags.noBrowser) {
 		openUrl(verifyUrl);
 		openedBrowser = true;
 	}
 
-	const spin = p.spinner();
-	spin.start("Waiting for browser authentication...");
+	const spin = headless ? undefined : p.spinner();
+	spin?.start("Waiting for browser authentication...");
 
 	let accessToken: string;
 	try {
-		accessToken = await pollForAccessToken(apiBase, deviceCode);
+		accessToken = await pollForAccessToken(
+			apiBase,
+			deviceCode,
+			connection?.signal,
+		);
 	} catch (error) {
 		const failureReason = normalizeFailureReason(error);
-		captureLoginFailure(
-			failureReason === "timeout"
-				? "browser_approval_timeout"
-				: "token_exchange",
-			error,
-		);
-		spin.stop("Authentication failed");
+		if (!connection?.signal?.aborted)
+			captureLoginFailure(
+				failureReason === "timeout"
+					? "browser_approval_timeout"
+					: "token_exchange",
+				error,
+			);
+		spin?.stop("Authentication failed");
 		return error instanceof Error ? error : new Error(String(error));
 	}
 
-	spin.message("Creating ingest token...");
+	spin?.message("Creating ingest token...");
 	let ingestKey: CliApiKeyCreateResponse;
 	try {
 		ingestKey = await createIngestApiKey(apiBase, accessToken);
 	} catch (error) {
 		captureLoginFailure("api_key_create", error);
-		spin.stop("Authentication failed");
+		spin?.stop("Authentication failed");
 		return error instanceof Error ? error : new Error(String(error));
 	}
 
@@ -359,7 +380,7 @@ export async function runLogin(
 		}
 	} catch (error) {
 		captureLoginFailure("account_fetch", error);
-		spin.stop("Authentication failed");
+		spin?.stop("Authentication failed");
 		return new Error("Login failed: unable to fetch account details");
 	}
 
@@ -374,7 +395,7 @@ export async function runLogin(
 		});
 	} catch (error) {
 		captureLoginFailure("account_fetch", error);
-		spin.stop("Authentication failed");
+		spin?.stop("Authentication failed");
 		return new Error("Login failed: unable to persist credentials");
 	}
 
@@ -390,7 +411,8 @@ export async function runLogin(
 			...getBaseCliEventPayload(),
 		},
 	});
-	spin.stop("Authenticated");
+	spin?.stop("Authenticated");
+	if (headless) return;
 	p.log.success(`Logged in as ${user.name} (${user.email})`);
 	p.outro("Done!");
 }

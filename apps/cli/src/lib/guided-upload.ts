@@ -17,6 +17,8 @@ export function createGuidedUpload(
 		apiBase: string;
 		allowInsecureApiBase: boolean;
 		noBrowser: boolean;
+		onVerificationUrl?: (url: string) => void;
+		signal?: AbortSignal;
 	},
 ) {
 	let finished = false;
@@ -63,6 +65,8 @@ export function createGuidedUpload(
 				readUploadHistory: (value) => {
 					hasPreviousUploads = value;
 				},
+				onVerificationUrl: flags.onVerificationUrl,
+				signal: flags.signal,
 			});
 			if (error) throw error;
 			const credentials = loadCredentials();
