@@ -92,7 +92,7 @@ export async function loadFailedUploads(): Promise<FailedUpload[]> {
 	}
 }
 
-function isTranscriptGone(failure: FailedUpload): boolean {
+export function isTranscriptGone(failure: FailedUpload): boolean {
 	return (
 		typeof failure.transcriptPath === "string" &&
 		failure.transcriptPath !== "" &&
