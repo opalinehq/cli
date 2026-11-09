@@ -8,12 +8,18 @@ import {
 } from "../contracts/cli-connection.js";
 import type { Credentials } from "./credentials.js";
 
-export async function connectBrowser(apiBase: string, code: string) {
+export async function connectBrowser(
+	apiBase: string,
+	code: string,
+	signal?: AbortSignal,
+) {
 	CliConnectionSecretSchema.parse(code);
 	const writerToken = randomBytes(32).toString("base64url");
 	const initial = await requestConnection(
 		`${apiBase}${CLI_CONNECTION_PATH}/redeem`,
 		{ code, writerToken },
+		undefined,
+		signal,
 	);
 	let sequence = 0;
 	let queue: Promise<unknown> = Promise.resolve();
@@ -59,6 +65,7 @@ async function requestConnection(
 	url: string,
 	body: unknown,
 	credentials?: Credentials,
+	signal?: AbortSignal,
 ): Promise<CliConnectionSnapshot> {
 	const headers: Record<string, string> = {
 		"Content-Type": "application/json",
@@ -75,10 +82,13 @@ async function requestConnection(
 				method: "POST",
 				headers,
 				body: JSON.stringify(body),
-				signal: AbortSignal.timeout(10_000),
+				signal: signal
+					? AbortSignal.any([signal, AbortSignal.timeout(10_000)])
+					: AbortSignal.timeout(10_000),
 				redirect: "error",
 			});
 		} catch (error) {
+			signal?.throwIfAborted();
 			if (attempt >= 2)
 				throw new Error(
 					"Could not connect to the demo. Check your connection and copy a fresh command.",
