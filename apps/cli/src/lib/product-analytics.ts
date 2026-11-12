@@ -237,6 +237,8 @@ function isErrorCode(error: unknown, code: string): boolean {
 export function trackCliFirstRun(options: {
 	commandName: ProductAnalyticsEventPayload<"CLI First Run">["command_name"];
 	isAuthenticated: boolean;
+	isCi: boolean;
+	isInteractive: boolean;
 	userId?: string;
 }) {
 	if (!getClient()) return;
@@ -251,6 +253,9 @@ export function trackCliFirstRun(options: {
 		cli_installation_id: cliInstallationId,
 		cli_first_run_event_id: eventId,
 	});
+	// Without saved state every later run also reports a first run, as on
+	// hosts that discard or cannot write the configuration directory.
+	const isEphemeral = readAnalyticsState().cli_first_run_event_id !== eventId;
 	captureCliProductAnalyticsEvent({
 		distinctId: getCliDistinctId(options.userId),
 		event: PRODUCT_ANALYTICS_EVENTS.CLI_FIRST_RUN,
@@ -261,6 +266,9 @@ export function trackCliFirstRun(options: {
 			cli_installation_id: cliInstallationId,
 			command_name: options.commandName,
 			is_authenticated: options.isAuthenticated,
+			is_ci: options.isCi,
+			is_interactive: options.isInteractive,
+			is_ephemeral: isEphemeral,
 			...getBaseCliEventPayload(),
 		},
 	});
